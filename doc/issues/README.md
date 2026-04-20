@@ -44,3 +44,4 @@ The Verification section exists because "tsc passes" and "lint passes" are neces
 | 0004 | frontend scaffold — Next.js 16 + TS strict + Tailwind v4 + React Query | resolved | high |
 | 0005 | docker-compose — Postgres + backend + frontend, one command up | resolved | high |
 | 0006 | staging GCP foundation — project, IAM, Cloud SQL, AR, Secret Manager | resolved | high |
+| 0007 | staging first deploy — cloudbuild.yaml, trigger, *.run.app verification | open | high |
