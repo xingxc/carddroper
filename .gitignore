@@ -1,0 +1,31 @@
+# Cross-cutting ignore patterns. Tree-local .gitignore files
+# (backend/.gitignore, frontend/.gitignore) handle language- and
+# framework-specific paths. This file handles patterns that can
+# appear anywhere in the repo or are user-machine specific.
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment files — defense in depth, never commit secrets.
+# Tree-local files also exclude these; .env.example IS committed.
+.env
+.env.local
+.env.*.local
+
+# direnv
+.envrc
+
+# Local Claude Code overrides (settings.json IS committed; .local is not)
+.claude/settings.local.json
+
+# Logs
+*.log

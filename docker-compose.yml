@@ -1,0 +1,70 @@
+# Carddroper local development stack: Postgres + backend + frontend.
+# Production uses Cloud Run + Cloud SQL; this file is dev-only.
+#
+# First-time setup:
+#   cp backend/.env.example backend/.env       # then set JWT_SECRET
+#   cp frontend/.env.example frontend/.env.local
+#   docker-compose build
+#   docker-compose up -d
+#   docker-compose exec backend alembic upgrade head
+#
+# Day-to-day:
+#   docker-compose up                          # start in foreground
+#   docker-compose down                        # stop, keep DB volume
+#   docker-compose down -v                     # stop, wipe DB volume
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: carddroper
+      POSTGRES_PASSWORD: carddroper
+      POSTGRES_DB: carddroper
+    ports:
+      - "5433:5432"
+    volumes:
+      - carddroper_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U carddroper -d carddroper"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - ./backend/.env
+    environment:
+      # Override .env's DATABASE_URL to use the compose service hostname.
+      # The .env.example already has this value, but the override makes intent explicit.
+      DATABASE_URL: postgresql+asyncpg://carddroper:carddroper@db:5432/carddroper
+    # Run alembic migrations before starting uvicorn so the schema exists
+    # before app startup hooks try to query it. Dev convenience only —
+    # production runs migrations as a separate Cloud Build step.
+    command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_BASE_URL: http://localhost:8000
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+
+volumes:
+  carddroper_pgdata:
