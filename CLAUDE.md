@@ -49,10 +49,32 @@ When you notice drift: stop, write the brief, dispatch.
 Task: <one sentence>
 Context: <what's already done; what doc/systems/*.md covers this>
 Acceptance: <how the agent knows it's done>
-Report: files touched, tests added, deviations, any env var or dep added.
+
+Testing requirements (see doc/operations/testing.md):
+- Run `.venv/bin/pytest` (backend) or `npm run lint && npm run typecheck && npm run build`
+  (frontend) before reporting done.
+- Add local tests covering the new behavior per §Per-ticket checklist.
+- If the feature touches infra (new secret / env var / external API / public URL / Cloud Run
+  flag), flag whether a staging smoke script was added under `scripts/smoke_*.py` or
+  deferred — do not silently skip.
+- Agents never run scripts against real staging. Smoke scripts are written locally and
+  executed by the orchestrator-user.
+
+Report: files touched, tests added, smoke scripts added, pytest + ruff summary lines,
+deviations, any env var or dep added.
 ```
 
 Keep briefs tight. The agent reads docs itself — don't paste spec content into the prompt.
+
+## Testing policy
+
+Three-tier model in `doc/operations/testing.md`:
+
+- **Local** — primary correctness environment. Everything that CAN be tested locally MUST be. Gated on `pytest` green + `ruff` clean.
+- **Staging** — glue-only. IAM, secrets, DNS, real external APIs. Run `backend/scripts/smoke_*.py` post-deploy. User runs these; AI agents never touch real infra.
+- **Prod** — observability only. Never a test target.
+
+No ticket closes as `resolved` unless it satisfies the §Per-ticket checklist in testing.md (local tests for new behavior; smoke script if infra glue changed).
 
 ## Working directory
 
