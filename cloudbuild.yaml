@@ -34,7 +34,26 @@ steps:
         chmod +x /tmp/cloud-sql-proxy
         /tmp/cloud-sql-proxy carddroper-staging:us-west1:carddroper-staging-db --port=5432 &
         PROXY_PID=$!
-        sleep 3
+        WAIT=0
+        until python -c "
+import psycopg2, sys
+try:
+    psycopg2.connect('host=127.0.0.1 port=5432 dbname=postgres connect_timeout=1')
+    sys.exit(0)
+except psycopg2.OperationalError as e:
+    msg = str(e).lower()
+    if 'connection refused' in msg or 'could not connect to server' in msg:
+        sys.exit(1)
+    sys.exit(0)
+" 2>/dev/null; do
+          WAIT=$((WAIT + 1))
+          if [ "$$WAIT" -ge 15 ]; then
+            echo "ERROR: postgres proxy did not become ready within 15s" >&2
+            kill $$PROXY_PID 2>/dev/null
+            exit 1
+          fi
+          sleep 1
+        done
         cd /app && DATABASE_URL="$$MIGRATION_DATABASE_URL" alembic upgrade head
         RESULT=$?
         kill $$PROXY_PID 2>/dev/null

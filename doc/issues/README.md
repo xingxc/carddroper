@@ -52,4 +52,5 @@ The Verification section exists because "tsc passes" and "lint passes" are neces
 | 0012 | Dockerfile hardening — non-root + multi-stage + HEALTHCHECK + public/ cleanup | resolved | medium |
 | 0013 | testing methodology doc + coverage audit + backfill | resolved | high |
 | 0014 | pre-0015 cleanup — backend + frontend hygiene batch from audit 2026-04-21 | resolved | medium |
+| 0014.5 | pre-0015 micro-cleanup — viewport, tsconfig strict, cloudbuild sleep, dockerfile-copy doc | resolved | medium |
 | 0015 | email verification flow — register, login, verify-email pages + auth foundations | open | high |

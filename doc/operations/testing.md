@@ -188,6 +188,7 @@ For every new feature ticket, the dispatch brief and Acceptance section must req
 3. **Staging smoke script** (or extension of an existing one) if the feature touches: a new secret, a new env var, a new external API, a new endpoint that participates in a golden path, or a new Cloud Run flag.
 4. **Doc update** (backend-api.md or relevant systems doc) if the feature adds or changes a public contract.
 5. **`docker build` must succeed locally** if the change touches `Dockerfile`, `pyproject.toml`, or `package.json`. `pytest` and `ruff` run against source in place; only `docker build` exercises packaging (e.g. setuptools package discovery). Surface check: `docker build -t carddroper-backend-test backend/` returns exit 0 before pushing.
+6. **Dockerfile `COPY` dependencies.** Before deleting the last tracked file in a directory referenced by a Dockerfile `COPY` (e.g. `public/`, `alembic/`), confirm either (a) the directory still has other tracked content, (b) a `.gitkeep` is added, or (c) the `COPY` line is removed. Git does not track empty directories, so a `COPY` that was valid at author time can silently break at build time. See the 0014 Phase 1 postmortem (commit `a8f1915`).
 
 The agent's Report must explicitly state which of 1–4 it added and the `pytest` output.
 
