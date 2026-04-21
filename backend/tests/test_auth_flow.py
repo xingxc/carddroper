@@ -242,6 +242,7 @@ async def test_health(client):
     r = await client.get("/health")
     assert r.status_code == 200
     assert r.json()["status"] == "ok"
+    assert r.json()["database"] == "connected"
 
 
 async def test_register_succeeds_when_email_send_raises(client, monkeypatch):

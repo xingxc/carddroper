@@ -130,3 +130,30 @@ async def test_missing_iss_returns_401(client):
     assert r.status_code == 401
     err = r.json()["error"]
     assert err["code"] == "UNAUTHORIZED"
+
+
+# ---------------------------------------------------------------------------
+# 0001 gap: exp is an integer epoch (tz-aware datetime encoding contract)
+# ---------------------------------------------------------------------------
+
+
+async def test_exp_is_integer_epoch(client):
+    r = await client.post(
+        "/auth/register",
+        json={
+            "email": "test+exp-epoch@example.com",
+            "password": "verylongsecret",
+            "full_name": "Exp Test",
+        },
+    )
+    assert r.status_code == 200, r.text
+    raw_token = r.json()["access_token"]
+
+    payload = jwt.decode(
+        raw_token,
+        settings.JWT_SECRET,
+        algorithms=[settings.JWT_ALGORITHM],
+        options={"verify_signature": False, "verify_aud": False, "verify_iss": False},
+    )
+    assert isinstance(payload["exp"], int), f"exp should be int, got {type(payload['exp'])}"
+    assert payload["exp"] > time.time(), "exp should be in the future"
