@@ -1,19 +1,21 @@
-"""Smoke-test CLI for send_email.
+#!/usr/bin/env python3
+"""Smoke test: send_email helper — exercises the SendGrid send path (or dev fallback).
 
-Usage (from backend/):
-    .venv/bin/python scripts/smoke_email.py --to=foo@bar.com --template=VERIFY_EMAIL
+Default invocation (no arguments needed):
+    .venv/bin/python scripts/smoke_email.py
 
-Reads config from environment (same Settings as the app).
-Prints the returned sg_message_id (or "local-<uuid>") and exits 0 on success.
+Manual overrides:
+    .venv/bin/python scripts/smoke_email.py --template RESET_PASSWORD --to foo@example.com
 
-Dev dry run (no key needed):
-    SENDGRID_API_KEY= .venv/bin/python scripts/smoke_email.py \
-        --to=you@example.com --template=VERIFY_EMAIL
+When SENDGRID_API_KEY is empty the service logs email_skipped_no_key and returns a
+"local-<uuid>" mock id — that still counts as SMOKE OK (dev / CI case).
+A staging run with the key set exercises the real SendGrid path.
 """
 
 import argparse
 import asyncio
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,7 +27,7 @@ from app.services.email_service import EmailTemplate, init_email_client, send_em
 
 
 def _stub_data(template: EmailTemplate, to: str) -> dict:
-    """Build a minimal stub dynamic_template_data for the given template."""
+    """Build minimal stub dynamic_template_data for the given template."""
     if template == EmailTemplate.VERIFY_EMAIL:
         return {
             "verify_url": f"{settings.FRONTEND_BASE_URL}/verify-email?token=smoke-test-token",
@@ -38,7 +40,9 @@ def _stub_data(template: EmailTemplate, to: str) -> dict:
         }
     if template == EmailTemplate.CHANGE_EMAIL:
         return {
-            "change_url": f"{settings.FRONTEND_BASE_URL}/confirm-email-change?token=smoke-test-token",
+            "change_url": (
+                f"{settings.FRONTEND_BASE_URL}/confirm-email-change?token=smoke-test-token"
+            ),
             "full_name": "Smoke Test",
             "new_email": to,
         }
@@ -57,26 +61,52 @@ def _stub_data(template: EmailTemplate, to: str) -> dict:
     return {}
 
 
-async def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Smoke-test send_email against the real API or dev fallback."
-    )
-    parser.add_argument("--to", required=True, help="Recipient email address")
-    parser.add_argument("--template", required=True, help="EmailTemplate name, e.g. VERIFY_EMAIL")
-    args = parser.parse_args()
-
+async def _run(template_name: str, to: str) -> None:
     try:
-        template = EmailTemplate[args.template.upper()]
+        template = EmailTemplate[template_name.upper()]
     except KeyError:
         valid = ", ".join(t.name for t in EmailTemplate)
-        print(f"Unknown template '{args.template}'. Valid values: {valid}", file=sys.stderr)
+        print(
+            f"SMOKE FAIL: email — unknown template {template_name!r}. Valid values: {valid}",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     init_email_client()
-    data = _stub_data(template, args.to)
-    message_id = await send_email(template=template, to=args.to, dynamic_template_data=data)
+    data = _stub_data(template, to)
+    message_id = await send_email(template=template, to=to, dynamic_template_data=data)
     print(f"sg_message_id={message_id}")
 
 
+def main() -> None:
+    slug = uuid.uuid4().hex[:8]
+    default_to = f"smoke+email-{slug}@carddroper.test"
+
+    parser = argparse.ArgumentParser(
+        description="Smoke-test send_email against the real SendGrid API or dev fallback.",
+    )
+    parser.add_argument(
+        "--to",
+        default=default_to,
+        help="Recipient email address (default: smoke+email-<uuid8>@carddroper.test)",
+    )
+    parser.add_argument(
+        "--template",
+        default="VERIFY_EMAIL",
+        help="EmailTemplate name, e.g. VERIFY_EMAIL (default: VERIFY_EMAIL)",
+    )
+    args = parser.parse_args()
+
+    try:
+        asyncio.run(_run(args.template, args.to))
+    except SystemExit:
+        raise
+    except Exception as exc:
+        print(f"SMOKE FAIL: email — {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    print("SMOKE OK: email")
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
