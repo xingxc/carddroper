@@ -13,6 +13,7 @@ Three audit findings clustered on image hygiene. Each is small; batching them in
 - **Backend F-5 (medium, security + dep-hygiene):** `backend/Dockerfile` is single-stage, runs as root, has no `HEALTHCHECK`, and keeps `gcc` / `libpq-dev` in the final image. Cloud Run tolerates all of this but it fails standard container security baselines and bloats the image by ~250MB.
 - **Frontend F-3 (nit, dead-code):** `frontend/public/` still contains the four default `create-next-app` SVGs (`file.svg`, `globe.svg`, `vercel.svg`, `window.svg`). `vercel.svg` ships Vercel branding; the other three are dead assets.
 - **Frontend F-7 (low, design-smell):** `frontend/Dockerfile` runner stage does not set `ENV HOSTNAME=0.0.0.0`. Works today because Next.js standalone default is `0.0.0.0`, but the official deploy guide recommends explicit.
+- **Backend `.dockerignore` missing (surfaced 2026-04-21 during 0010 Cloud Build debugging):** `backend/` has no `.dockerignore`, so `docker build` sends the entire backend directory as build context — `.venv/`, `.env`, `__pycache__/`, `.pytest_cache/`, local SQLite files, editor dotfiles, and anything else sitting in the tree. Secrets are the headline risk; build latency is the tax. `frontend/.dockerignore` already exists; parity is the fix.
 
 Priority: medium. Not a v0.1.0 blocker, but we want it landed before the prod project stands up so prod inherits hardened images from the first deploy. Ideal sequencing: after 0010 (since 0010 already touches `backend/Dockerfile` for the F-4 `pip install .` fix) and before the prod stand-up ticket.
 
@@ -54,6 +55,41 @@ Required shape:
         CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)" || exit 1
     - ENTRYPOINT ["tini", "--"]   (or dumb-init)
     - CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+Also create `backend/.dockerignore`. `frontend/.dockerignore` already exists
+— mirror its intent for a Python project. Required entries (minimum):
+
+    .venv/
+    __pycache__/
+    *.pyc
+    *.pyo
+    .pytest_cache/
+    .ruff_cache/
+    .mypy_cache/
+    .env
+    .env.*
+    !.env.example
+    *.db
+    *.sqlite
+    *.sqlite3
+    .git/
+    .gitignore
+    .DS_Store
+    .idea/
+    .vscode/
+    tests/
+    scripts/
+    README*.md
+
+Why `tests/` and `scripts/` are excluded: pytest runs against source-in-place
+locally (never inside the built image), and `scripts/smoke_*.py` are executed
+by the orchestrator-user against staging — they don't belong in the Cloud Run
+image. Keep `alembic/` IN (migration runner uses it at deploy time).
+
+Validate by comparing build-context size before and after:
+
+    docker build ./backend 2>&1 | grep "Sending build context"
+    # Report both numbers.
 
 Test locally:
   - `docker build -t carddroper-backend:hardened ./backend` — must succeed.
@@ -178,6 +214,7 @@ curl -sSf https://staging.carddroper.com | head -20
 - Backend image `.Config.User = "appuser"`.
 - Backend image `.Config.Healthcheck` non-nil.
 - Backend image size (post-hardening) notably smaller than pre-hardening (agent reports before/after).
+- `backend/.dockerignore` exists; build-context size reported before/after.
 - Frontend `npm ci / build / lint / tsc --noEmit` all clean.
 
 **Functional smoke (user, Phase 2):**
@@ -200,7 +237,7 @@ curl -sSf https://staging.carddroper.com | head -20
 ## Report
 
 Backend-builder:
-- Dockerfile diff, local-build + local-run results, image size before / after, any Cloud Build concern.
+- Dockerfile diff, `.dockerignore` created (path), local-build + local-run results, image size before / after, build-context size before / after, any Cloud Build concern.
 
 Frontend-builder:
 - Four file deletions, one-line Dockerfile diff, build/lint/type-check + docker-build smoke results.
