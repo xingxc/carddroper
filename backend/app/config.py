@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRATION_MINUTES: int = 15
     REFRESH_TOKEN_DAYS: int = 7
+    JWT_ISSUER: str = "carddroper"
+    JWT_AUDIENCE: str = "carddroper-api"
 
     # Auth cookies
     COOKIE_SECURE: bool = True

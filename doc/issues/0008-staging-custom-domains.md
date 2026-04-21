@@ -1,9 +1,40 @@
 ---
 id: 0008
 title: staging custom domains — Cloudflare CNAMEs + Cloud Run domain mappings
-status: open
+status: resolved
 priority: high
 found_by: orchestrator 2026-04-20
+resolved_by: user 2026-04-20
+---
+
+## Resolution
+
+Staging custom domains are live with Google-managed SSL:
+
+- Frontend: https://staging.carddroper.com — renders styled `<h1>Carddroper</h1>`, padlock valid.
+- Backend: https://api.staging.carddroper.com — `/health` → `{"status":"ok","database":"connected"}`, `/auth/me` → 401.
+- Cert issuer: `Google Trust Services` (WR3 intermediate).
+- Cloudflare: three DNS records — two CNAMEs (`staging`, `api.staging` → `ghs.googlehosted.com`, DNS-only) + one TXT (`carddroper.com` → `google-site-verification=...`).
+
+### Deviations from the initial draft (now folded into the body)
+
+1. **`gcloud run domain-mappings` is not in the GA track for regional services.** `--region` is rejected with "flag is available in one or more alternate release tracks." Body now uses `gcloud beta run domain-mappings` throughout.
+
+2. **Google requires root-domain ownership verification via Search Console.** First `domain-mappings create` failed until we added a TXT record at the `carddroper.com` apex with the Google-site-verification token and clicked Verify in Search Console. Body now documents this inline in Phase 2.
+
+3. **`describe` subcommand takes `--domain=...`, not a positional arg.** Body still uses `--domain=...` consistently.
+
+4. **Edge cert propagation lags `status: Ready` by ~10-20 minutes.** `describe` reported `Ready: True, CertificateProvisioned: True` at 18:11 PDT, but TLS handshakes from curl/browser failed with "no peer certificate available" + "read 0 bytes" for the next ~17 minutes until the cert fully rolled out to the Google edge serving `142.250.101.121`. No action needed — just wait.
+
+### Frontend bundle check — expected empty
+
+`grep 'api.staging.carddroper.com'` across `_next/static/chunks/*.js` returned no hits. Root cause: `frontend/lib/api.ts` reads `process.env.NEXT_PUBLIC_API_BASE_URL`, but nothing in `frontend/app/**` currently imports `@/lib/api`, so Next.js tree-shakes the module and the env-var string never reaches a compiled chunk. Pipeline is correct end-to-end (Dockerfile ARG → ENV → `next build`); the URL will materialise in the bundle the moment the first component imports from `@/lib/api` (auth forms, Stripe flow, etc.).
+
+### Checkbox added + flipped in `doc/operations/deployment.md`
+- `carddroper-staging` custom domain mapped (frontend + api)
+
+Next: Phase 5 of PLAN.md §10 — Stripe layer (create Customer on signup, PAYG Payment Intent, credit ledger, webhook handler). First Stripe ticket to be drafted.
+
 ---
 
 ## Context

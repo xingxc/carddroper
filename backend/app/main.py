@@ -3,8 +3,9 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy import delete, text
@@ -61,6 +62,34 @@ from app.routes.auth import limiter, router as auth_router  # noqa: E402
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+async def internal_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    request_id = getattr(request.state, "request_id", None)
+    logger.exception(
+        "unhandled_exception",
+        extra={
+            "event": "unhandled_exception",
+            "request_id": request_id,
+            "path": request.url.path,
+            "method": request.method,
+            "exc_type": type(exc).__name__,
+            "exc_message": str(exc),
+        },
+    )
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": {
+                "code": "INTERNAL_ERROR",
+                "message": "An unexpected error occurred.",
+                "request_id": request_id,
+            }
+        },
+    )
+
+
+app.add_exception_handler(Exception, internal_error_handler)
 
 
 @app.get("/health", tags=["meta"])

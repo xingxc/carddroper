@@ -31,7 +31,13 @@ def _utc_naive_now() -> datetime:
 
 def create_access_token(user_id: int, token_version: int = 0) -> str:
     expire = datetime.now(tz=timezone.utc) + timedelta(minutes=settings.JWT_EXPIRATION_MINUTES)  # tz-aware: python-jose expects aware datetimes for exp. See doc/issues/0001.
-    payload = {"sub": str(user_id), "tv": token_version, "exp": expire}
+    payload = {
+        "sub": str(user_id),
+        "tv": token_version,
+        "exp": expire,
+        "iss": settings.JWT_ISSUER,
+        "aud": settings.JWT_AUDIENCE,
+    }
     return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
 
 
@@ -44,6 +50,8 @@ def _create_purpose_token(
         "tv": token_version,
         "purpose": purpose,
         "exp": expire,
+        "iss": settings.JWT_ISSUER,
+        "aud": settings.JWT_AUDIENCE,
         **extra,
     }
     return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
@@ -51,7 +59,13 @@ def _create_purpose_token(
 
 def _decode_purpose_token(token: str, purpose: str) -> Optional[dict]:
     try:
-        payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
+        payload = jwt.decode(
+            token,
+            settings.JWT_SECRET,
+            algorithms=[settings.JWT_ALGORITHM],
+            audience=settings.JWT_AUDIENCE,
+            issuer=settings.JWT_ISSUER,
+        )
     except JWTError as e:
         logger.warning("Token decode failed", extra={"purpose": purpose, "error": str(e)})
         return None

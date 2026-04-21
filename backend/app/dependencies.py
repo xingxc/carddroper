@@ -45,7 +45,13 @@ def _authenticate(request: Request) -> tuple[Optional[str], Optional[dict]]:
     if not token:
         return None, None
     try:
-        payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
+        payload = jwt.decode(
+            token,
+            settings.JWT_SECRET,
+            algorithms=[settings.JWT_ALGORITHM],
+            audience=settings.JWT_AUDIENCE,
+            issuer=settings.JWT_ISSUER,
+        )
     except JWTError as e:
         logger.warning("JWT decode failed", extra={"error": str(e)})
         return None, None
