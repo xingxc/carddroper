@@ -1,7 +1,7 @@
 ---
 id: 0014
 title: pre-0015 cleanup — backend + frontend hygiene batch from audit 2026-04-21
-status: open
+status: resolved
 priority: medium
 found_by: pre-0015 audits 2026-04-21
 ---
@@ -171,4 +171,40 @@ Frontend-builder (Phase 1):
 
 ## Resolution
 
-*(filled in by orchestrator on close)*
+Resolved 2026-04-21. Two phases + two follow-on fixes.
+
+**Phase 0 — Backend (backend-builder, commit 4fc4d33).** Five items:
+- Ruff-formatted the sole alembic migration so `ruff format --check .` is now clean.
+- Removed dead `FRONTEND_URL` from `app/config.py` + `.env.example`.
+- Wired `require_not_locked` to `PUT /auth/password` (the only authenticated non-exempt route today). Interpreted auth.md §Soft cap "every route except [5]" as "every authenticated route" — documented as a spec ambiguity; fixed in auth.md (commit 888e0c9).
+- Public-endpoint token-decode failures: `POST /auth/verify-email` and `POST /auth/reset-password` now return 422 instead of 401 on malformed tokens. The verify-email "user not found after successful decode" branch stays at 401 — edge case, revisit if it surfaces. `GET /auth/validate-reset-token` never returned 401 in the first place (ticket brief was wrong about its shape — it returns 200 with `{valid: False}`).
+- pytest warnings eliminated: added `asyncio_default_fixture_loop_scope = "function"` to `pyproject.toml`; restructured `test_exception_handler.py` to stop leaking the async mark onto a sync test. 38 passing, 0 warnings.
+- 2 new tests covering the locked-account path: 403 on `PUT /auth/password`, 200 still on `GET /auth/me`.
+
+**Phase 1 — Frontend (frontend-builder, commit 4fc4d33).** Four items:
+- `lib/api.ts` line 1: `??` → `||` so empty-string `NEXT_PUBLIC_API_BASE_URL` (missing `--build-arg`) falls back to localhost instead of producing silent relative-path fetches.
+- `lib/api.ts`: `fetch()` wrapped in `try/catch`; native `TypeError` re-thrown as `ApiError(0, "NETWORK_ERROR", …)` so `instanceof ApiError` checks hold during outages. Agent correctly used the positional constructor (ticket brief sketched an object form that wouldn't have typechecked).
+- `providers.tsx`: `queries.retry = 1`, `refetchOnWindowFocus = false`, `mutations.retry = 0`. Correct defaults for the `/auth/me` query 0015 will add.
+- Deleted `public/next.svg` (framework logo, unimported). Closed the SVG purge started by 0012.
+
+**Phase 2 — auth.md tightening (orchestrator, commit 888e0c9).** §Soft cap now says "every **authenticated** route" with an explicit note that anonymous endpoints are out of scope. Resolves the spec ambiguity the backend agent flagged.
+
+**Phase 3 — Cloud Build hotfix (orchestrator, commit a8f1915).** Deleting the last SVG in Phase 1 left `frontend/public/` empty; git doesn't track empty directories so the folder vanished from the repo, and the frontend Dockerfile's `COPY /app/public` failed at Cloud Build with `stat app/public: file does not exist`. Added a 0-byte `frontend/public/.gitkeep` to preserve the directory. Postmortem lesson: when deleting the last file from a build-context directory, check the Dockerfile for hardcoded `COPY <dir>` references — worth adding to the per-ticket checklist.
+
+**Staging smoke (user, 2026-04-21):** All three green — `smoke_healthz`, `smoke_auth`, and `/health` curl. Confirms `require_not_locked` wiring didn't break the golden path, 422-instead-of-401 doesn't confuse the auth smoke (it never hit a malformed-token path anyway), and the empty-`public/` fix restored the deploy.
+
+**Deviations:**
+1. `require_not_locked` applied to only one route (`PUT /auth/password`) instead of "every authenticated non-exempt route" as literally written. Driven by a spec ambiguity; resolved by tightening auth.md rather than applying to anonymous endpoints.
+2. `verify-email` has a second 401 path (subject user missing after successful decode) left at 401 — flagged as an edge case; revisit if it surfaces in 0015 frontend error handling.
+3. Frontend agent used the actual `ApiError(status, code, message)` positional constructor rather than the object-shape sketch in the ticket brief. Correct adaptation, not a regression.
+4. Deleting `next.svg` broke Cloud Build. Root cause: agent brief did not include a "check Dockerfile COPY dependencies before deleting the last file in a directory" step. Postmortem flagged above.
+
+**Commits:** 2a23b05 (audits + ticket open), 4fc4d33 (Phase 0+1), 888e0c9 (auth.md clarification), a8f1915 (public/.gitkeep hotfix).
+
+**Deferred from audit (tracked):**
+- Backend F-3 (`users.updated_at` best-effort accuracy) — informational only; revisit when the first filtering query on `updated_at` lands.
+- Backend F-6 (`sleep 3` fragility in `cloudbuild.yaml` migrate step) — revisit on first intermittent migration failure.
+- Frontend F-6 (`undefined as T` cast on 204 responses) — will be handled naturally when 0015 adds typed `api.get/post/delete` wrappers.
+- Frontend F-9 (`.dockerignore *.md` nit) — no action needed unless a `README.md` in `frontend/` is ever required in the image.
+- 0009 F-2 (viewport export on layout) and F-6 (tsconfig tightening) — still deferred from 0009 disposition.
+- Frontend F-1/F-2/F-7 (401 refresh, auth context, middleware + route groups) — folded into 0015 where they have a real consumer.

@@ -51,4 +51,5 @@ The Verification section exists because "tsc passes" and "lint passes" are neces
 | 0011 | backend hardening — global 500 exception handler + JWT iss/aud claims | resolved | high |
 | 0012 | Dockerfile hardening — non-root + multi-stage + HEALTHCHECK + public/ cleanup | resolved | medium |
 | 0013 | testing methodology doc + coverage audit + backfill | resolved | high |
-| 0014 | pre-0015 cleanup — backend + frontend hygiene batch from audit 2026-04-21 | open | medium |
+| 0014 | pre-0015 cleanup — backend + frontend hygiene batch from audit 2026-04-21 | resolved | medium |
+| 0015 | email verification flow — register, login, verify-email pages + auth foundations | open | high |
