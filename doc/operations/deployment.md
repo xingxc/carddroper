@@ -7,8 +7,8 @@ Google Cloud deployment playbook. This doc is a stub that gets filled in as we s
 - [x] `carddroper-staging` GCP project created
 - [x] `carddroper-staging` Cloud SQL instance created
 - [x] `carddroper-staging` secrets uploaded
-- [ ] `carddroper-staging` Cloud Build trigger wired to `main`
-- [ ] `carddroper-staging` deployed (backend + frontend)
+- [x] `carddroper-staging` Cloud Build trigger wired to `main`
+- [x] `carddroper-staging` deployed (backend + frontend)
 - [ ] `carddroper-staging` Stripe webhook endpoint configured
 - [ ] `carddroper-prod` GCP project created
 - [ ] `carddroper-prod` Cloud SQL instance created

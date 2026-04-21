@@ -59,35 +59,23 @@ steps:
       - --allow-unauthenticated
       - --port=8000
 
-  # 5. Capture backend URL for frontend build arg
-  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
-    entrypoint: bash
-    args:
-      - -c
-      - |
-        gcloud run services describe carddroper-backend \
-          --region=us-west1 \
-          --format='value(status.url)' \
-          > /workspace/backend_url.txt
-
-  # 6. Build frontend image with baked-in API URL
+  # 5. Build frontend image with baked-in custom-domain API URL
   - name: gcr.io/cloud-builders/docker
-    entrypoint: bash
     args:
-      - -c
-      - |
-        docker build \
-          --build-arg NEXT_PUBLIC_API_BASE_URL=$(cat /workspace/backend_url.txt) \
-          -t us-west1-docker.pkg.dev/$PROJECT_ID/carddroper-repo/frontend:$SHORT_SHA \
-          ./frontend
+      - build
+      - --build-arg
+      - NEXT_PUBLIC_API_BASE_URL=https://api.staging.carddroper.com
+      - -t
+      - us-west1-docker.pkg.dev/$PROJECT_ID/carddroper-repo/frontend:$SHORT_SHA
+      - ./frontend
 
-  # 7. Push frontend image
+  # 6. Push frontend image
   - name: gcr.io/cloud-builders/docker
     args:
       - push
       - us-west1-docker.pkg.dev/$PROJECT_ID/carddroper-repo/frontend:$SHORT_SHA
 
-  # 8. Deploy frontend to Cloud Run
+  # 7. Deploy frontend to Cloud Run
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk
     entrypoint: gcloud
     args:
