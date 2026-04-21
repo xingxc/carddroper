@@ -33,6 +33,7 @@ Running, deploying, and evolving carddroper.
 | [operations/development.md](operations/development.md) | Local setup, docker-compose, day-to-day workflow, branching. |
 | [operations/environments.md](operations/environments.md) | dev / staging / prod layout, promotion path, secret strategy. |
 | [operations/deployment.md](operations/deployment.md) | GCP Cloud Run + Cloud SQL + Cloud Build playbook (filled as we stand each env up). |
+| [operations/testing.md](operations/testing.md) | Three-tier testing policy — local / staging / prod — with per-ticket coverage checklist and smoke-script pattern. |
 
 ## Legal
 

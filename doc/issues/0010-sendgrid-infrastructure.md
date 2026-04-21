@@ -1,7 +1,7 @@
 ---
 id: 0010
 title: SendGrid infrastructure — hardened send_email() helper + staging secret wiring
-status: open
+status: paused — Phase 4 blocked on 0013
 priority: high
 found_by: orchestrator 2026-04-20
 ---
@@ -541,6 +541,11 @@ Do NOT merge. Report the diff; orchestrator merges to main after review.
 Orchestrator reviews and merges to `main` to trigger the deploy.
 
 ### Phase 4: user — staging smoke test (real email send, no key in shell history)
+
+> **PAUSED 2026-04-21.** Ticket 0013 (testing methodology) is establishing
+> the staging-smoke pattern so `smoke_email.py` lands as one of a suite
+> rather than a one-off. Resume this phase at 0013's Phase 5. Phases 0–3
+> of 0010 remain complete and committed (c4fb874, 4d846ba).
 
 The backend build from Phase 3 must be `SUCCESS` first. Then run the local
 smoke against the real staging key, pulled from Secret Manager into a subshell.

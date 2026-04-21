@@ -47,6 +47,7 @@ The Verification section exists because "tsc passes" and "lint passes" are neces
 | 0007 | staging first deploy — cloudbuild.yaml, trigger, *.run.app verification | resolved | high |
 | 0008 | staging custom domains — Cloudflare CNAMEs + Cloud Run domain mappings | resolved | high |
 | 0009 | scaffold code audit — backend + frontend ground-truth inventory before v0.1.0 features | resolved | high |
-| 0010 | SendGrid infrastructure — hardened send_email() helper + staging secret wiring | open | high |
+| 0010 | SendGrid infrastructure — hardened send_email() helper + staging secret wiring | paused (Phase 4 blocked on 0013) | high |
 | 0011 | backend hardening — global 500 exception handler + JWT iss/aud claims | resolved | high |
 | 0012 | Dockerfile hardening — non-root + multi-stage + HEALTHCHECK + public/ cleanup | open | medium |
+| 0013 | testing methodology doc + coverage audit + backfill | in_progress | high |
