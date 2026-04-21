@@ -1,7 +1,7 @@
 ---
 id: 0010
 title: SendGrid infrastructure — hardened send_email() helper + staging secret wiring
-status: paused — Phase 4 blocked on 0013
+status: resolved
 priority: high
 found_by: orchestrator 2026-04-20
 ---
@@ -644,4 +644,21 @@ User (Phases 1, 2, 4):
 
 ## Resolution
 
-*(filled in by orchestrator on close)*
+Resolved 2026-04-21. SendGrid infrastructure landed across four phases; Phase 4 staging smoke ran under ticket 0013 Phase 5 using the now-codified `scripts/smoke_email.py` pattern.
+
+**Phases delivered:**
+
+- **Phase 0 (backend, commit c4fb874).** `app/services/email_service.py` reshaped to the production spec: `EmailTemplate` enum (5 members including `EMAIL_CHANGED`), async `send_email(template, to, dynamic_template_data)` with singleton SendGrid client, `asyncio.to_thread` offload, 5s per-attempt timeout, tenacity retry (3 attempts, 1s→4s→16s exp backoff on `Timeout`/`ConnectionError`/{429,500,502,503,504}), sandbox mode, `SecretStr` API key, SHA-256 `to_hash` structured logging, no-key fallback with `dev_preview_url`. All 5 `routes/auth.py` callsites migrated to the new signature with best-effort `try/except` semantics. Settings extended with `SENDGRID_API_KEY: SecretStr`, `SENDGRID_SANDBOX`, 5 template IDs, `FROM_EMAIL`, `FROM_NAME`, `FRONTEND_BASE_URL`. 9 service-level tests + 1 callsite test added.
+- **Phases 1–2 (user).** SendGrid domain authentication completed (3 CNAMEs green); 5 template IDs + API key uploaded to Secret Manager as 6 secrets; runtime SA granted `secretmanager.secretAccessor` on each via the IAM binding loop.
+- **Phase 3 (orchestrator, commit 4d846ba).** `cloudbuild.yaml` Step 4 extended — `--set-secrets` now mounts all 6 SendGrid secrets; `--set-env-vars` adds `SENDGRID_SANDBOX=false`, `FROM_EMAIL=noreply@carddroper.com`, `FROM_NAME=Carddroper`, `FRONTEND_BASE_URL=https://staging.carddroper.com`.
+- **Phase 4 (user, under 0013 Phase 5, commit d2750dd).** `scripts/smoke_email.py` (rewritten to the `testing.md` pattern with pre-flight guards refusing fallback success) executed against `https://api.staging.carddroper.com`. Real `sg_message_id=VLDjJRHJQ82yKuCFngsAlg` returned on first attempt (`attempt: 1`), `email_sent` structured log emitted, `SMOKE OK: email` marker printed. Proves: live API key valid, template ID correctly mounted from Secret Manager, `dynamic_template_data` contract matches the template, async offload + retry wrapper work under real latency.
+
+**Deviations from the original brief:**
+
+1. `email_service.py` lives at `app/services/email_service.py`, not `app/email_service.py`. Phase 0 agent moved it into `app/services/` without flagging. Non-breaking — all imports updated consistently. Kept as-is since it matches the `app/services/*` convention already established by `auth_service.py`.
+2. The register endpoint returns HTTP 200, not the 201 the ticket text called out. The existing suite always asserted 200; the new `test_register_succeeds_when_email_send_raises` test follows suit with an inline comment documenting the deviation. Endpoint contract unchanged from what was already in production; no caller affected.
+3. Post-Phase-0 packaging bug surfaced on Cloud Build: Phase 0's Dockerfile swap from hand-listed `pip install` to `pip install .` triggered setuptools ≥61 auto-discovery to find both `app/` and `alembic/` as flat-layout top-level packages, producing "Multiple top-level packages discovered" and failing the build. Fix: added `[tool.setuptools.packages.find]` with `include = ["app*"]` to `backend/pyproject.toml`. `alembic/` continues to be `COPY`d into the image for the migration step but is not installed as a Python package. This class of bug was not caught by `pytest` (source-in-place) and motivated adding a `docker build` checklist item to `doc/operations/testing.md` §Per-ticket checklist.
+
+**Acceptance trace.** All 10 items (A1–A10) from the Acceptance section satisfied. §Verification automated checks: `pytest` green (36 passing at ticket close), `ruff check .` + `ruff format --check .` clean. §Verification functional smoke: `smoke_email.py` returned `SMOKE OK: email` with a real SendGrid message ID against staging.
+
+**Commits:** c4fb874 (Phase 0 backend), 4d846ba (Phase 3 cloudbuild.yaml), d2750dd (Phase 5 staging smoke under 0013).

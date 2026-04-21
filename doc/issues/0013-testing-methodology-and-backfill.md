@@ -1,7 +1,7 @@
 ---
 id: 0013
 title: testing methodology doc + coverage audit + backfill
-status: in_progress
+status: resolved
 priority: high
 found_by: orchestrator 2026-04-21
 ---
@@ -178,4 +178,24 @@ Each row maps one completed ticket to the test evidence that currently exists, f
 
 ## Resolution
 
-*Added by orchestrator on close.*
+Resolved 2026-04-21. Three-tier testing methodology codified and enforced, coverage audit completed and backfilled, staging smoke suite established, 0010 Phase 4 resumed and closed.
+
+**Phases delivered:**
+
+- **Phase 0 — Methodology doc (orchestrator, commits b09afba, facc8a1).** `doc/operations/testing.md` drafted: three tiers (local / staging / prod), the core rule ("if a bug can be caught locally, it must be caught locally"), per-tier scope, smoke-script pattern, per-ticket coverage checklist, backfill policy, agent dispatch expectations, open gaps. `doc/README.md` updated with Operations index link. Subsequently amended (commit facc8a1) with the `@example.com` vs `smoke+@carddroper.com` test-data convention after agent audit found the first draft misstated email-validator behavior.
+- **Phase 1 — Coverage audit (backend-builder, commit 5e53d9d).** Audit table covering tickets 0001–0011 landed in §Audit results. Produced a 3-item local gap list (0001 exp-integer assertion, 0003 bcrypt service unit tests, 0005 `/health` database-key assertion), 3-item smoke gap list (healthz, auth, email fix), and 2-item drift list (smoke_email non-conforming, register returns 200 not 201).
+- **Phase 2 — Local test backfill (backend-builder, commit 75064e9).** 4 new tests added: `test_exp_is_integer_epoch` in `tests/test_jwt_claims.py`; `test_hash_and_verify_password_roundtrip`, `test_wrong_password_returns_false`, `test_hash_produces_bcrypt_prefix` in new `tests/services/test_auth_service.py`; `"database": "connected"` assertion appended to `test_health`. Test count 32 → 36 passing.
+- **Phase 3 — Staging smoke suite (backend-builder, commits 577b16a, 1b0e246).** Three smoke scripts written against `https://api.staging.carddroper.com`: `scripts/smoke_healthz.py` (GET /health with status+database assertions), `scripts/smoke_auth.py` (register → login → /auth/me → refresh → logout golden path), `scripts/smoke_email.py` (rewritten from the 0010 Phase 0 draft to add `SMOKE OK:` marker, `smoke+@carddroper.com` recipient, pre-flight guards that refuse silent fallback success). Each is idempotent, <10s, non-zero exit on failure.
+- **Phase 4 — Dispatch template (orchestrator).** `CLAUDE.md` extended with the Testing requirements block and a Testing policy section. Future dispatches inherit the rule through the template.
+- **Phase 5 — 0010 Phase 4 resume (user, commit d2750dd).** All three smokes run against staging. `smoke_healthz`: `SMOKE OK: healthz`. `smoke_auth`: `SMOKE OK: auth`. `smoke_email` with real API key exported from Secret Manager: real `sg_message_id=VLDjJRHJQ82yKuCFngsAlg` on `attempt: 1`, `email_sent` structured log, `SMOKE OK: email`. 0010 flipped to resolved.
+
+**Deviations / surprises:**
+
+1. **smoke_auth initial bug.** First draft used `@carddroper.test` — rejected by pydantic-email as RFC 6761 reserved special-use TLD (422). Fixed by switching to `smoke+<slug>@carddroper.com`: passes email-validator, bounces harmlessly at delivery (no inbox for arbitrary smoke+* addresses), `smoke+` prefix lets a future nightly sweep reap smoke-created users. Correction landed in `testing.md` alongside the fix.
+2. **smoke_email false positive.** First rewrite of `smoke_email.py` happily printed `SMOKE OK: email` when `SENDGRID_API_KEY` was empty because `send_email`'s no-key fallback returns a `local-<uuid>` mock message-id. Fix: pre-flight guards in `main()` now refuse to run without a real API key + template ID, printing `SMOKE FAIL` with a copy-pasteable `gcloud secrets versions access` remediation one-liner.
+3. **Cloud Build packaging bug (surfaced during 0010 Phase 0, fixed under 0013).** setuptools ≥61 flat-layout auto-discovery picked up both `app/` and `alembic/` after Phase 0's Dockerfile swap to `pip install .`. Motivated adding a `docker build` item to the per-ticket checklist in `testing.md`. `pytest` alone runs against source-in-place and never exercised packaging.
+4. **Frontend test runner still deferred.** Flagged in `testing.md` §Open gaps; a real decision (Playwright vs Vitest+RTL) waits for the first real UI surface (ticket 0011's verify/reset pages when they land).
+
+**Acceptance trace.** All 7 Acceptance items satisfied. §Verification automated checks: `pytest` 36 passing, `ruff check .` + `ruff format --check .` clean, all three smoke scripts compile clean. §Verification functional smokes: all three returned `SMOKE OK` against `https://api.staging.carddroper.com` on 2026-04-21, closing 0010 Phase 4 in the same run.
+
+**Commits:** b09afba (Phase 0 methodology doc), facc8a1 (Phase 0 test-data convention correction), 5e53d9d (Phase 1 audit), 75064e9 (Phase 2 local backfill), 577b16a (Phase 3 smoke suite), 1b0e246 (Phase 3 smoke fixes: .test → .com, email fallback guards, setuptools find-include for Cloud Build packaging), d2750dd (Phase 5 staging smoke proof).
