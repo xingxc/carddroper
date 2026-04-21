@@ -36,12 +36,12 @@ gcloud secrets list --format="value(name)" | wc -l                              
 Additional one-time checks:
 
 1. **GitHub repo is pushed.** `main` exists on `github.com/xingxc/carddroper` and reflects the current scaffold.
-2. **Project number** — needed for the Cloud Build service account email:
+2. **Project number** (occasionally needed for other SA references):
    ```bash
    PROJECT_NUMBER=$(gcloud projects describe carddroper-staging --format="value(projectNumber)")
    echo "Project number: $PROJECT_NUMBER"
-   # Cloud Build SA will be: $PROJECT_NUMBER@cloudbuild.gserviceaccount.com
    ```
+   Carddroper's build SA is project-scoped and user-managed (`carddroper-build@<project-id>.iam.gserviceaccount.com`), so we don't need `$PROJECT_NUMBER` for it — but you may see it referenced in IAM audit logs and the default compute SA's email.
 
 ## Acceptance
 
@@ -85,59 +85,105 @@ images:
 
 Verify: `gcloud builds repositories list --connection=<auto-created-connection-name> --region=us-west1` lists `carddroper`. (The connection name is usually something like `github-cloudbuild` or the GitHub org name — the console shows it.)
 
-### Phase 2: Grant Cloud Build service account the IAM roles it needs (user, CLI)
+### Phase 2: Create a dedicated build service account and grant it IAM roles (user, CLI)
 
-The default Cloud Build SA is `$PROJECT_NUMBER@cloudbuild.gserviceaccount.com`. Grant four roles:
+**Important — Google's 2024+ policy:** Cloud Build triggers must use a **user-managed** service account. The legacy `<PROJECT_NUMBER>@cloudbuild.gserviceaccount.com` SA is Google-managed and is now rejected at build time with: `invalid value for build.service_account: provide a user-managed service account`. The default compute SA (`<PROJECT_NUMBER>-compute@developer.gserviceaccount.com`) is user-managed but ships with `roles/editor` (too broad for least-privilege). The correct pattern is to create a dedicated build SA with scoped roles — symmetric to `carddroper-runtime` which we created in ticket 0006 for the Cloud Run runtime.
+
+Create `carddroper-build` and grant it six roles:
 
 ```bash
-CB_SA="${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com"
+BUILD_SA="carddroper-build@carddroper-staging.iam.gserviceaccount.com"
 
-# Deploy services to Cloud Run
-gcloud projects add-iam-policy-binding carddroper-staging \
-    --member="serviceAccount:${CB_SA}" \
-    --role="roles/run.admin"
+# Create the SA
+gcloud iam service-accounts create carddroper-build \
+    --display-name="Carddroper Cloud Build" \
+    --project=carddroper-staging
 
-# Act as the runtime SA when setting --service-account on Cloud Run
-gcloud projects add-iam-policy-binding carddroper-staging \
-    --member="serviceAccount:${CB_SA}" \
-    --role="roles/iam.serviceAccountUser"
-
-# Connect to Cloud SQL (for the migration step's Auth Proxy)
-gcloud projects add-iam-policy-binding carddroper-staging \
-    --member="serviceAccount:${CB_SA}" \
-    --role="roles/cloudsql.client"
-
-# Read the migration DATABASE_URL secret during the build
-gcloud projects add-iam-policy-binding carddroper-staging \
-    --member="serviceAccount:${CB_SA}" \
-    --role="roles/secretmanager.secretAccessor"
+# Grant the roles the build pipeline needs
+for ROLE in \
+    run.admin \
+    iam.serviceAccountUser \
+    cloudsql.client \
+    secretmanager.secretAccessor \
+    logging.logWriter \
+    artifactregistry.writer
+do
+  gcloud projects add-iam-policy-binding carddroper-staging \
+    --member="serviceAccount:${BUILD_SA}" \
+    --role="roles/${ROLE}" \
+    --condition=None
+done
 ```
 
-`roles/artifactregistry.writer` is granted to the Cloud Build SA by default; no action needed for image push.
+Role rationale:
+- `run.admin` — deploy Cloud Run services.
+- `iam.serviceAccountUser` — "act as" `carddroper-runtime` when attaching it to the deployed service.
+- `cloudsql.client` — open the Auth Proxy connection for the migration step.
+- `secretmanager.secretAccessor` — read `carddroper-migration-database-url` during the migration step.
+- `logging.logWriter` — write to Cloud Logging. (The legacy Cloud Build SA had this implicitly; user-managed SAs need it explicitly.)
+- `artifactregistry.writer` — push built images. (The legacy SA had this implicitly too.)
 
 Verify:
 ```bash
 gcloud projects get-iam-policy carddroper-staging \
     --flatten="bindings[].members" \
-    --filter="bindings.members:serviceAccount:${CB_SA}" \
+    --filter="bindings.members:serviceAccount:${BUILD_SA}" \
     --format="value(bindings.role)" | sort
-# Should include: roles/cloudbuild.builds.builder, roles/cloudsql.client,
-#                 roles/iam.serviceAccountUser, roles/run.admin,
-#                 roles/secretmanager.secretAccessor
+# Expected: 6 roles, in alphabetical order.
 ```
 
-### Phase 3: Create the Cloud Build trigger (user, browser)
+**Gotcha about the IAM browser view:** GCP's IAM page hides Google-managed service agents by default. If you're looking for `carddroper-build` in the browser, use the search box (our custom SA will always appear). The `Include Google-provided role grants` toggle only affects Google-managed agents.
 
-1. GCP Console: **Cloud Build** → **Triggers** → **Create Trigger**.
-2. **Name**: `carddroper-staging-main`.
-3. **Region**: `us-west1`.
-4. **Event**: Push to a branch.
-5. **Source**: 2nd gen. Repository: `xingxc/carddroper`. Branch: `^main$`.
-6. **Configuration**: Cloud Build configuration file (yaml or json). Location: `cloudbuild.yaml` (repository).
-7. **Service account**: leave as default (`$PROJECT_NUMBER@cloudbuild.gserviceaccount.com`) since we granted it all the needed roles in Phase 2.
-8. **Create**.
+### Phase 3: Create the Cloud Build trigger (user, browser + CLI)
 
-Verify: `gcloud builds triggers list --region=us-west1` shows `carddroper-staging-main` with filter `^main$`.
+Cloud Build's GitHub integration uses "2nd gen" connections. You create a host connection once (authenticates GCP to GitHub), link specific repos to it, then create triggers that reference the linked repo.
+
+**Step 3a — Create the host connection + link the repo** (browser):
+
+1. GCP Console: **Cloud Build** → **Triggers** → **Manage repositories** (or "Connect Repository").
+2. Region: `us-west1`. Generation: **2nd gen**.
+3. **Create host connection** → name: `github-xingxc`. Encryption: leave default (Google-managed; no KMS needed for staging).
+4. Authenticate to GitHub → install the Google Cloud Build GitHub App on the `xingxc/carddroper` repo.
+5. **Link repository** → connection: `github-xingxc` → select `xingxc/carddroper` → leave auto-generated repository resource name (`xingxc-carddroper`).
+
+Verify: `gcloud builds repositories list --connection=github-xingxc --region=us-west1` lists `xingxc-carddroper`.
+
+**Step 3b — Create the trigger** (browser):
+
+1. **Triggers** → **Create Trigger**.
+2. Name: `carddroper-staging-main`; Region: `us-west1`.
+3. Event: **Push to a branch**.
+4. Source: **2nd gen**. Repository: `xingxc-carddroper`. Branch: `^main$`.
+5. Configuration: **Cloud Build configuration file (yaml or json)**. Location: Repository, path `cloudbuild.yaml` (default).
+6. Service account: **ignore the dropdown** — it defaults to the compute SA and doesn't surface custom SAs. We'll fix it in Step 3c via CLI. Just leave whatever's selected and click Create.
+
+**Step 3c — Point the trigger at the `carddroper-build` SA** (CLI):
+
+The browser dropdown only surfaces a subset of SAs and often reverts to the compute SA on save. Fix via export → sed → import (there is no `gcloud builds triggers update` command; the proper edit flow is export/import, and at time of writing both commands live under `gcloud beta`):
+
+```bash
+gcloud beta builds triggers export carddroper-staging-main \
+    --region=us-west1 \
+    --destination=trigger.yaml
+
+# Replace whatever SA the browser saved with carddroper-build
+sed -i '' "s|serviceAccounts/.*$|serviceAccounts/carddroper-build@carddroper-staging.iam.gserviceaccount.com|" trigger.yaml
+
+gcloud beta builds triggers import \
+    --region=us-west1 \
+    --source=trigger.yaml
+```
+
+macOS `sed -i ''` syntax; Linux users drop the `''`.
+
+Verify:
+
+```bash
+gcloud builds triggers describe carddroper-staging-main --region=us-west1 --format="value(serviceAccount)"
+# Expected: projects/carddroper-staging/serviceAccounts/carddroper-build@carddroper-staging.iam.gserviceaccount.com
+```
+
+Cleanup: `rm trigger.yaml` (it's scratch — the authoritative trigger config lives in GCP).
 
 ### Phase 4: Merge `dev` → `main` to fire the trigger (user, CLI)
 

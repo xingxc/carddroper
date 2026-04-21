@@ -20,19 +20,19 @@ steps:
       - push
       - us-west1-docker.pkg.dev/$PROJECT_ID/carddroper-repo/backend:$SHORT_SHA
 
-  # 3. Run alembic upgrade head against Cloud SQL via proxy
+  # 3. Run alembic upgrade head against Cloud SQL via proxy.
+  # Wrapped in bash -c so $DATABASE_URL expands BEFORE exec-wrapper sees it —
+  # exec-wrapper passes its -e arg to `docker run` verbatim and won't re-eval.
   - name: gcr.io/google-appengine/exec-wrapper
+    entrypoint: bash
     args:
-      - -i
-      - us-west1-docker.pkg.dev/$PROJECT_ID/carddroper-repo/backend:$SHORT_SHA
-      - -s
-      - carddroper-staging:us-west1:carddroper-staging-db
-      - -e
-      - DATABASE_URL=$$DATABASE_URL
-      - --
-      - alembic
-      - upgrade
-      - head
+      - -c
+      - |
+        /exec-wrapper.sh \
+          -i us-west1-docker.pkg.dev/$PROJECT_ID/carddroper-repo/backend:$SHORT_SHA \
+          -s carddroper-staging:us-west1:carddroper-staging-db \
+          -e "DATABASE_URL=$$DATABASE_URL" \
+          -- alembic upgrade head
     secretEnv:
       - DATABASE_URL
 
