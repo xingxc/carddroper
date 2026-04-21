@@ -55,7 +55,7 @@ The token extraction helper reads the cookie first, then falls back to the Autho
 **Soft cap (7-day lock, 30-day delete):**
 - **Days 0–6:** login works, read-only account pages accessible, paid actions return 403. Reminder emails at days 1 and 4.
 - **Day 6 email:** "your account will be locked tomorrow unless you verify."
-- **Day 7 onward (locked):** a `require_not_locked` FastAPI dependency returns 403 on every route except `/auth/verify-email`, `/auth/resend-verification`, `/auth/change-email`, `/auth/me`, `/auth/logout`. Successful verification flips `verified_at` and instantly unlocks everything.
+- **Day 7 onward (locked):** a `require_not_locked` FastAPI dependency returns 403 on every **authenticated** route except `/auth/verify-email`, `/auth/resend-verification`, `/auth/change-email`, `/auth/me`, `/auth/logout`. Anonymous / unauthenticated routes (login, register, forgot-password, reset-password, refresh, etc.) are out of scope — the lock is a per-account control that only makes sense once a user is identified. Successful verification flips `verified_at` and instantly unlocks everything.
 - **Day 29 email:** final warning before deletion.
 - **Day 30:** a nightly sweep (Cloud Scheduler → Cloud Run job running `DELETE FROM users WHERE verified_at IS NULL AND created_at < now() - interval '30 days'`) hard-deletes still-unverified accounts. Releases the email for re-registration and aligns with the 30-day retention commitment in Privacy Policy §4. Cascades to `refresh_tokens`; no `subscriptions` rows should exist since paid actions are blocked.
 
