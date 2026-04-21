@@ -3,7 +3,7 @@ timeout: 1800s
 availableSecrets:
   secretManager:
     - versionName: projects/$PROJECT_ID/secrets/carddroper-migration-database-url/versions/latest
-      env: DATABASE_URL
+      env: MIGRATION_DATABASE_URL
 
 steps:
   # 1. Build backend image
@@ -21,39 +21,26 @@ steps:
       - us-west1-docker.pkg.dev/$PROJECT_ID/carddroper-repo/backend:$SHORT_SHA
 
   # 3. Run alembic upgrade head against Cloud SQL via the Auth Proxy.
-  # Start the proxy as a sidecar container, then run alembic in a second
-  # container that shares the proxy's network namespace so the migration
-  # DATABASE_URL's 127.0.0.1:5432 points at the proxy.
+  # Runs AS the backend image so alembic + app code are already on PATH.
+  # Downloads the proxy binary with Python (image has no wget/curl),
+  # starts it as a background process, runs alembic, then kills the proxy.
   - id: migrate
-    name: gcr.io/cloud-builders/docker
-    entrypoint: bash
+    name: us-west1-docker.pkg.dev/$PROJECT_ID/carddroper-repo/backend:$SHORT_SHA
+    entrypoint: sh
     args:
       - -c
       - |
-        set -e
-        trap 'docker rm -f sql-proxy 2>/dev/null || true' EXIT
-
-        docker run -d --name sql-proxy \
-          gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.11.4 \
-          --address=0.0.0.0 \
-          --port=5432 \
-          carddroper-staging:us-west1:carddroper-staging-db
-
-        # Wait until the proxy reports ready (log line "ready for new connections")
-        for i in $(seq 1 30); do
-          if docker logs sql-proxy 2>&1 | grep -q "ready for new connections"; then
-            break
-          fi
-          sleep 2
-        done
-
-        docker run --rm \
-          --network=container:sql-proxy \
-          -e DATABASE_URL="$$DATABASE_URL" \
-          us-west1-docker.pkg.dev/$PROJECT_ID/carddroper-repo/backend:$SHORT_SHA \
-          alembic upgrade head
+        python -c "import urllib.request; urllib.request.urlretrieve('https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v2.15.2/cloud-sql-proxy.linux.amd64', '/tmp/cloud-sql-proxy')"
+        chmod +x /tmp/cloud-sql-proxy
+        /tmp/cloud-sql-proxy carddroper-staging:us-west1:carddroper-staging-db --port=5432 &
+        PROXY_PID=$!
+        sleep 3
+        DATABASE_URL="$$MIGRATION_DATABASE_URL" alembic upgrade head
+        RESULT=$?
+        kill $$PROXY_PID 2>/dev/null
+        exit $$RESULT
     secretEnv:
-      - DATABASE_URL
+      - MIGRATION_DATABASE_URL
 
   # 4. Deploy backend to Cloud Run
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk
