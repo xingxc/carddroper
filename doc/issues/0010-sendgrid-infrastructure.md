@@ -8,27 +8,48 @@ found_by: orchestrator 2026-04-20
 
 ## Context
 
-PLAN.md §10.5 (email layer) and §10.6 (Stripe) both consume this service. This ticket lands a production-grade email helper *before* either layer calls it, so we never retrofit retries / templating / async-offload across live callsites.
+PLAN.md §10.5 (email layer) and §10.6 (Stripe) both consume this service. This
+ticket lands a production-grade email helper *before* either layer calls it,
+so we never retrofit retries / templating / async-offload across live
+callsites.
 
-The scaffold left behind `backend/app/services/email_service.py` (and it is **already consumed** by `backend/app/routes/auth.py` — register, verify-resend, forgot-password, change-email). Ground-truth callsites are in ticket 0009's audit report — this ticket reshapes the helper *and* updates every existing callsite to the new signature.
+The scaffold left behind `backend/app/services/email_service.py` (and it is
+**already consumed** by `backend/app/routes/auth.py` — register, verify-resend,
+forgot-password, change-email). Ground-truth callsites are in ticket 0009's
+audit report — this ticket reshapes the helper *and* updates every existing
+callsite to the new signature.
+
+**Readiness audit (2026-04-20, patch 2026-04-21).** Three readiness audits
+(`doc/audits/2026-04-20-sendgrid-doc-readiness.md`,
+`doc/audits/2026-04-20-sendgrid-backend-readiness.md`,
+`doc/audits/2026-04-20-sendgrid-frontend-readiness.md`) ran before
+implementation dispatch. This ticket was patched 2026-04-21 with their
+findings: 5th canary template (`EMAIL_CHANGED`) added because the
+`auth.md` canary is a distinct email from the change-email verification link;
+`dynamic_template_data` key contract specified per template;
+`FRONTEND_BASE_URL` added to Settings; best-effort callsite semantics made
+explicit; `SecretStr` truthiness unwrap specified; Dockerfile `COPY .`
+ordering specified; `poetry` references swapped for `.venv/bin`;
+`cloudbuild.yaml` repo-root path named; HTML-escaping dropped;
+`dev_preview_url` added to the no-key fallback.
 
 **Improvements over the foodapp pattern** (all to be delivered):
 
-1. **Singleton SendGrid client.** Instantiate once at FastAPI startup (`main.py` lifespan), reuse across requests. foodapp instantiated per-call.
-2. **Async offload for the sync SDK.** `sendgrid.SendGridAPIClient` is a blocking `requests`-based client. All calls out of `send_email()` must go through `asyncio.to_thread(...)` (or an equivalent thread-pool offload). Without this, every send blocks the FastAPI event loop — a latent concurrency bug that is invisible under low load.
-3. **Per-attempt HTTP timeout of 5 seconds.** Configure on the SendGrid client's underlying session (or via `httpx.AsyncClient` if the builder chooses to rewrite). Prevents a hung TLS handshake from blocking for Cloud Run's full 5-minute request budget.
-4. **Tenacity retry with exponential backoff.** 3 attempts, 1s → 4s → 16s. Retry predicate: network errors (`requests.Timeout`, `requests.ConnectionError`) **or** any caught exception where `getattr(exc, "status_code", None) in {429, 500, 502, 503, 504}`. Do not retry on other 4xx — those are developer errors, failing loud is correct.
-5. **Dynamic Templates.** Every outbound email uses a server-side template ID. Code passes `dynamic_template_data: dict`. No hardcoded HTML in the codebase.
-6. **Typed `EmailTemplate` enum.** Members: `VERIFY_EMAIL`, `RESET_PASSWORD`, `CHANGE_EMAIL`, `CREDITS_PURCHASED`. Each resolves to a Settings field carrying the SendGrid template ID. `send_email(template: EmailTemplate, ...)` — no loose strings.
-7. **Structured logging.** Each send emits `{event: "email_sent", template, to_hash, sg_message_id, attempt}` where `to_hash` is SHA-256 of the lowercased email. PII-safe tracing. On failure, log the full exception + `status_code` at `ERROR`.
-8. **Sandbox mode.** When `SENDGRID_SANDBOX=true`, set `mail_settings.sandbox_mode.enable=True` on the Mail object. SendGrid validates the payload but never delivers. Default `false` in staging/prod; `true` in tests.
+1. **Singleton SendGrid client.** Instantiate once at FastAPI startup (`main.py` lifespan), reuse across requests.
+2. **Async offload for the sync SDK.** `sendgrid.SendGridAPIClient` is blocking; all calls route through `asyncio.to_thread(...)`. Without this, every send blocks the event loop.
+3. **Per-attempt HTTP timeout of 5 seconds.**
+4. **Tenacity retry with exponential backoff.** 3 attempts, 1s → 4s → 16s. Retry on `requests.Timeout`, `requests.ConnectionError`, or any exception with `status_code` in `{429, 500, 502, 503, 504}`. Other 4xx fail loud.
+5. **Dynamic Templates.** Every outbound email uses a server-side template ID + `dynamic_template_data: dict`. No hardcoded HTML.
+6. **Typed `EmailTemplate` enum** (5 members, see Phase 0 deliverable 1).
+7. **Structured logging.** `{event, template, to_hash, sg_message_id, attempt}` — `to_hash` is SHA-256 of the lowercased email. PII-safe.
+8. **Sandbox mode** via `SENDGRID_SANDBOX`. When true, SendGrid validates but does not deliver.
 9. **`from_address` / `from_name` as parameters** (defaults from `FROM_EMAIL` / `FROM_NAME`). Forward-compat for v0.2 multi-tenant.
-10. **Settings repr hides the key.** Pydantic `SecretStr` for `SENDGRID_API_KEY` so logs / `/health?debug=true` never leak the raw key.
+10. **`SecretStr` for API key** so logs / `/health?debug=true` never leak the raw key.
 
 ## Pre-requisites
 
 - Ticket 0008 resolved (staging custom domains live).
-- Ticket 0009 (code audit) resolved (2026-04-20). Relevant extracts from `doc/audits/2026-04-20-backend-audit.md` are inlined below — this ticket does not require re-reading that file.
+- Ticket 0009 (code audit) resolved (2026-04-20).
 - Access to the Carddroper SendGrid account (user must create if new).
 
 **Current `email_service.py` public API** (to be fully reshaped in Phase 0):
@@ -41,7 +62,9 @@ def send_email_change_verification(new_email: str, token: str, full_name: Option
 def send_email_change_notification(old_email: str, new_email: str) -> bool
 ```
 
-**All callsites** (all in `backend/app/routes/auth.py`, all currently wrap the send in `asyncio.to_thread(...)` at the outer helper level — Phase 0 moves the offload *inside* `send_email` so callsites just `await send_email(...)`):
+**All callsites** (all in `backend/app/routes/auth.py`, all currently wrap the
+send in `asyncio.to_thread(...)` at the outer helper level — Phase 0 moves the
+offload *inside* `send_email` so callsites just `await send_email(...)`):
 
 | Line | Endpoint | Current call |
 |---|---|---|
@@ -53,12 +76,11 @@ def send_email_change_notification(old_email: str, new_email: str) -> bool
 
 **Audit-derived fixes folded into Phase 0:**
 
-- **F-2 (medium, security):** the current "no API key" dev fallback at `email_service.py:20` logs `{"to": to, "body_text": text or html[:500]}` — the `body_text` contains the full verification/reset link (i.e. a valid auth token) in production-shape logs. Phase 0 must drop `body_text` entirely from the no-key fallback log and replace `to` with the same `to_hash` used on the real-send path. Safe log fields in the no-key branch: `template`, `to_hash`, `mock_message_id`. Nothing else.
-- **F-4 (medium, dep-hygiene):** `backend/requirements.txt` duplicates `pyproject.toml` and the `Dockerfile` installs via a third hand-maintained `pip install` list. Phase 0 deletes `backend/requirements.txt` and updates the `Dockerfile` to install via `pip install .` against `pyproject.toml`. tenacity gets added to `pyproject.toml` (not anywhere else).
+- **F-2 (medium, security):** the current no-key dev fallback at `email_service.py:20` logs `{"to": to, "subject": subject, "body_text": text or html[:500]}` — `body_text` contains the full verification/reset link (valid auth token) in production-shape logs. Phase 0 must drop all three (`to`, `subject`, `body_text`) from the fallback log. Safe fields: `event`, `template`, `to_hash`, `mock_message_id`, `dev_preview_url` (single preview URL only, safe because this path only fires in dev after 0010 lands — staging/prod always have SENDGRID_API_KEY set via Secret Manager).
+
+- **F-4 (medium, dep-hygiene):** `backend/requirements.txt` duplicates `pyproject.toml` and the `Dockerfile` installs via a third hand-maintained `pip install` list. Phase 0 deletes `backend/requirements.txt` and updates the `Dockerfile` to `pip install .` against `pyproject.toml`. **Layer ordering matters: `COPY . .` MUST precede `RUN pip install .`** — pip needs the package source (`app/` directory + `pyproject.toml`) present to install. Current Dockerfile has `COPY . .` AFTER the pip install; move it before. tenacity gets added to `pyproject.toml` (not anywhere else).
 
 **Confirm staging still green:**
-
-Confirm staging still green:
 
 ```bash
 curl -sSf https://api.staging.carddroper.com/health
@@ -77,167 +99,369 @@ Task: Reshape backend/app/services/email_service.py to the production-grade help
 
 Ground truth: the Pre-requisites section of this ticket inlines the current
   email_service public API (5 functions) and all 5 callsites in routes/auth.py
-  (L241, L399, L494, L525-L527, L569). Every callsite in that table must switch
-  to the new send_email signature. The four helper functions (send_verification_email,
-  send_password_reset, send_email_change_verification, send_email_change_notification)
-  are dropped — their callers move to the new typed send_email directly.
+  (L241, L399, L494, L525-L527, L569). Every callsite in that table switches
+  to the new send_email signature. The four helper functions
+  (send_verification_email, send_password_reset, send_email_change_verification,
+  send_email_change_notification) are DELETED.
 
   If you find an email_service callsite outside that table, report it and still
   update it.
 
-Deliverables:
+====================================================================
+Deliverable 1 — Public API (5-member enum)
+====================================================================
 
-  1. Public API:
-       class EmailTemplate(str, Enum):
-           VERIFY_EMAIL = "VERIFY_EMAIL"
-           RESET_PASSWORD = "RESET_PASSWORD"
-           CHANGE_EMAIL = "CHANGE_EMAIL"
-           CREDITS_PURCHASED = "CREDITS_PURCHASED"
+    class EmailTemplate(str, Enum):
+        VERIFY_EMAIL = "VERIFY_EMAIL"              # → verification link to the signup address
+        RESET_PASSWORD = "RESET_PASSWORD"          # → reset link to the account address
+        CHANGE_EMAIL = "CHANGE_EMAIL"              # → verification link to the NEW address
+        EMAIL_CHANGED = "EMAIL_CHANGED"            # → canary notification to the OLD address
+        CREDITS_PURCHASED = "CREDITS_PURCHASED"    # → Stripe receipt (consumer ticket; Phase 0 does NOT wire this)
 
-       async def send_email(
-           *,
-           template: EmailTemplate,
-           to: str,
-           dynamic_template_data: dict,
-           from_address: str | None = None,
-           from_name: str | None = None,
-       ) -> str  # returns the SendGrid x-message-id
+    async def send_email(
+        *,
+        template: EmailTemplate,
+        to: str,
+        dynamic_template_data: dict,
+        from_address: str | None = None,
+        from_name: str | None = None,
+    ) -> str  # returns the SendGrid x-message-id on success, or "local-<uuid>" on no-key fallback
 
-  2. Singleton SendGrid client built once at module import. Expose
-     an init_email_client() / close_email_client() pair wired into
-     main.py's FastAPI lifespan, even if close is a no-op today.
+The 5th member (EMAIL_CHANGED) is NEW vs the scaffold. The auth.md §Email change
+canary — "your email was changed; contact support if not you" — is a distinct
+email from the change-email verification link, so it gets its own template.
 
-  3. ALL outbound calls go through asyncio.to_thread(client.send, mail)
-     (the SDK is sync; calling it directly on the event loop is a bug).
-     Per-attempt HTTP timeout = 5.0s, set on the client's requests session.
+====================================================================
+Deliverable 2 — dynamic_template_data KEY CONTRACT
+====================================================================
 
-  4. Tenacity retry:
-       - 3 attempts, exponential wait 1s → 4s → 16s.
-       - Retry on: requests.Timeout, requests.ConnectionError, OR any exception
-         where getattr(exc, "status_code", None) in {429, 500, 502, 503, 504}.
-       - Do NOT retry on other 4xx.
-       - Each attempt emits a structured log line with `attempt` incremented.
+Exactly these keys per template. Phase 1 (user) will declare these variable
+names inside the SendGrid Dynamic Template designer, so agreement is critical.
 
-  5. If Settings.SENDGRID_API_KEY is empty: send_email logs ONLY
-       {"event":"email_skipped_no_key", "template":<name>, "to_hash":<sha256 hex>,
-        "mock_message_id":"local-<uuid4>"}
-     and returns "local-<uuid4>". Makes no network call. Local dev works without a key.
-     (Audit F-2: the current implementation logs body_text which contains the full
-     token URL — that MUST go. Do not log dynamic_template_data contents, do not log
-     the raw "to" address, do not log the subject.)
+  VERIFY_EMAIL:
+    - verify_url:  str    # f"{settings.FRONTEND_BASE_URL}/verify-email?token={jwt}"
+    - full_name:   str | None  # Optional on User; template must render a fallback like "Hi there," when None
 
-  6. Sandbox: Settings.SENDGRID_SANDBOX (bool, default False). When True, set
-     mail.mail_settings.sandbox_mode.enable = True. Network call still happens;
-     SendGrid returns 200 without delivering.
+  RESET_PASSWORD:
+    - reset_url:   str    # f"{settings.FRONTEND_BASE_URL}/reset-password?token={jwt}"
+    - full_name:   str | None
 
-  7. Settings additions (all in backend/app/config.py):
-       SENDGRID_API_KEY: SecretStr = SecretStr("")   # pydantic SecretStr so repr hides it
-       SENDGRID_SANDBOX: bool = False
-       SENDGRID_TEMPLATE_VERIFY_EMAIL: str = ""
-       SENDGRID_TEMPLATE_RESET_PASSWORD: str = ""
-       SENDGRID_TEMPLATE_CHANGE_EMAIL: str = ""
-       SENDGRID_TEMPLATE_CREDITS_PURCHASED: str = ""
-       FROM_EMAIL: str = "noreply@carddroper.com"
-       FROM_NAME: str = "Carddroper"
+  CHANGE_EMAIL (verification to NEW address):
+    - change_url:  str    # f"{settings.FRONTEND_BASE_URL}/confirm-email-change?token={jwt}"
+    - full_name:   str | None
+    - new_email:   str    # destination address; useful context in the template body
 
-     EmailTemplate → settings-field resolution via a module-level dict.
-     If the resolved template ID is empty at send time, raise ValueError
-     ("SENDGRID_TEMPLATE_<NAME> is not configured"). Fail loud on misconfig.
+  EMAIL_CHANGED (canary notification to OLD address; no clickable token):
+    - old_email:       str
+    - new_email:       str
+    - change_date:     str      # ISO-8601 UTC, e.g. datetime.now(timezone.utc).isoformat()
+    - support_email:   str = "support@carddroper.com"   # hard-coded constant; MX routing deferred per PLAN.md §11
 
-  8. Structured logging: use the existing app logger. Log line shape:
-       INFO:  {"event":"email_sent","template":"VERIFY_EMAIL","to_hash":"<hex>",
-               "sg_message_id":"<x-message-id>","attempt":1}
-       ERROR: {"event":"email_send_failed","template":"...","to_hash":"...",
-               "status_code":<int or null>,"attempt":<int>,"error":"<exc class>"}
+  CREDITS_PURCHASED:
+    - DEFERRED to Stripe receipt ticket. Phase 0 does NOT wire this. Leave the
+      enum member + Settings field + Secret Manager entry in place.
 
-  9. Update backend/.env.example to include all new fields with safe defaults
-     (empty key, sandbox=false for parity with prod, empty template IDs).
+Values MUST NOT be HTML-escaped on the Python side. SendGrid Dynamic Templates
+escape automatically; double-escape produces literal `&amp;` etc. in rendered
+emails. Drop the current `html.escape(full_name)` in helpers.
 
-  10. Add backend/scripts/smoke_email.py — a tiny CLI that takes --to=<addr> and
-      --template=<name> and calls send_email. Used by Phase 4 for the live
-      staging send. Reads config from env (same Settings as the app).
+====================================================================
+Deliverable 3 — Singleton SendGrid client + lifespan wiring
+====================================================================
 
-  11. Update EVERY callsite of email_service in routes/auth.py (the 5 listed in
-      Pre-requisites: L241, L399, L494, L525-L527, L569) to the new send_email
-      signature. The four helper wrappers (send_verification_email,
-      send_password_reset, send_email_change_verification,
-      send_email_change_notification) are deleted — no meaningful wrapping survives
-      the reshape because templates are now server-side and HTML construction moves
-      out of Python entirely. Each former helper becomes a direct send_email call
-      at the route, passing the appropriate EmailTemplate enum + dynamic_template_data
-      dict.
+Expose `init_email_client()` / `close_email_client()` (close may be a no-op).
+Wire into main.py's existing FastAPI lifespan (the `@asynccontextmanager` at
+main.py lines 21-44). `init_email_client()` runs before `yield`, close after.
 
-  12. Audit F-4 (dep hygiene): delete backend/requirements.txt. Update
-      backend/Dockerfile to install runtime deps via `pip install .` against
-      pyproject.toml (currently a hand-maintained pip install list that duplicates
-      pyproject.toml). Confirm the build still succeeds with
-      `docker compose build backend` (or at minimum `docker build ./backend`).
+====================================================================
+Deliverable 4 — Async offload + per-attempt timeout
+====================================================================
+
+ALL outbound calls go through `asyncio.to_thread(client.send, mail)`. The SDK
+is sync; calling it on the event loop is a bug. Per-attempt HTTP timeout =
+5.0s, set on the client's requests session.
+
+====================================================================
+Deliverable 5 — Tenacity retry
+====================================================================
+
+- 3 attempts, exponential wait 1s → 4s → 16s.
+- Retry on: requests.Timeout, requests.ConnectionError, OR any exception
+  where getattr(exc, "status_code", None) in {429, 500, 502, 503, 504}.
+- Do NOT retry on other 4xx.
+- Each attempt emits a structured log line with `attempt` incremented.
+
+====================================================================
+Deliverable 6 — No-key fallback
+====================================================================
+
+If the API key is empty, skip the network call and return "local-<uuid4>".
+
+IMPORTANT: SENDGRID_API_KEY is now `SecretStr`, not `Optional[str]`. A bare
+`SecretStr("")` is TRUTHY AS AN OBJECT — `if not settings.SENDGRID_API_KEY:` will
+NEVER fire. Correct check:
+
+    if not settings.SENDGRID_API_KEY.get_secret_value():
+        <no-key fallback>
+
+Fallback log shape (absolutely nothing else):
+
+    logger.info("email_skipped_no_key", extra={
+        "event": "email_skipped_no_key",
+        "template": <EmailTemplate.name>,
+        "to_hash": <sha256 hex of lowercased to>,
+        "mock_message_id": f"local-{uuid4()}",
+        "dev_preview_url": <verify_url | reset_url | change_url | None>,
+            # whichever URL is in dynamic_template_data; None for EMAIL_CHANGED
+    })
+
+Do NOT log: `to`, `subject`, `body_text`, `body_html`, `full_name`, or any
+dynamic_template_data key other than the single preview URL.
+
+`dev_preview_url` is safe here because after 0010 this fallback only fires in
+local dev (staging/prod always have SENDGRID_API_KEY set). F-2's security
+concern is moot in that state.
+
+====================================================================
+Deliverable 7 — Sandbox mode
+====================================================================
+
+Settings.SENDGRID_SANDBOX (bool, default False). When True, set
+`mail.mail_settings.sandbox_mode.enable = True`. Network call still happens;
+SendGrid returns 200 without delivering.
+
+====================================================================
+Deliverable 8 — Settings additions (backend/app/config.py)
+====================================================================
+
+    SENDGRID_API_KEY: SecretStr = SecretStr("")
+    SENDGRID_SANDBOX: bool = False
+    SENDGRID_TEMPLATE_VERIFY_EMAIL: str = ""
+    SENDGRID_TEMPLATE_RESET_PASSWORD: str = ""
+    SENDGRID_TEMPLATE_CHANGE_EMAIL: str = ""
+    SENDGRID_TEMPLATE_EMAIL_CHANGED: str = ""          # 5th — canary to old address
+    SENDGRID_TEMPLATE_CREDITS_PURCHASED: str = ""
+    FRONTEND_BASE_URL: str = "http://localhost:3000"   # staging overrides via --set-env-vars
+
+DO NOT re-declare FROM_EMAIL or FROM_NAME — they already exist in config.py.
+Only CHANGE SENDGRID_API_KEY type (Optional[str] → SecretStr) and ADD the new
+fields. Import `from pydantic import SecretStr` at the top of config.py.
+
+EmailTemplate → settings-field resolution via a module-level dict, e.g.:
+
+    _TEMPLATE_FIELD = {
+        EmailTemplate.VERIFY_EMAIL:        "SENDGRID_TEMPLATE_VERIFY_EMAIL",
+        EmailTemplate.RESET_PASSWORD:      "SENDGRID_TEMPLATE_RESET_PASSWORD",
+        EmailTemplate.CHANGE_EMAIL:        "SENDGRID_TEMPLATE_CHANGE_EMAIL",
+        EmailTemplate.EMAIL_CHANGED:       "SENDGRID_TEMPLATE_EMAIL_CHANGED",
+        EmailTemplate.CREDITS_PURCHASED:   "SENDGRID_TEMPLATE_CREDITS_PURCHASED",
+    }
+
+If the resolved template ID is empty at send time, raise ValueError
+("SENDGRID_TEMPLATE_<NAME> is not configured"). Fail loud on misconfig.
+
+====================================================================
+Deliverable 9 — Structured logging
+====================================================================
+
+Use the existing app logger. The JSON formatter at app/logging.py promotes all
+`extra` keys to top-level fields. Shapes:
+
+    INFO:  logger.info("email_sent", extra={
+             "event": "email_sent", "template": "VERIFY_EMAIL", "to_hash": "<hex>",
+             "sg_message_id": "<x-message-id>", "attempt": 1,
+           })
+    ERROR: logger.error("email_send_failed", extra={
+             "event": "email_send_failed", "template": "...", "to_hash": "...",
+             "status_code": <int or None>, "attempt": <int>, "error": "<exc class>",
+           })
+
+====================================================================
+Deliverable 10 — backend/.env.example
+====================================================================
+
+Update to include all new fields with safe defaults:
+    SENDGRID_API_KEY=
+    SENDGRID_SANDBOX=false
+    SENDGRID_TEMPLATE_VERIFY_EMAIL=
+    SENDGRID_TEMPLATE_RESET_PASSWORD=
+    SENDGRID_TEMPLATE_CHANGE_EMAIL=
+    SENDGRID_TEMPLATE_EMAIL_CHANGED=
+    SENDGRID_TEMPLATE_CREDITS_PURCHASED=
+    FROM_EMAIL=noreply@carddroper.com
+    FROM_NAME=Carddroper
+    FRONTEND_BASE_URL=http://localhost:3000
+
+====================================================================
+Deliverable 11 — scripts/smoke_email.py
+====================================================================
+
+Create `backend/scripts/` directory (does NOT exist today). Inside it create
+`smoke_email.py`: a tiny CLI that takes --to=<addr> and --template=<name>,
+constructs a stub dynamic_template_data dict matching the template, and calls
+`await send_email(...)`. Reads config from env (same Settings as the app). Prints
+the returned sg_message_id (or "local-<uuid>") and exits 0 on success.
+
+Invocation convention (from `backend/`):
+    .venv/bin/python scripts/smoke_email.py --to=foo@bar.com --template=VERIFY_EMAIL
+
+No __init__.py needed if run as a script.
+
+====================================================================
+Deliverable 12 — Update all 5 callsites in routes/auth.py
+====================================================================
+
+Delete the 4 helper wrappers in email_service.py
+(send_verification_email, send_password_reset, send_email_change_verification,
+send_email_change_notification). Templates are server-side; HTML construction
+moves out of Python; URL construction moves to the callsite.
+
+**CRITICAL: preserve best-effort semantic.** Each callsite MUST wrap
+`await send_email(...)` in its own `try/except Exception`, log via
+`logger.exception(...)`, and continue. Email-send failure must NOT fail the
+enclosing HTTP request. This is current behaviour per the 0009 audit and must
+not regress. Example:
+
+    try:
+        await send_email(
+            template=EmailTemplate.VERIFY_EMAIL,
+            to=user.email,
+            dynamic_template_data={
+                "verify_url": f"{settings.FRONTEND_BASE_URL}/verify-email?token={verify_token}",
+                "full_name": user.full_name,
+            },
+        )
+    except Exception:
+        logger.exception("verification_email_send_failed", extra={"user_id": user.id})
+        # do NOT raise — registration succeeded; email is best-effort.
+
+For the L569 `confirm_email_change` callsite (canary to OLD address):
+
+    try:
+        await send_email(
+            template=EmailTemplate.EMAIL_CHANGED,
+            to=old_email,
+            dynamic_template_data={
+                "old_email": old_email,
+                "new_email": new_email,
+                "change_date": datetime.now(timezone.utc).isoformat(),
+                "support_email": "support@carddroper.com",
+            },
+        )
+    except Exception:
+        logger.exception("email_changed_canary_send_failed", extra={"user_id": user.id})
+
+The existing current-scaffold callsite does not use full_name for this
+notification; do not add it unless Phase 1 template design calls for it.
+
+====================================================================
+Deliverable 13 — Dep-hygiene (audit F-4)
+====================================================================
+
+Delete `backend/requirements.txt`. Update `backend/Dockerfile`:
+
+- Replace the hand-maintained pip install list with `RUN pip install .`.
+- **CRITICAL: `COPY . .` MUST precede `RUN pip install .`**. pip needs the
+  package source (app/ + pyproject.toml) present to install. The current
+  Dockerfile has `COPY . .` AFTER the pip step; move it before. This does
+  reduce Docker layer cache granularity; accept the tradeoff.
+- Confirm `docker build ./backend` still succeeds.
 
 Dependencies:
-  - Add tenacity to backend/pyproject.toml main deps (not dev/extras).
+  - Add `tenacity` to backend/pyproject.toml main deps (not dev/extras).
     Version: ^9 if available, else ^8.
-  - DO NOT add tenacity or any other dep to the deleted requirements.txt path.
+  - Do NOT re-add anything to the deleted requirements.txt.
 
-Tests (backend/tests/services/test_email_service.py):
-  a. Happy path: mocked client — send_email returns "X-Message-Id" header value,
-     emits one structured INFO log with attempt=1.
-  b. Sandbox mode: SENDGRID_SANDBOX=True — the Mail object passed to the mocked
-     client has mail_settings.sandbox_mode.enable=True.
+====================================================================
+Tests (backend/tests/services/test_email_service.py)
+====================================================================
+
+  a. Happy path: mocked client — send_email returns x-message-id, one INFO log
+     with attempt=1.
+  b. Sandbox mode: SENDGRID_SANDBOX=True — Mail object passed to mocked client
+     has mail_settings.sandbox_mode.enable=True.
   c. No API key: SENDGRID_API_KEY="" — send_email returns "local-<uuid>", mocked
-     client is never invoked.
-  d. Retry on 503: mocked client raises a 503-shaped exception twice, then succeeds.
-     Assert 3 attempts + one final success log.
-  e. Retry on ConnectionError: same shape, but raise ConnectionError.
-  f. No retry on 400: mocked client raises a 400-shaped exception. Assert 1 attempt
-     and the exception propagates.
-  g. Missing template ID: SENDGRID_TEMPLATE_VERIFY_EMAIL="" — send_email(template=
-     EmailTemplate.VERIFY_EMAIL, ...) raises ValueError before the client is called.
-  h. Event loop not blocked: can be a smoke test that calls send_email with the
-     mocked client configured to sleep() and asserts another coroutine runs
-     concurrently. (If the to_thread wiring is missing, this test hangs.)
+     client is NEVER invoked. Log entry has `event=email_skipped_no_key` and
+     contains no `to`, no `subject`, no `body_text`.
+  d. Retry on 503: mocked client raises a 503-shaped exception twice, succeeds
+     third. Assert 3 attempts + one final success log.
+  e. Retry on ConnectionError: same shape with ConnectionError.
+  f. No retry on 400: mocked client raises 400-shaped exception. Assert 1
+     attempt and the exception propagates.
+  g. Missing template ID: SENDGRID_TEMPLATE_VERIFY_EMAIL="" — send_email(
+     template=EmailTemplate.VERIFY_EMAIL, ...) raises ValueError before client.
+  h. Event loop not blocked: smoke test calls send_email with the mocked client
+     configured to sleep() and asserts another coroutine runs concurrently. (If
+     to_thread wiring is missing, this test hangs.)
+  i. Best-effort callsite preservation: patch send_email to raise after 3
+     retries, call POST /auth/register with a valid payload, assert the HTTP
+     response is still 201 (registration succeeded, email failed silently).
 
-Also run the existing auth test suite after updating callsites. Every existing test
-  that covered register / verify-resend / forgot / change-email must still pass,
-  potentially with updated mock targets if the function being patched moved.
+Run the full auth test suite after updating callsites; every test that
+exercised register / verify-resend / forgot / change-email must still pass.
 
-Do NOT:
-  - Ship a Jinja template directory (templates are server-side in SendGrid).
-  - Wire new routes — only update existing callsites.
-  - Add any CLI flag for prod; scripts/smoke_email.py is dev/staging only.
+====================================================================
+Do NOT
+====================================================================
 
-Report:
-  - Every file touched, one-line purpose each.
-  - Deps added (tenacity version), Settings fields added.
-  - List of callsites updated (file:line → new signature).
-  - Full pytest output (pass/fail counts).
-  - Any callsite found NOT in the 0009 audit (so orchestrator can flag the audit gap).
-  - Any deviation from this brief.
+- Ship a Jinja template directory (templates are server-side in SendGrid).
+- Wire new routes — only update existing callsites.
+- Add any CLI flag for prod; scripts/smoke_email.py is dev/staging only.
+- HTML-escape any value passed to dynamic_template_data.
+- Use `poetry` anywhere — this project has no poetry. Use `.venv/bin/*`
+  for all test / lint / script invocations.
+
+====================================================================
+Report
+====================================================================
+
+- Every file touched, one-line purpose each.
+- Deps added (tenacity version), Settings fields added (should be 7 new + 1
+  type change on SENDGRID_API_KEY).
+- List of callsites updated (file:line → new signature).
+- Full `.venv/bin/pytest` output (pass/fail counts).
+- Any callsite found NOT in the 5-row table (audit gap signal).
+- Any deviation from this brief.
 ```
 
 ### Phase 1: user — create SendGrid account + empty Dynamic Templates (browser)
 
 1. Log in or create account at https://signup.sendgrid.com/ (free tier = 100/day, plenty for staging).
 2. **Sender Authentication** (Settings → Sender Authentication):
-   - Authenticate `carddroper.com` via Domain Authentication. SendGrid gives you ~3 CNAME records (`s1._domainkey`, `s2._domainkey`, return-path like `em1234`).
-   - Add those in Cloudflare as CNAMEs, **Proxy status: DNS only** (grey cloud).
-   - Click **Verify** in SendGrid. Re-check if any fail — DKIM propagation on Cloudflare is usually under a minute, but edge caching occasionally needs 5-15 min. If "Show original" in Gmail later shows DKIM=fail, wait 15 min before escalating.
-3. **Create four empty Dynamic Templates** (Email API → Dynamic Templates → Create Template). Name them:
+   - Authenticate `carddroper.com` via Domain Authentication. SendGrid provides ~3 CNAME records (`s1._domainkey`, `s2._domainkey`, return-path like `em1234`).
+   - Add in Cloudflare as CNAMEs, **Proxy status: DNS only** (grey cloud).
+   - Click **Verify** in SendGrid. If any fail, wait 15 min for DNS/edge cache.
+3. **Create FIVE empty Dynamic Templates** (Email API → Dynamic Templates → Create Template):
    - `carddroper-verify-email`
    - `carddroper-reset-password`
    - `carddroper-change-email`
+   - `carddroper-email-changed`          ← NEW canary to OLD address (per readiness audit)
    - `carddroper-credits-purchased`
 
-   **Do not fill in HTML/variables yet.** The consumer tickets (0011 email verify, 0013 Stripe receipts, etc.) each lock their own variable names and design the final copy. For now just create the templates, save the IDs (`d-abc123...`).
+   Expected template variables per template (wire into the designer, exactly these names):
+
+   | Template | Variables |
+   |---|---|
+   | `carddroper-verify-email` | `{{verify_url}}`, `{{full_name}}` |
+   | `carddroper-reset-password` | `{{reset_url}}`, `{{full_name}}` |
+   | `carddroper-change-email` | `{{change_url}}`, `{{full_name}}`, `{{new_email}}` |
+   | `carddroper-email-changed` | `{{old_email}}`, `{{new_email}}`, `{{change_date}}`, `{{support_email}}` |
+   | `carddroper-credits-purchased` | deferred — leave blank, set up with Stripe receipt ticket |
+
+   Leave HTML empty or use placeholder strings like `"Click here: {{verify_url}}"` for the initial staging smoke. Real copy lands with the consumer tickets.
+
 4. **Create one API key** (Settings → API Keys → Create API Key):
    - Name: `carddroper-staging-mail`
-   - Permission: **Restricted Access** → only **Mail Send: Full Access**
-   - Copy the key once (it is shown exactly once).
+   - Permission: **Restricted Access** → **Mail Send: Full Access**
+   - Copy the key once (shown exactly once).
 
-Output for Phase 2: one API key + four template IDs.
+Output for Phase 2: one API key + five template IDs.
 
 ### Phase 2: user — upload API key + template IDs as Secret Manager secrets (staging)
 
-Template IDs go into Secret Manager (not env vars) so future ID rotations don't touch `cloudbuild.yaml`. They aren't secret, but they *are* environment-specific config and Secret Manager is the single source of truth for that in this project.
+Template IDs go into Secret Manager (not env vars) so future ID rotations don't
+touch `cloudbuild.yaml`. They aren't secret, but they *are* environment-specific
+config and Secret Manager is the single source of truth for that in this project.
 
 ```bash
 PROJECT=carddroper-staging
@@ -247,11 +471,12 @@ SA=carddroper-runtime@$PROJECT.iam.gserviceaccount.com
 echo -n "SG.<KEY>" | gcloud secrets create carddroper-sendgrid-api-key \
     --project=$PROJECT --replication-policy=automatic --data-file=-
 
-# 2-5. Template IDs — not sensitive, but same storage for uniform plumbing.
+# 2-6. Template IDs (5 now, including the new email-changed canary).
 for PAIR in \
   "carddroper-sendgrid-template-verify-email:d-<VERIFY_ID>" \
   "carddroper-sendgrid-template-reset-password:d-<RESET_ID>" \
   "carddroper-sendgrid-template-change-email:d-<CHANGE_ID>" \
+  "carddroper-sendgrid-template-email-changed:d-<CHANGED_ID>" \
   "carddroper-sendgrid-template-credits-purchased:d-<CREDITS_ID>"; do
     NAME="${PAIR%%:*}"
     VALUE="${PAIR#*:}"
@@ -259,12 +484,13 @@ for PAIR in \
         --project=$PROJECT --replication-policy=automatic --data-file=-
 done
 
-# 6. Grant runtime SA read access on all five.
+# 7. Grant runtime SA read access on all 6 secrets.
 for NAME in \
   carddroper-sendgrid-api-key \
   carddroper-sendgrid-template-verify-email \
   carddroper-sendgrid-template-reset-password \
   carddroper-sendgrid-template-change-email \
+  carddroper-sendgrid-template-email-changed \
   carddroper-sendgrid-template-credits-purchased; do
     gcloud secrets add-iam-policy-binding "$NAME" \
         --project=$PROJECT \
@@ -278,10 +504,11 @@ Verify:
 ```bash
 gcloud secrets list --project=$PROJECT --filter="name:carddroper-sendgrid*" \
     --format="value(name)" | sort
-# Expected (5 rows):
+# Expected (6 rows):
 #   projects/.../secrets/carddroper-sendgrid-api-key
 #   projects/.../secrets/carddroper-sendgrid-template-change-email
 #   projects/.../secrets/carddroper-sendgrid-template-credits-purchased
+#   projects/.../secrets/carddroper-sendgrid-template-email-changed
 #   projects/.../secrets/carddroper-sendgrid-template-reset-password
 #   projects/.../secrets/carddroper-sendgrid-template-verify-email
 ```
@@ -291,22 +518,22 @@ gcloud secrets list --project=$PROJECT --filter="name:carddroper-sendgrid*" \
 Dispatch **backend-builder**:
 
 ```
-Task: Extend cloudbuild.yaml backend deploy step (step 4) to mount SendGrid config.
+Task: Extend the backend deploy step in `/Users/johnxing/mini/postapp/cloudbuild.yaml`
+  (repo root — NOT backend/cloudbuild.yaml; the file lives at the repo root)
+  to mount SendGrid config on the Cloud Run revision.
 
-Edit the --set-secrets line on the backend Cloud Run deploy so all five SendGrid
-secrets are mounted as env vars. Keep existing DATABASE_URL and JWT_SECRET entries.
+Edit step 4 (the `gcloud run deploy carddroper-backend` step). The existing
+`--set-secrets` line today is exactly:
 
-Resulting --set-secrets value (single comma-separated argument):
-  DATABASE_URL=carddroper-database-url:latest,
-  JWT_SECRET=carddroper-jwt-secret:latest,
-  SENDGRID_API_KEY=carddroper-sendgrid-api-key:latest,
-  SENDGRID_TEMPLATE_VERIFY_EMAIL=carddroper-sendgrid-template-verify-email:latest,
-  SENDGRID_TEMPLATE_RESET_PASSWORD=carddroper-sendgrid-template-reset-password:latest,
-  SENDGRID_TEMPLATE_CHANGE_EMAIL=carddroper-sendgrid-template-change-email:latest,
-  SENDGRID_TEMPLATE_CREDITS_PURCHASED=carddroper-sendgrid-template-credits-purchased:latest
+    --set-secrets=DATABASE_URL=carddroper-database-url:latest,JWT_SECRET=carddroper-jwt-secret:latest
 
-Add --set-env-vars (new argument) on the same deploy step with:
-  SENDGRID_SANDBOX=false,FROM_EMAIL=noreply@carddroper.com,FROM_NAME=Carddroper
+Replace with (single comma-separated argument, no line breaks in the actual YAML):
+
+    --set-secrets=DATABASE_URL=carddroper-database-url:latest,JWT_SECRET=carddroper-jwt-secret:latest,SENDGRID_API_KEY=carddroper-sendgrid-api-key:latest,SENDGRID_TEMPLATE_VERIFY_EMAIL=carddroper-sendgrid-template-verify-email:latest,SENDGRID_TEMPLATE_RESET_PASSWORD=carddroper-sendgrid-template-reset-password:latest,SENDGRID_TEMPLATE_CHANGE_EMAIL=carddroper-sendgrid-template-change-email:latest,SENDGRID_TEMPLATE_EMAIL_CHANGED=carddroper-sendgrid-template-email-changed:latest,SENDGRID_TEMPLATE_CREDITS_PURCHASED=carddroper-sendgrid-template-credits-purchased:latest
+
+Add a NEW `--set-env-vars` argument to the same deploy step with:
+
+    --set-env-vars=SENDGRID_SANDBOX=false,FROM_EMAIL=noreply@carddroper.com,FROM_NAME=Carddroper,FRONTEND_BASE_URL=https://staging.carddroper.com
 
 Do NOT merge. Report the diff; orchestrator merges to main after review.
 ```
@@ -315,15 +542,19 @@ Orchestrator reviews and merges to `main` to trigger the deploy.
 
 ### Phase 4: user — staging smoke test (real email send, no key in shell history)
 
-The backend build from Phase 3 must be `SUCCESS` first. Then run the local REPL against the real staging key, pulled from Secret Manager into a subshell — never into your shell history.
+The backend build from Phase 3 must be `SUCCESS` first. Then run the local
+smoke against the real staging key, pulled from Secret Manager into a subshell.
+
+**This project uses a plain `.venv` — NOT poetry.** All invocations use
+`.venv/bin/python` directly.
 
 ```bash
 cd /Users/johnxing/mini/postapp/backend
 
-# 1. Dry run — no key needed, confirms the smoke script imports cleanly.
-SENDGRID_API_KEY= poetry run python scripts/smoke_email.py \
+# 1. Dry run — no key needed, confirms smoke script imports cleanly.
+SENDGRID_API_KEY= .venv/bin/python scripts/smoke_email.py \
     --to="<your-personal-email>" --template=VERIFY_EMAIL
-# Expected: logs a payload, returns "local-<uuid>".
+# Expected: logs event=email_skipped_no_key with dev_preview_url; returns "local-<uuid>".
 
 # 2. Real send — key pulled inline from Secret Manager, scoped to this one command.
 SENDGRID_API_KEY="$(gcloud secrets versions access latest \
@@ -334,20 +565,28 @@ SENDGRID_TEMPLATE_VERIFY_EMAIL="$(gcloud secrets versions access latest \
     --project=carddroper-staging)" \
 FROM_EMAIL=noreply@carddroper.com \
 FROM_NAME=Carddroper \
-  poetry run python scripts/smoke_email.py \
+FRONTEND_BASE_URL=https://staging.carddroper.com \
+  .venv/bin/python scripts/smoke_email.py \
     --to="<your-personal-email>" --template=VERIFY_EMAIL
 # Expected: prints "sg_message_id=..." and exits 0.
 ```
 
-The key lives only in the subshell's environment for the single command — `~/.zsh_history` sees `$(gcloud ...)` as text, not the key.
+The key lives only in the subshell's environment for the single command —
+`~/.zsh_history` sees `$(gcloud ...)` as text, not the key.
 
 Expected in your inbox within 30 seconds:
-- Email with your chosen template's placeholder contents.
+
+- Email with your chosen template's placeholder contents rendered.
 - `From: Carddroper <noreply@carddroper.com>`.
 - Gmail → three dots → **Show original** shows `DKIM: 'PASS' with domain carddroper.com`.
 - SendGrid Activity Feed shows the send event with status `Delivered`.
 
-If DKIM shows `FAIL` or `NONE`, wait 15 minutes (Cloudflare → Google edge DKIM caching lag) and send again before escalating. The failure mode usually means sent-too-early after DNS update, not a real config bug.
+If DKIM shows `FAIL` or `NONE`, wait 15 minutes (Cloudflare → Google edge DKIM
+caching lag) and send again before escalating.
+
+**Note:** clicking the `{{verify_url}}` link in the delivered email will 404
+until ticket 0011 ships the `/verify-email` Next.js page. The smoke goal here is
+DKIM + delivery confirmation, not end-to-end verify.
 
 ## Verification
 
@@ -355,29 +594,31 @@ If DKIM shows `FAIL` or `NONE`, wait 15 minutes (Cloudflare → Google edge DKIM
 
 ```bash
 cd backend
-poetry run pytest tests/services/test_email_service.py -v   # new tests
-poetry run pytest                                            # full suite, 0 regressions
-poetry run ruff check app/ tests/ scripts/
+.venv/bin/pytest tests/services/test_email_service.py -v   # new tests
+.venv/bin/pytest                                           # full suite, 0 regressions
+.venv/bin/ruff check app/ tests/ scripts/
 ```
 
 **Functional smoke (user, staging, after Phase 3 deploy):**
 
 - `gcloud builds list --region=us-west1 --limit=1 --format="value(status)"` → `SUCCESS`.
-- `gcloud run services describe carddroper-backend --region=us-west1 --format="value(spec.template.spec.containers[0].env)"` shows `SENDGRID_SANDBOX=false`, `FROM_EMAIL=...`, `FROM_NAME=...`, and the secret-backed env vars.
+- `gcloud run services describe carddroper-backend --region=us-west1 --format="value(spec.template.spec.containers[0].env)"` shows `SENDGRID_SANDBOX=false`, `FROM_EMAIL=...`, `FROM_NAME=...`, `FRONTEND_BASE_URL=https://staging.carddroper.com`, and the six secret-backed env vars.
 - Real email arrives with `From: Carddroper <noreply@carddroper.com>`.
 - Gmail "Show original": DKIM=PASS, domain=carddroper.com.
 - SendGrid Activity Feed shows the send within 1 minute.
-- Cloud Run logs for the send include a structured line: `{"event":"email_sent","template":"VERIFY_EMAIL","to_hash":"<sha256 hex>","sg_message_id":"<x-message-id>","attempt":1}`.
+- Cloud Run logs for the send include a structured line:
+  `{"event":"email_sent","template":"VERIFY_EMAIL","to_hash":"<sha256 hex>","sg_message_id":"<x-message-id>","attempt":1}`.
 
 ## Out of scope
 
-- Wiring `send_email` into *new* routes (email verification polish = ticket 0011; Stripe receipt = ticket with the Stripe webhook). This ticket only updates *existing* callsites from the scaffold.
+- Wiring `send_email` into *new* routes (email verification polish = ticket 0011; Stripe receipt = its own ticket). This ticket only updates *existing* callsites from the scaffold.
+- **Frontend routes consuming the verify / reset / change URLs.** Ticket 0011 creates `/verify-email`, `/verify-email-sent`, `/reset-password`, `/confirm-email-change`. Until 0011 lands, the email links in 0010's smoke will resolve to Next.js 404s. Acceptable: staging has no real users and Phase 4 smoke is manual (personal inbox). v0.1.0 launch blocks on 0011.
 - SPF / DMARC tuning beyond the DKIM CNAMEs SendGrid provides. Pre-launch operational item.
-- MX / inbound mail for `support@`, `privacy@`, `legal@`. Pre-launch operational item.
+- MX / inbound mail for `support@`, `privacy@`, `legal@carddroper.com`. Pre-launch operational item.
 - Prod SendGrid account + secrets. Lands with the prod stand-up ticket.
 - Multi-tenant senders. `from_address` / `from_name` are parameters so v0.2 can use them; v0.1 always passes defaults.
-- Email open/click tracking and bounce/complaint webhook handling. Deferred to v0.2. We rely on SendGrid's built-in suppression list to protect sender reputation in the meantime.
-- Background-task / queue-based email dispatch. v0.1 sends inline on the request with tenacity + 5s per-attempt timeout (~36s worst-case). Move to async queue in v0.2 if latency becomes a UX issue.
+- Email open/click tracking and bounce/complaint webhook handling. Deferred to v0.2.
+- Background-task / queue-based email dispatch. v0.1 sends inline with tenacity + 5s per-attempt timeout (~36s worst-case). Move to queue in v0.2 if latency becomes a UX issue.
 
 ## Report
 
@@ -386,13 +627,13 @@ Backend-builder (Phases 0 and 3):
 - Deps added (name + version).
 - Settings fields added.
 - Callsites updated (file:line → new call shape).
-- Full pytest output.
-- Any callsites found NOT listed in 0009 audit (indicates audit gap).
+- Full `.venv/bin/pytest` output.
+- Any callsites found NOT listed in the 5-row table (audit gap).
 - Any deviations.
 
 User (Phases 1, 2, 4):
 - SendGrid domain auth: three CNAMEs, all green.
-- Four template IDs + API key uploaded to Secret Manager (paste the 5 secret names, not values).
+- Five template IDs + API key uploaded to Secret Manager (paste the 6 secret names, not values).
 - Inbox screenshot or timestamp of smoke email.
 - Gmail "Show original" DKIM=PASS line.
 

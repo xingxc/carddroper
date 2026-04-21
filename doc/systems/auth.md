@@ -62,7 +62,7 @@ The token extraction helper reads the cookie first, then falls back to the Autho
 ## Password reset
 
 Same design as foodapp:
-1. `POST /auth/forgot-password` looks up the user by email. Always returns 200 to prevent enumeration. If user exists, issues a signed reset JWT (`purpose="reset"`, `tv=token_version`, TTL 15m) and emails the link.
+1. `POST /auth/forgot-password` looks up the user by email. Always returns 200 to prevent enumeration. If user exists, issues a signed reset JWT (`purpose="reset"`, `tv=token_version`, TTL 15m) and emails the link `https://carddroper.com/reset-password?token=<jwt>` (staging: `https://staging.carddroper.com/reset-password?token=<jwt>`).
 2. `GET /auth/validate-reset-token?token=...` lets the frontend show "invalid link" / "expired link" without consuming the token.
 3. `POST /auth/reset-password` takes the token + new password. Validates `purpose`, `tv` still matches the user (single-use), updates `password_hash`, increments `token_version`, revokes all refresh tokens.
 
@@ -79,7 +79,7 @@ Standard for-money-handling pattern — keeps the legitimate user in the loop an
 
 1. User visits account settings, clicks "change email."
 2. `POST /auth/change-email { current_password, new_email }` — backend verifies `current_password` (proves it's really them, not a hijacked session). Returns 400 if `new_email` is already in use.
-3. Backend issues a signed JWT (`purpose="email_change"`, `tv=current_token_version`, `new_email=<...>`, TTL 1 h) and sends it to the **new** address as a verification link. Old email continues to work until the link is clicked.
+3. Backend issues a signed JWT (`purpose="email_change"`, `tv=current_token_version`, `new_email=<...>`, TTL 1 h) and sends it to the **new** address as a verification link `https://carddroper.com/confirm-email-change?token=<jwt>` (staging: `https://staging.carddroper.com/confirm-email-change?token=<jwt>`). Old email continues to work until the link is clicked.
 4. User clicks the link from the new inbox. Frontend calls `POST /auth/confirm-email-change { token }`. Backend:
    - Decodes, verifies `purpose` and that `tv` still matches the user (single-use within this token_version).
    - Updates `users.email = new_email`.
