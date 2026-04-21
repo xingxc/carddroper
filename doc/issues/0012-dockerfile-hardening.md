@@ -1,7 +1,7 @@
 ---
 id: 0012
 title: Dockerfile hardening — non-root + multi-stage + HEALTHCHECK + public/ cleanup
-status: open
+status: resolved
 priority: medium
 found_by: ticket 0009 audit (backend F-5 medium, frontend F-3 nit, F-7 low)
 ---
@@ -247,4 +247,23 @@ User:
 
 ## Resolution
 
-*(filled in by orchestrator on close)*
+Resolved 2026-04-21. All three audit findings closed plus the `backend/.dockerignore` gap surfaced during 0010 Cloud Build debugging.
+
+**Phases delivered:**
+
+- **Phase 0 — Backend (backend-builder, commit f566088).** `backend/Dockerfile` rewritten as two-stage: builder installs `libpq-dev`/`gcc`/`build-essential` and builds `/opt/venv` via `pip install .`; runtime carries only `libpq5`/`ca-certificates`/`tini`, copies the prebuilt venv, adds an `appuser` system user (`--system --no-create-home --group`), declares `USER appuser`, adds a `HEALTHCHECK` via `python urllib.request` (no curl in slim), and sets `ENTRYPOINT ["tini", "--"]` for PID-1 signal handling. `backend/.dockerignore` created — excludes `.venv/`, `__pycache__/`, lint/test caches, `.env*` (with `!.env.example`), local SQLite, `tests/`, `scripts/`, editor noise, and `README*.md`; keeps `alembic/` in-context for the Cloud Build migrate step.
+- **Phase 1 — Frontend (frontend-builder, commit f566088).** `frontend/Dockerfile` runner stage: one-line `ENV HOSTNAME=0.0.0.0` added per Next.js deploy guide (guards against future standalone default drift). Four unused create-next-app template SVGs deleted from `frontend/public/` (`file.svg`, `globe.svg`, `vercel.svg`, `window.svg`); no imports found via grep.
+- **Phase 2 — Staging deploy + verify (user, 2026-04-21).** `main` deployed via Cloud Build `SUCCESS`. `curl https://api.staging.carddroper.com/health` → `{"status":"ok","database":"connected"}`. `curl https://staging.carddroper.com` → SSR HTML with `Carddroper</h1>`. `gcloud run services logs read` shows only legitimate `/health` 200s and WordPress-probe 404s (internet background radiation — not a regression). No "running as root" advisory, no startup errors, no crashloop — service boots and serves under `appuser`. `scripts/smoke_healthz.py` → `SMOKE OK: healthz`.
+
+**Measured wins:**
+
+- Backend image size: **855 MB → 426 MB uncompressed** (~50% reduction). Build tools excised from the runtime image.
+- Backend build context: **747.65 kB → 2.85 kB** (`.dockerignore` pruned `.venv/` and caches from what `docker build` ships).
+- Backend container now runs as non-root (`.Config.User = "appuser"`); `HEALTHCHECK` non-nil; tini handles PID 1.
+- Frontend `HOSTNAME=0.0.0.0` explicit; four dead SVGs (including Vercel branding) gone from `public/`.
+
+**Deviations:** none. Scope matched the ticket; no cloudbuild.yaml changes required (mentally walked through — `/tmp` remained world-writable for the migrate step's `sh` exec; empirically confirmed by `docker run --rm carddroper-backend:hardened sh -c 'touch /tmp/foo && echo ok'`).
+
+**Acceptance trace.** All Acceptance items satisfied across Phases 0–2. §Verification automated checks: `docker build` both, `.Config.User = "appuser"`, `.Config.Healthcheck` non-nil, image size reduction measured, `.dockerignore` in place with context-size delta reported, pytest 36 passing, ruff clean, frontend lint/typecheck/build clean. §Verification functional smoke: Cloud Build `SUCCESS`, `/health` 200 JSON, frontend SSR heading, logs clean, four SVGs removed from `frontend/public/`.
+
+**Commits:** db8baaf (ticket amendment — `.dockerignore` added to Phase 0), f566088 (Phases 0–1 implementation).

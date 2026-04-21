@@ -49,5 +49,5 @@ The Verification section exists because "tsc passes" and "lint passes" are neces
 | 0009 | scaffold code audit — backend + frontend ground-truth inventory before v0.1.0 features | resolved | high |
 | 0010 | SendGrid infrastructure — hardened send_email() helper + staging secret wiring | resolved | high |
 | 0011 | backend hardening — global 500 exception handler + JWT iss/aud claims | resolved | high |
-| 0012 | Dockerfile hardening — non-root + multi-stage + HEALTHCHECK + public/ cleanup | open | medium |
+| 0012 | Dockerfile hardening — non-root + multi-stage + HEALTHCHECK + public/ cleanup | resolved | medium |
 | 0013 | testing methodology doc + coverage audit + backfill | resolved | high |
