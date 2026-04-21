@@ -30,7 +30,9 @@ def _utc_naive_now() -> datetime:
 
 
 def create_access_token(user_id: int, token_version: int = 0) -> str:
-    expire = datetime.now(tz=timezone.utc) + timedelta(minutes=settings.JWT_EXPIRATION_MINUTES)  # tz-aware: python-jose expects aware datetimes for exp. See doc/issues/0001.
+    expire = datetime.now(tz=timezone.utc) + timedelta(
+        minutes=settings.JWT_EXPIRATION_MINUTES
+    )  # tz-aware: python-jose expects aware datetimes for exp. See doc/issues/0001.
     payload = {
         "sub": str(user_id),
         "tv": token_version,
@@ -44,7 +46,9 @@ def create_access_token(user_id: int, token_version: int = 0) -> str:
 def _create_purpose_token(
     user_id: int, token_version: int, purpose: str, expires_delta: timedelta, **extra
 ) -> str:
-    expire = datetime.now(tz=timezone.utc) + expires_delta  # tz-aware: python-jose expects aware datetimes for exp. See doc/issues/0001.
+    expire = (
+        datetime.now(tz=timezone.utc) + expires_delta
+    )  # tz-aware: python-jose expects aware datetimes for exp. See doc/issues/0001.
     payload = {
         "sub": str(user_id),
         "tv": token_version,
@@ -153,9 +157,7 @@ async def verify_refresh_token(raw_token: str, db: AsyncSession) -> Optional[Ref
 
 async def revoke_refresh_token(raw_token: str, db: AsyncSession) -> None:
     token_hash = _hash_refresh_token(raw_token)
-    result = await db.execute(
-        select(RefreshToken).where(RefreshToken.token_hash == token_hash)
-    )
+    result = await db.execute(select(RefreshToken).where(RefreshToken.token_hash == token_hash))
     row = result.scalar_one_or_none()
     if row and row.revoked_at is None:
         row.revoked_at = _utc_naive_now()

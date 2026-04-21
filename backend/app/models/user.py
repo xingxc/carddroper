@@ -26,6 +26,6 @@ class User(Base):
         server_default=func.now(), onupdate=func.now()
     )
 
-    refresh_tokens: Mapped[List["RefreshToken"]] = relationship(
+    refresh_tokens: Mapped[List["RefreshToken"]] = relationship(  # noqa: F821
         "RefreshToken", back_populates="user", cascade="all, delete-orphan"
     )

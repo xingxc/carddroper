@@ -21,11 +21,30 @@ class _JsonFormatter(logging.Formatter):
 
         for key, value in record.__dict__.items():
             if key not in {
-                "args", "asctime", "created", "exc_info", "exc_text",
-                "filename", "funcName", "id", "levelname", "levelno",
-                "lineno", "message", "module", "msecs", "msg", "name",
-                "pathname", "process", "processName", "relativeCreated",
-                "stack_info", "thread", "threadName", "taskName",
+                "args",
+                "asctime",
+                "created",
+                "exc_info",
+                "exc_text",
+                "filename",
+                "funcName",
+                "id",
+                "levelname",
+                "levelno",
+                "lineno",
+                "message",
+                "module",
+                "msecs",
+                "msg",
+                "name",
+                "pathname",
+                "process",
+                "processName",
+                "relativeCreated",
+                "stack_info",
+                "thread",
+                "threadName",
+                "taskName",
             }:
                 log_obj[key] = value
 
@@ -55,9 +74,7 @@ def get_logger(name: str) -> logging.Logger:
 class LoggingMiddleware(BaseHTTPMiddleware):
     _logger = get_logger("http")
 
-    async def dispatch(
-        self, request: Request, call_next: RequestResponseEndpoint
-    ) -> Response:
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         start = time.perf_counter()
         response: Response = await call_next(request)
         duration_ms = round((time.perf_counter() - start) * 1000, 2)

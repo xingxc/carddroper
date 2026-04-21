@@ -1,4 +1,5 @@
 """Tests for JWT iss/aud claims (ticket 0011, Deliverable B)."""
+
 import time
 
 import pytest
@@ -11,6 +12,7 @@ pytestmark = pytest.mark.asyncio
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _mint(payload_overrides: dict) -> str:
     """Mint a raw JWT with the project secret, allowing arbitrary claim overrides."""
@@ -37,6 +39,7 @@ async def _register(client) -> dict:
 # ---------------------------------------------------------------------------
 # B-happy: minted token decodes and carries iss + aud
 # ---------------------------------------------------------------------------
+
 
 async def test_access_token_has_iss_and_aud(client):
     body = await _register(client)
@@ -68,6 +71,7 @@ async def test_access_token_accepted_by_me(client):
 # B-wrong-audience
 # ---------------------------------------------------------------------------
 
+
 async def test_wrong_audience_returns_401(client):
     token = _mint({"aud": "carddroper-other"})
     r = await client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
@@ -80,6 +84,7 @@ async def test_wrong_audience_returns_401(client):
 # B-wrong-issuer
 # ---------------------------------------------------------------------------
 
+
 async def test_wrong_issuer_returns_401(client):
     token = _mint({"iss": "someone-else"})
     r = await client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
@@ -91,6 +96,7 @@ async def test_wrong_issuer_returns_401(client):
 # ---------------------------------------------------------------------------
 # B-missing-aud
 # ---------------------------------------------------------------------------
+
 
 async def test_missing_aud_returns_401(client):
     # Encode without aud at all.
@@ -110,6 +116,7 @@ async def test_missing_aud_returns_401(client):
 # ---------------------------------------------------------------------------
 # B-missing-iss
 # ---------------------------------------------------------------------------
+
 
 async def test_missing_iss_returns_401(client):
     payload = {

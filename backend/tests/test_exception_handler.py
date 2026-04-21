@@ -8,6 +8,7 @@ middleware stack is complicated by Starlette's BaseHTTPMiddleware behaviour
   2. Confirm it is registered in app.exception_handlers under Exception.
   3. Smoke the route via raise_app_exceptions=False to confirm a 500 is returned.
 """
+
 import logging
 
 import httpx
@@ -22,6 +23,7 @@ pytestmark = pytest.mark.asyncio
 # ---------------------------------------------------------------------------
 # Unit test: call the handler directly
 # ---------------------------------------------------------------------------
+
 
 async def test_handler_returns_correct_json_shape(caplog):
     """internal_error_handler returns 500 JSON with INTERNAL_ERROR code."""
@@ -111,6 +113,7 @@ async def test_handler_logs_unhandled_exception_event(caplog):
 # Wiring check: handler is registered in main app
 # ---------------------------------------------------------------------------
 
+
 def test_exception_handler_registered_in_app():
     """Exception (catch-all) must be registered as a handler on the main app."""
     from app.main import app as fastapi_app
@@ -120,8 +123,7 @@ def test_exception_handler_registered_in_app():
     # The Exception entry must map to our internal_error_handler.
     handlers = fastapi_app.exception_handlers
     assert Exception in handlers, (
-        f"Exception not registered as exception handler. "
-        f"Registered: {list(handlers.keys())}"
+        f"Exception not registered as exception handler. Registered: {list(handlers.keys())}"
     )
     assert handlers[Exception] is internal_error_handler
 
@@ -129,6 +131,7 @@ def test_exception_handler_registered_in_app():
 # ---------------------------------------------------------------------------
 # Integration smoke: 500 is returned (body shape verified above via unit test)
 # ---------------------------------------------------------------------------
+
 
 @pytest_asyncio.fixture
 async def boom_client():

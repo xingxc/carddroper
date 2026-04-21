@@ -5,9 +5,10 @@ Each test function gets:
 - A configured FastAPI `app` with that DB wired in.
 - An httpx.AsyncClient pointed at the app via ASGITransport (no real network).
 """
+
 import os
 
-import pytest
+import pytest  # noqa: F401
 import pytest_asyncio
 
 # Force test env before the app imports config / database.

@@ -20,9 +20,12 @@ logger = get_logger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from app.services.email_service import close_email_client, init_email_client
+
     logger.info("Starting up — testing database connection…")
     await init_db()
     logger.info("Database connection OK")
+    init_email_client()
 
     from app.models.refresh_token import RefreshToken
 
@@ -41,6 +44,7 @@ async def lifespan(app: FastAPI):
             )
 
     yield
+    close_email_client()
     logger.info("Shutting down")
 
 

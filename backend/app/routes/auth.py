@@ -15,13 +15,13 @@ Endpoints:
     POST /auth/change-email
     POST /auth/confirm-email-change
 """
-import asyncio
+
 from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from sqlalchemy import select
@@ -49,12 +49,7 @@ from app.services.auth_service import (
     verify_password,
     verify_refresh_token,
 )
-from app.services.email_service import (
-    send_email_change_notification,
-    send_email_change_verification,
-    send_password_reset,
-    send_verification_email,
-)
+from app.services.email_service import EmailTemplate, send_email
 from app.services.hibp import validate_password
 from app.services.lockout_service import (
     clear_failures_for,
@@ -72,6 +67,7 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 # ---------------------------------------------------------------------------
 # Cookie helpers
 # ---------------------------------------------------------------------------
+
 
 def _set_access_cookie(response: JSONResponse, access_token: str) -> None:
     response.set_cookie(
@@ -122,6 +118,7 @@ def _clear_auth_cookies(response: JSONResponse) -> None:
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
+
 
 class RegisterRequest(BaseModel):
     email: EmailStr
@@ -188,6 +185,7 @@ class ConfirmEmailChangeRequest(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _user_response(user: User) -> UserResponse:
     return UserResponse(
         id=user.id,
@@ -212,6 +210,7 @@ def _refresh_from_request(request: Request, body: Optional[RefreshRequest]) -> O
 # ---------------------------------------------------------------------------
 # POST /auth/register
 # ---------------------------------------------------------------------------
+
 
 @router.post("/register", response_model=AuthResponse)
 @limiter.limit(settings.REGISTER_RATE_LIMIT)
@@ -238,9 +237,17 @@ async def register(
 
     verify_token = create_verify_token(user.id, user.token_version)
     try:
-        await asyncio.to_thread(send_verification_email, user.email, verify_token, user.full_name)
-    except Exception as e:
-        logger.error("Failed to send verification email", extra={"error": str(e)})
+        await send_email(
+            template=EmailTemplate.VERIFY_EMAIL,
+            to=user.email,
+            dynamic_template_data={
+                "verify_url": f"{settings.FRONTEND_BASE_URL}/verify-email?token={verify_token}",
+                "full_name": user.full_name,
+            },
+        )
+    except Exception:
+        logger.exception("verification_email_send_failed", extra={"user_id": user.id})
+        # do NOT raise — registration succeeded; email is best-effort.
 
     payload = AuthResponse(
         access_token=access_tok,
@@ -255,6 +262,7 @@ async def register(
 # ---------------------------------------------------------------------------
 # POST /auth/login
 # ---------------------------------------------------------------------------
+
 
 @router.post("/login", response_model=AuthResponse)
 @limiter.limit(settings.LOGIN_RATE_LIMIT)
@@ -295,6 +303,7 @@ async def login(
 # POST /auth/logout
 # ---------------------------------------------------------------------------
 
+
 @router.post("/logout", response_model=MessageResponse)
 @limiter.limit(settings.LOGOUT_RATE_LIMIT)
 async def logout(
@@ -313,6 +322,7 @@ async def logout(
 # ---------------------------------------------------------------------------
 # POST /auth/refresh
 # ---------------------------------------------------------------------------
+
 
 @router.post("/refresh", response_model=MessageResponse)
 @limiter.limit(settings.REFRESH_RATE_LIMIT)
@@ -335,9 +345,7 @@ async def refresh(
         raise unauthorized("User not found.")
 
     access_tok = create_access_token(user.id, user.token_version)
-    response = JSONResponse(
-        content={"message": "Token refreshed.", "access_token": access_tok}
-    )
+    response = JSONResponse(content={"message": "Token refreshed.", "access_token": access_tok})
     _set_access_cookie(response, access_tok)
     return response
 
@@ -345,6 +353,7 @@ async def refresh(
 # ---------------------------------------------------------------------------
 # GET /auth/me
 # ---------------------------------------------------------------------------
+
 
 @router.get("/me", response_model=UserResponse)
 async def me(user: User = Depends(get_current_user)) -> UserResponse:
@@ -354,6 +363,7 @@ async def me(user: User = Depends(get_current_user)) -> UserResponse:
 # ---------------------------------------------------------------------------
 # PUT /auth/password
 # ---------------------------------------------------------------------------
+
 
 @router.put("/password", response_model=MessageResponse)
 async def change_password(
@@ -383,6 +393,7 @@ async def change_password(
 # POST /auth/forgot-password
 # ---------------------------------------------------------------------------
 
+
 @router.post("/forgot-password", response_model=MessageResponse)
 @limiter.limit(settings.FORGOT_PASSWORD_RATE_LIMIT)
 async def forgot_password(
@@ -396,9 +407,16 @@ async def forgot_password(
     if user:
         token = create_reset_token(user.id, user.token_version)
         try:
-            await asyncio.to_thread(send_password_reset, user.email, token, user.full_name)
-        except Exception as e:
-            logger.error("Failed to send password reset email", extra={"error": str(e)})
+            await send_email(
+                template=EmailTemplate.RESET_PASSWORD,
+                to=user.email,
+                dynamic_template_data={
+                    "reset_url": f"{settings.FRONTEND_BASE_URL}/reset-password?token={token}",
+                    "full_name": user.full_name,
+                },
+            )
+        except Exception:
+            logger.exception("password_reset_email_send_failed", extra={"user_id": user.id})
 
     return {"message": "If an account exists with that email, a reset link has been sent."}
 
@@ -406,6 +424,7 @@ async def forgot_password(
 # ---------------------------------------------------------------------------
 # GET /auth/validate-reset-token
 # ---------------------------------------------------------------------------
+
 
 @router.get("/validate-reset-token")
 async def validate_reset_token(token: str, db: AsyncSession = Depends(get_db)):
@@ -424,6 +443,7 @@ async def validate_reset_token(token: str, db: AsyncSession = Depends(get_db)):
 # ---------------------------------------------------------------------------
 # POST /auth/reset-password
 # ---------------------------------------------------------------------------
+
 
 @router.post("/reset-password", response_model=MessageResponse)
 async def reset_password(body: ResetPasswordRequest, db: AsyncSession = Depends(get_db)):
@@ -448,6 +468,7 @@ async def reset_password(body: ResetPasswordRequest, db: AsyncSession = Depends(
 # ---------------------------------------------------------------------------
 # POST /auth/verify-email
 # ---------------------------------------------------------------------------
+
 
 @router.post("/verify-email", response_model=MessageResponse)
 @limiter.limit(settings.VERIFY_EMAIL_RATE_LIMIT)
@@ -480,6 +501,7 @@ async def verify_email(
 # POST /auth/resend-verification
 # ---------------------------------------------------------------------------
 
+
 @router.post("/resend-verification", response_model=MessageResponse)
 @limiter.limit(settings.RESEND_VERIFICATION_RATE_LIMIT)
 async def resend_verification(
@@ -491,9 +513,16 @@ async def resend_verification(
 
     token = create_verify_token(current_user.id, current_user.token_version)
     try:
-        await asyncio.to_thread(send_verification_email, current_user.email, token, current_user.full_name)
-    except Exception as e:
-        logger.error("Failed to send verification email", extra={"error": str(e)})
+        await send_email(
+            template=EmailTemplate.VERIFY_EMAIL,
+            to=current_user.email,
+            dynamic_template_data={
+                "verify_url": f"{settings.FRONTEND_BASE_URL}/verify-email?token={token}",
+                "full_name": current_user.full_name,
+            },
+        )
+    except Exception:
+        logger.exception("verification_email_send_failed", extra={"user_id": current_user.id})
 
     return {"message": "Verification email sent."}
 
@@ -501,6 +530,7 @@ async def resend_verification(
 # ---------------------------------------------------------------------------
 # POST /auth/change-email
 # ---------------------------------------------------------------------------
+
 
 @router.post("/change-email", response_model=MessageResponse)
 @limiter.limit(settings.CHANGE_EMAIL_RATE_LIMIT)
@@ -522,11 +552,17 @@ async def change_email(
 
     token = create_email_change_token(current_user.id, current_user.token_version, body.new_email)
     try:
-        await asyncio.to_thread(
-            send_email_change_verification, body.new_email, token, current_user.full_name
+        await send_email(
+            template=EmailTemplate.CHANGE_EMAIL,
+            to=body.new_email,
+            dynamic_template_data={
+                "change_url": f"{settings.FRONTEND_BASE_URL}/confirm-email-change?token={token}",
+                "full_name": current_user.full_name,
+                "new_email": body.new_email,
+            },
         )
-    except Exception as e:
-        logger.error("Failed to send email-change verification", extra={"error": str(e)})
+    except Exception:
+        logger.exception("email_change_send_failed", extra={"user_id": current_user.id})
 
     return {"message": "Verification link sent to the new address."}
 
@@ -534,6 +570,7 @@ async def change_email(
 # ---------------------------------------------------------------------------
 # POST /auth/confirm-email-change
 # ---------------------------------------------------------------------------
+
 
 @router.post("/confirm-email-change", response_model=MessageResponse)
 @limiter.limit(settings.CONFIRM_EMAIL_CHANGE_RATE_LIMIT)
@@ -566,8 +603,17 @@ async def confirm_email_change(
     await revoke_all_user_tokens(user.id, db)
 
     try:
-        await asyncio.to_thread(send_email_change_notification, old_email, new_email)
-    except Exception as e:
-        logger.error("Failed to send email-change notification", extra={"error": str(e)})
+        await send_email(
+            template=EmailTemplate.EMAIL_CHANGED,
+            to=old_email,
+            dynamic_template_data={
+                "old_email": old_email,
+                "new_email": new_email,
+                "change_date": datetime.now(timezone.utc).isoformat(),
+                "support_email": "support@carddroper.com",
+            },
+        )
+    except Exception:
+        logger.exception("email_changed_canary_send_failed", extra={"user_id": user.id})
 
     return {"message": "Email changed. Please log in with your new email."}

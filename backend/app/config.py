@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from pydantic import field_validator
+from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -74,9 +74,16 @@ class Settings(BaseSettings):
     STRIPE_WEBHOOK_SECRET: Optional[str] = None
 
     # SendGrid / Email — leave API key empty to log to stdout in dev.
-    SENDGRID_API_KEY: Optional[str] = None
+    SENDGRID_API_KEY: SecretStr = SecretStr("")
+    SENDGRID_SANDBOX: bool = False
+    SENDGRID_TEMPLATE_VERIFY_EMAIL: str = ""
+    SENDGRID_TEMPLATE_RESET_PASSWORD: str = ""
+    SENDGRID_TEMPLATE_CHANGE_EMAIL: str = ""
+    SENDGRID_TEMPLATE_EMAIL_CHANGED: str = ""
+    SENDGRID_TEMPLATE_CREDITS_PURCHASED: str = ""
     FROM_EMAIL: str = "noreply@carddroper.com"
     FROM_NAME: str = "Carddroper"
+    FRONTEND_BASE_URL: str = "http://localhost:3000"
 
 
 settings = Settings()

@@ -18,6 +18,4 @@ class LoginAttempt(Base):
     ip: Mapped[Optional[str]] = mapped_column(String(45), nullable=True)
     success: Mapped[bool] = mapped_column(Boolean, nullable=False)
 
-    __table_args__ = (
-        Index("ix_login_attempts_email_attempted_at", "email", "attempted_at"),
-    )
+    __table_args__ = (Index("ix_login_attempts_email_attempted_at", "email", "attempted_at"),)

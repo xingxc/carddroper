@@ -8,6 +8,7 @@ Provides:
 
 Token source order: access_token cookie → Authorization: Bearer header.
 """
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -35,7 +36,7 @@ def _extract_token(request: Request) -> Optional[str]:
         return token
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
-        token = auth_header[len("Bearer "):]
+        token = auth_header[len("Bearer ") :]
         return token or None
     return None
 

@@ -3,12 +3,8 @@
 Covers: register → verify-email → me → change-password → refresh → logout.
 Also: login lockout and email change.
 """
-from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import text
-
-from app.database import AsyncSessionLocal
 
 
 pytestmark = pytest.mark.asyncio
@@ -27,9 +23,7 @@ async def test_register_login_me(client):
     assert body["user"]["verified_at"] is None
 
     # me via Bearer
-    me = await client.get(
-        "/auth/me", headers={"Authorization": f"Bearer {body['access_token']}"}
-    )
+    me = await client.get("/auth/me", headers={"Authorization": f"Bearer {body['access_token']}"})
     assert me.status_code == 200
     assert me.json()["email"] == "a@example.com"
 
@@ -248,3 +242,27 @@ async def test_health(client):
     r = await client.get("/health")
     assert r.status_code == 200
     assert r.json()["status"] == "ok"
+
+
+async def test_register_succeeds_when_email_send_raises(client, monkeypatch):
+    """Best-effort preservation: send_email raises after retries; registration still returns 201.
+
+    Note: the register endpoint currently returns 200 (AuthResponse), not 201.
+    The ticket acceptance says 201, but the endpoint returns 200. We assert 200
+    to match the actual implementation (see deviation note in report).
+    """
+    import app.routes.auth as auth_routes
+
+    async def _always_raise(**kwargs):
+        raise Exception("SendGrid unreachable after 3 attempts")
+
+    monkeypatch.setattr(auth_routes, "send_email", _always_raise)
+
+    r = await client.post(
+        "/auth/register",
+        json={"email": "besteffort@example.com", "password": "verylongsecret", "full_name": "Best"},
+    )
+    # Registration must succeed despite email failure
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["user"]["email"] == "besteffort@example.com"
