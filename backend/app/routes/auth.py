@@ -30,7 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import get_db
-from app.dependencies import get_current_user
+from app.dependencies import get_current_user, require_not_locked
 from app.errors import conflict, too_many_requests, unauthorized, validation_error
 from app.logging import get_logger
 from app.models.user import User
@@ -369,7 +369,7 @@ async def me(user: User = Depends(get_current_user)) -> UserResponse:
 async def change_password(
     body: ChangePasswordRequest,
     request: Request,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_not_locked),
     db: AsyncSession = Depends(get_db),
 ):
     if not verify_password(body.current_password, current_user.password_hash):
@@ -449,7 +449,7 @@ async def validate_reset_token(token: str, db: AsyncSession = Depends(get_db)):
 async def reset_password(body: ResetPasswordRequest, db: AsyncSession = Depends(get_db)):
     payload = decode_reset_token(body.token)
     if not payload:
-        raise unauthorized("Invalid or expired reset token.")
+        raise validation_error("Invalid or expired reset token.")
 
     result = await db.execute(select(User).where(User.id == int(payload["sub"])))
     user = result.scalar_one_or_none()
@@ -479,7 +479,7 @@ async def verify_email(
 ):
     payload = decode_verify_token(body.token)
     if not payload:
-        raise unauthorized("Invalid or expired verification token.")
+        raise validation_error("Invalid or expired verification token.")
 
     result = await db.execute(select(User).where(User.id == int(payload["sub"])))
     user = result.scalar_one_or_none()

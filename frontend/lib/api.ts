@@ -1,4 +1,4 @@
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
 
 /** Shape of every error body the backend returns. */
 export interface ApiErrorBody {
@@ -41,11 +41,19 @@ export async function apiFetch<T>(
     headers.set("Content-Type", "application/json");
   }
 
-  const response = await fetch(url, {
-    ...init,
-    headers,
-    credentials: "include",
-  });
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      ...init,
+      headers,
+      credentials: "include",
+    });
+  } catch (err) {
+    if (err instanceof TypeError) {
+      throw new ApiError(0, "NETWORK_ERROR", "Network error — check your connection.");
+    }
+    throw err;
+  }
 
   if (!response.ok) {
     let code = "UNKNOWN";

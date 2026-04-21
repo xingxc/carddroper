@@ -11,6 +11,11 @@ function makeQueryClient(): QueryClient {
       queries: {
         // Avoid refetching immediately on mount when data is fresh.
         staleTime: 30_000,
+        retry: 1,
+        refetchOnWindowFocus: false,
+      },
+      mutations: {
+        retry: 0,
       },
     },
   });

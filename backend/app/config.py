@@ -29,9 +29,6 @@ class Settings(BaseSettings):
     COOKIE_SECURE: bool = True
     COOKIE_DOMAIN: Optional[str] = None
 
-    # Frontend URL (verification / reset email links, Stripe return URL)
-    FRONTEND_URL: str = "http://localhost:3000"
-
     # CORS — CSV string, exposed as list via `cors_origins_list`
     CORS_ORIGINS: str = "http://localhost:3000"
 

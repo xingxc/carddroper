@@ -17,14 +17,13 @@ import pytest_asyncio
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
-pytestmark = pytest.mark.asyncio
-
 
 # ---------------------------------------------------------------------------
 # Unit test: call the handler directly
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 async def test_handler_returns_correct_json_shape(caplog):
     """internal_error_handler returns 500 JSON with INTERNAL_ERROR code."""
     import json
@@ -55,6 +54,7 @@ async def test_handler_returns_correct_json_shape(caplog):
     assert "request_id" in body["error"]
 
 
+@pytest.mark.asyncio
 async def test_handler_redacts_exception_details(caplog):
     """Response body must NOT contain exception class or message text."""
     from app.main import internal_error_handler
@@ -78,6 +78,7 @@ async def test_handler_redacts_exception_details(caplog):
     assert "Traceback" not in body_text
 
 
+@pytest.mark.asyncio
 async def test_handler_logs_unhandled_exception_event(caplog):
     """Handler must log at ERROR level with event=unhandled_exception."""
     from app.main import internal_error_handler
@@ -152,6 +153,7 @@ async def boom_client():
     ]
 
 
+@pytest.mark.asyncio
 async def test_unhandled_exception_smoke_returns_500(boom_client):
     """Integration: hitting a route that raises returns HTTP 500."""
     r = await boom_client.get("/test/boom-smoke")

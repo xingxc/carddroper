@@ -245,6 +245,70 @@ async def test_health(client):
     assert r.json()["database"] == "connected"
 
 
+async def test_locked_user_blocked_from_change_password(client):
+    """A >7-day-old unverified user gets 403 from a route guarded by require_not_locked."""
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import update
+
+    from app.database import engine
+    from app.models.user import User
+
+    # Register a user (unverified by default).
+    reg = await client.post(
+        "/auth/register",
+        json={"email": "locked@example.com", "password": "verylongsecret"},
+    )
+    assert reg.status_code == 200
+    access = reg.json()["access_token"]
+    user_id = reg.json()["user"]["id"]
+
+    # Back-date created_at to 8 days ago so the lock condition fires.
+    stale_created_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=8)
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(User).where(User.id == user_id).values(created_at=stale_created_at)
+        )
+
+    # PUT /auth/password is guarded by require_not_locked → must return 403.
+    r = await client.put(
+        "/auth/password",
+        headers={"Authorization": f"Bearer {access}"},
+        json={"current_password": "verylongsecret", "new_password": "anotherone1234"},
+    )
+    assert r.status_code == 403, r.text
+
+
+async def test_locked_user_can_still_access_me(client):
+    """A >7-day-old unverified user still gets 200 from /auth/me (exempt route)."""
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import update
+
+    from app.database import engine
+    from app.models.user import User
+
+    reg = await client.post(
+        "/auth/register",
+        json={"email": "locked_me@example.com", "password": "verylongsecret"},
+    )
+    assert reg.status_code == 200
+    access = reg.json()["access_token"]
+    user_id = reg.json()["user"]["id"]
+
+    # Back-date created_at to 8 days ago.
+    stale_created_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=8)
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(User).where(User.id == user_id).values(created_at=stale_created_at)
+        )
+
+    # GET /auth/me is exempt → must return 200.
+    me = await client.get("/auth/me", headers={"Authorization": f"Bearer {access}"})
+    assert me.status_code == 200, me.text
+    assert me.json()["email"] == "locked_me@example.com"
+
+
 async def test_register_succeeds_when_email_send_raises(client, monkeypatch):
     """Best-effort preservation: send_email raises after retries; registration still returns 201.
 
