@@ -1,7 +1,7 @@
 ---
 id: 0011
 title: backend hardening — global 500 exception handler + JWT iss/aud claims
-status: open
+status: resolved
 priority: high
 found_by: ticket 0009 audit (backend F-1 high, backend F-3 medium)
 ---
@@ -197,19 +197,20 @@ the unit test covers it.
 Smoke JWT iss/aud from staging:
 
 ```bash
-# Mint a token with wrong audience using a Python one-liner (requires jwt
-# library available locally, e.g. via the backend poetry env):
+# Mint a token with wrong audience using a Python one-liner. The backend uses
+# a plain venv (no poetry), so invoke .venv/bin/python directly.
 cd /Users/johnxing/mini/postapp/backend
 
 JWT_SECRET=$(gcloud secrets versions access latest \
     --secret=carddroper-jwt-secret --project=carddroper-staging) \
-  poetry run python -c "
-import jwt, time
+  .venv/bin/python -c "
+import os, time
+from jose import jwt
 tok = jwt.encode(
     {'sub': '00000000-0000-0000-0000-000000000000', 'tv': 1,
      'iss': 'carddroper', 'aud': 'wrong-audience',
      'exp': int(time.time()) + 60},
-    '$JWT_SECRET', algorithm='HS256')
+    os.environ['JWT_SECRET'], algorithm='HS256')
 print(tok)
 "
 # Take the printed token, hit /auth/me:
@@ -217,6 +218,20 @@ curl -sS -w "\nHTTP_STATUS=%{http_code}\n" \
     -H "Authorization: Bearer <PASTE_TOKEN>" \
     https://api.staging.carddroper.com/auth/me
 # Expected: 401 with the project's existing invalid-token error shape.
+
+# Repeat with wrong issuer:
+JWT_SECRET=$(gcloud secrets versions access latest \
+    --secret=carddroper-jwt-secret --project=carddroper-staging) \
+  .venv/bin/python -c "
+import os, time
+from jose import jwt
+tok = jwt.encode(
+    {'sub': '00000000-0000-0000-0000-000000000000', 'tv': 1,
+     'iss': 'someone-else', 'aud': 'carddroper-api',
+     'exp': int(time.time()) + 60},
+    os.environ['JWT_SECRET'], algorithm='HS256')
+print(tok)
+"
 ```
 
 ## Verification
@@ -264,4 +279,23 @@ User (Phase 2):
 
 ## Resolution
 
-*(filled in by orchestrator on close)*
+Resolved 2026-04-20. Shipped in commit `765cdc3` on main.
+
+**Deliverable A (global 500 handler):** `internal_error_handler` registered in `backend/app/main.py` after the AppError and RateLimitExceeded handlers. Returns `{"error": {"code": "INTERNAL_ERROR", "message": "An unexpected error occurred.", "request_id": ...}}` at status 500. Logs via `logger.exception()` with `event=unhandled_exception` and request_id / path / method / exc_type / exc_message fields. Response body carries no stack frames, exception class, or message text. New test file `backend/tests/test_exception_handler.py` (5 tests) — note: agent used direct handler invocation for most assertions because Starlette `BaseHTTPMiddleware` (the `LoggingMiddleware`) wraps route exceptions in an anyio `ExceptionGroup` under `httpx.ASGITransport` when `raise_app_exceptions=True`. One end-to-end 500 smoke test uses `raise_app_exceptions=False`. Accepted deviation.
+
+**Deliverable B (JWT iss/aud):** `JWT_ISSUER="carddroper"` and `JWT_AUDIENCE="carddroper-api"` added to `Settings` and documented in `.env.example`. Every `jwt.encode` in `auth_service.py` mints with both claims. Every `jwt.decode` (in `dependencies.py` and `auth_service.py`) passes `audience=` and `issuer=` kwargs — python-jose raises `JWTClaimsError` (subclass of `JWTError`) on mismatch, caught by the existing invalid-token path. Refresh tokens untouched (opaque, not JWTs). New test file `backend/tests/test_jwt_claims.py` (6 tests: happy path, wrong-aud, wrong-iss, missing-aud, missing-iss, plus iss/aud appear in minted token).
+
+**Tests:** Full suite 22/22 passing (10.11s).
+
+**Staging smoke (all five pass):**
+- `GET /health` → 200 `{"status":"ok","database":"connected"}`
+- `GET /this-route-does-not-exist` → 404 `{"detail":"Not Found"}` (catch-all is not greedy)
+- `GET /auth/me` (no auth) → 401 existing AppError shape (`code: UNAUTHORIZED`, not `INTERNAL_ERROR`)
+- `GET /auth/me` with `aud=wrong-audience` token → 401 `{"error":{"code":"UNAUTHORIZED","message":"Invalid or expired token."}}`
+- `GET /auth/me` with `iss=someone-else` token → identical 401 shape
+
+**Files touched:** `backend/app/main.py`, `backend/app/services/auth_service.py`, `backend/app/dependencies.py`, `backend/app/config.py`, `backend/.env.example`, `backend/tests/test_exception_handler.py` (new), `backend/tests/test_jwt_claims.py` (new). 5 files +57/-4 plus two new test files.
+
+**Doc patch (post-merge):** Phase 2 smoke-mint block in this ticket originally used `poetry run python`; the project uses a plain `.venv`, so it was corrected to `.venv/bin/python` with `from jose import jwt` so future readers can run the smokes directly.
+
+**Backwards-compat note:** Pre-existing 15-minute access tokens invalidated on deploy; already-logged-in sessions got bumped to re-auth. Expected and documented. No prod impact (staging only).
