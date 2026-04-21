@@ -79,7 +79,14 @@ Agents may not report a task done without showing these in their report.
 
 ### Test-data conventions
 
-- Test users use `test+<slug>@example.com` — never a real domain.
+- **Local pytest tests** use `@example.com` addresses (e.g. `a@example.com`, `user@example.com`).
+  This is the convention already in the codebase — do not rewrite existing fixtures. Note that
+  `@example.com` is RFC 2606-reserved and will be rejected by pydantic-email / email-validator in
+  production validation, but pytest tests bypass the HTTP layer or hit an internal test app that
+  accepts the addresses directly, so this is not a problem in practice.
+- **Staging smoke scripts** use `smoke+<slug>@carddroper.com` — our real domain. The delivery
+  attempt will bounce harmlessly (no inbox for arbitrary `smoke+*` addresses), but the address
+  passes email-validator. The `smoke+` prefix lets a future nightly sweep reap smoke-created users.
 - Test tokens are minted with the helper in `tests/test_jwt_claims.py` (`_mint` function) — never hand-crafted in other files.
 - Test DB state is isolated per test via fixtures; parallel execution must remain safe.
 - `ruff format` runs before every commit; no hand-formatting arguments.

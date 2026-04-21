@@ -29,7 +29,9 @@ def main() -> None:
 
     base = args.base_url.rstrip("/")
     slug = uuid.uuid4().hex[:8]
-    email = f"smoke+auth-{slug}@carddroper.test"
+    # Uses the real domain, not a .test / .invalid / .example TLD, because email-validator
+    # rejects special-use TLDs. The smoke+ prefix lets a nightly sweep reap these.
+    email = f"smoke+auth-{slug}@carddroper.com"
 
     with httpx.Client(timeout=10) as client:
         # ------------------------------------------------------------------

@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Smoke test: send_email helper — exercises the SendGrid send path (or dev fallback).
+"""Smoke test: send_email helper — exercises the real SendGrid API end-to-end.
 
-Default invocation (no arguments needed):
+This script REQUIRES a real SENDGRID_API_KEY and a valid template ID. It will
+refuse to run in the no-key dev-fallback path so that a false-positive result
+is impossible.
+
+Default invocation (staging, with secrets from Secret Manager):
+    SENDGRID_API_KEY=$(gcloud secrets versions access latest --secret=carddroper-sendgrid-api-key --project=carddroper-staging) \\
+    SENDGRID_TEMPLATE_VERIFY_EMAIL=$(gcloud secrets versions access latest --secret=carddroper-sendgrid-template-verify-email --project=carddroper-staging) \\
     .venv/bin/python scripts/smoke_email.py
 
 Manual overrides:
-    .venv/bin/python scripts/smoke_email.py --template RESET_PASSWORD --to foo@example.com
-
-When SENDGRID_API_KEY is empty the service logs email_skipped_no_key and returns a
-"local-<uuid>" mock id — that still counts as SMOKE OK (dev / CI case).
-A staging run with the key set exercises the real SendGrid path.
+    .venv/bin/python scripts/smoke_email.py --template RESET_PASSWORD --to foo@carddroper.com
 """
 
 import argparse
@@ -80,15 +82,17 @@ async def _run(template_name: str, to: str) -> None:
 
 def main() -> None:
     slug = uuid.uuid4().hex[:8]
-    default_to = f"smoke+email-{slug}@carddroper.test"
+    # Uses the real domain, not a .test / .invalid / .example TLD, because email-validator
+    # rejects special-use TLDs. The smoke+ prefix lets a nightly sweep reap these.
+    default_to = f"smoke+email-{slug}@carddroper.com"
 
     parser = argparse.ArgumentParser(
-        description="Smoke-test send_email against the real SendGrid API or dev fallback.",
+        description="Smoke-test send_email against the real SendGrid API.",
     )
     parser.add_argument(
         "--to",
         default=default_to,
-        help="Recipient email address (default: smoke+email-<uuid8>@carddroper.test)",
+        help="Recipient email address (default: smoke+email-<uuid8>@carddroper.com)",
     )
     parser.add_argument(
         "--template",
@@ -96,6 +100,51 @@ def main() -> None:
         help="EmailTemplate name, e.g. VERIFY_EMAIL (default: VERIFY_EMAIL)",
     )
     args = parser.parse_args()
+
+    # ------------------------------------------------------------------
+    # Pre-flight: refuse to run without real credentials.
+    # The no-key fallback in send_email is correct for local dev; it is NOT
+    # a valid smoke result — a fallback run proves nothing about SendGrid wiring.
+    # ------------------------------------------------------------------
+    api_key = settings.SENDGRID_API_KEY.get_secret_value()
+    if not api_key:
+        print(
+            "SMOKE FAIL: email — SENDGRID_API_KEY is empty. "
+            "This smoke must exercise the real SendGrid API. Re-run with:\n"
+            "  SENDGRID_API_KEY=$(gcloud secrets versions access latest "
+            "--secret=carddroper-sendgrid-api-key --project=carddroper-staging) \\\n"
+            "  SENDGRID_TEMPLATE_VERIFY_EMAIL=$(gcloud secrets versions access latest "
+            "--secret=carddroper-sendgrid-template-verify-email --project=carddroper-staging) \\\n"
+            "  .venv/bin/python scripts/smoke_email.py",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Resolve the template name early so we can check the corresponding setting.
+    template_name = args.template.upper()
+    if template_name not in EmailTemplate.__members__:
+        valid = ", ".join(t.name for t in EmailTemplate)
+        print(
+            f"SMOKE FAIL: email — unknown template {args.template!r}. Valid values: {valid}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    template_setting_name = f"SENDGRID_TEMPLATE_{template_name}"
+    template_id = getattr(settings, template_setting_name, None) or ""
+    if not template_id:
+        print(
+            f"SMOKE FAIL: email — {template_setting_name} is empty. "
+            "This smoke must exercise the real SendGrid API. Re-run with:\n"
+            "  SENDGRID_API_KEY=$(gcloud secrets versions access latest "
+            "--secret=carddroper-sendgrid-api-key --project=carddroper-staging) \\\n"
+            f"  {template_setting_name}=$(gcloud secrets versions access latest "
+            f"--secret=carddroper-sendgrid-template-{template_name.lower().replace('_', '-')} "
+            "--project=carddroper-staging) \\\n"
+            "  .venv/bin/python scripts/smoke_email.py",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     try:
         asyncio.run(_run(args.template, args.to))
