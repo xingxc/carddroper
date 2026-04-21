@@ -20,19 +20,38 @@ steps:
       - push
       - us-west1-docker.pkg.dev/$PROJECT_ID/carddroper-repo/backend:$SHORT_SHA
 
-  # 3. Run alembic upgrade head against Cloud SQL via proxy.
-  # Wrapped in bash -c so $DATABASE_URL expands BEFORE exec-wrapper sees it —
-  # exec-wrapper passes its -e arg to `docker run` verbatim and won't re-eval.
-  - name: gcr.io/google-appengine/exec-wrapper
+  # 3. Run alembic upgrade head against Cloud SQL via the Auth Proxy.
+  # Start the proxy as a sidecar container, then run alembic in a second
+  # container that shares the proxy's network namespace so the migration
+  # DATABASE_URL's 127.0.0.1:5432 points at the proxy.
+  - id: migrate
+    name: gcr.io/cloud-builders/docker
     entrypoint: bash
     args:
       - -c
       - |
-        /exec-wrapper.sh \
-          -i us-west1-docker.pkg.dev/$PROJECT_ID/carddroper-repo/backend:$SHORT_SHA \
-          -s carddroper-staging:us-west1:carddroper-staging-db \
-          -e "DATABASE_URL=$$DATABASE_URL" \
-          -- alembic upgrade head
+        set -e
+        trap 'docker rm -f sql-proxy 2>/dev/null || true' EXIT
+
+        docker run -d --name sql-proxy \
+          gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.11.4 \
+          --address=0.0.0.0 \
+          --port=5432 \
+          carddroper-staging:us-west1:carddroper-staging-db
+
+        # Wait until the proxy reports ready (log line "ready for new connections")
+        for i in $(seq 1 30); do
+          if docker logs sql-proxy 2>&1 | grep -q "ready for new connections"; then
+            break
+          fi
+          sleep 2
+        done
+
+        docker run --rm \
+          --network=container:sql-proxy \
+          -e DATABASE_URL="$$DATABASE_URL" \
+          us-west1-docker.pkg.dev/$PROJECT_ID/carddroper-repo/backend:$SHORT_SHA \
+          alembic upgrade head
     secretEnv:
       - DATABASE_URL
 
