@@ -1,0 +1,41 @@
+# Python virtualenv — large and rebuilt inside the image
+.venv/
+
+# Compiled bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Test and lint caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Secrets — never in image
+.env
+.env.*
+!.env.example
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Version control
+.git/
+.gitignore
+
+# macOS / editor noise
+.DS_Store
+.idea/
+.vscode/
+
+# pytest runs against source locally, never inside the built image
+tests/
+
+# Smoke scripts are executed by the orchestrator-user against staging,
+# not baked into the Cloud Run image
+scripts/
+
+# Docs — not needed at runtime
+README*.md

@@ -25,6 +25,7 @@ FROM node:20-alpine AS runner
 WORKDIR /app
 
 ENV NODE_ENV=production
+ENV HOSTNAME=0.0.0.0
 
 # Use the built-in non-root node user provided by the node alpine image.
 USER node
