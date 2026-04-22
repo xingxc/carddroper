@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import re
 from typing import Optional
 
-from pydantic import SecretStr, field_validator
+from pydantic import SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -31,6 +32,10 @@ class Settings(BaseSettings):
 
     # CORS — CSV string, exposed as list via `cors_origins_list`
     CORS_ORIGINS: str = "http://localhost:3000"
+    # Optional regex for multi-subdomain projects. When set, FRONTEND_BASE_URL
+    # may match the regex instead of appearing literally in CORS_ORIGINS.
+    # NOTE: not wired into CORSMiddleware.allow_origin_regex in this version.
+    CORS_ORIGIN_REGEX: Optional[str] = None
 
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod
@@ -40,6 +45,32 @@ class Settings(BaseSettings):
     @property
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]
+
+    @model_validator(mode="after")
+    def validate_cors_origins(self) -> "Settings":
+        """Refuse to construct if FRONTEND_BASE_URL is not covered by CORS config.
+
+        A browser served from FRONTEND_BASE_URL must be able to reach this API.
+        If the URL is absent from CORS_ORIGINS (and no matching CORS_ORIGIN_REGEX
+        is set), every preflight will be rejected and the frontend will be broken.
+        Failing loudly at startup is cheaper than a silent runtime CORS failure.
+        """
+        frontend_url = self.FRONTEND_BASE_URL
+        origins_list = self.cors_origins_list
+        regex = self.CORS_ORIGIN_REGEX
+
+        in_list = frontend_url in origins_list
+        regex_match = bool(regex and re.search(regex, frontend_url))
+
+        if not in_list and not regex_match:
+            regex_display = regex if regex else "(unset)"
+            raise ValueError(
+                f"CORS misconfiguration: FRONTEND_BASE_URL={frontend_url} is not in CORS_ORIGINS={origins_list}\n"
+                f"and does not match CORS_ORIGIN_REGEX={regex_display}.\n"
+                f"A browser served from the frontend URL cannot call this API.\n"
+                f"Set CORS_ORIGINS to include FRONTEND_BASE_URL (CSV) or CORS_ORIGIN_REGEX to match it."
+            )
+        return self
 
     # Rate limits (slowapi strings, per-IP)
     REGISTER_RATE_LIMIT: str = "3/minute"

@@ -35,6 +35,7 @@ Running, deploying, and evolving carddroper.
 | [operations/environments.md](operations/environments.md) | dev / staging / prod layout, promotion path, secret strategy. |
 | [operations/deployment.md](operations/deployment.md) | GCP Cloud Run + Cloud SQL + Cloud Build playbook (filled as we stand each env up). |
 | [operations/testing.md](operations/testing.md) | Three-tier testing policy — local / staging / prod — with per-ticket coverage checklist and smoke-script pattern. |
+| [operations/chassis-contract.md](operations/chassis-contract.md) | Chassis invariants enforced at startup — the contract adopters must honor. |
 
 ## Legal
 

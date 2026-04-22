@@ -78,6 +78,16 @@ Three-tier model in `doc/operations/testing.md`:
 
 No ticket closes as `resolved` unless it satisfies the §Per-ticket checklist in testing.md (local tests for new behavior; smoke script if infra glue changed).
 
+## Chassis contract (coupling rule)
+
+`doc/operations/chassis-contract.md` lists every invariant the chassis enforces at startup. It is a 1:1 mirror of the enforcement layer (pydantic validators on `Settings`, middleware requirements, other fail-loud checks).
+
+**Rule:** any PR that adds or changes a validator on `Settings`, or adds a new middleware-enforced requirement in chassis code, must update `chassis-contract.md` in the same commit. No speculative entries, no aspirational entries — every entry has matching enforcement. Every enforced invariant has a matching entry.
+
+Reviewers (including the orchestrator, at dispatch-brief time and at review time): if a PR touches `backend/app/config.py` validators or chassis middleware, confirm `chassis-contract.md` moved too. If the chassis enforces something that isn't in the contract, treat it as a bug in either the doc or the enforcement — both can't be right.
+
+Why this exists: a chassis reused across many projects is only reliable if its contract is trustworthy. Uncoupled docs rot; coupled docs can't. Origin discussion: ticket 0015.5.
+
 ## Working directory
 
 - Primary repo: `/Users/johnxing/mini/postapp`
