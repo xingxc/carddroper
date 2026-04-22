@@ -45,7 +45,7 @@ The token extraction helper reads the cookie first, then falls back to the Autho
 **Flow:**
 1. `POST /auth/register` creates the user with `verified_at = NULL`, creates a Stripe Customer, creates a signed verification JWT (TTL 24h, `purpose="verify"`), sends a SendGrid email with a link `https://carddroper.com/verify-email?token=<jwt>` (staging: `https://staging.carddroper.com/verify-email?token=<jwt>`).
 2. User clicks the link. The frontend page calls `POST /auth/verify-email` with the token.
-3. Backend decodes, checks `purpose=="verify"`, checks `user.verified_at is NULL`, sets `verified_at = now()`, increments `token_version` (so any session opened before verification is invalidated — defense in depth).
+3. Backend decodes, checks `purpose=="verify"`, checks `user.verified_at is NULL`, sets `verified_at = now()`. The session is preserved — `verified_at` is a capability toggle (enabling paid actions post-soft-cap), not a security event. Reset-password and change-email remain session-invalidating (they bump `token_version` and revoke refresh tokens).
 4. A resend endpoint `POST /auth/resend-verification` issues a new token, rate-limited to 3/hour.
 
 **Enforcement:** a `require_verified` FastAPI dependency raises 403 on any endpoint that performs a paid action (credit purchase, subscription, send). Read-only account endpoints (`/auth/me`, `/profile`) remain accessible to unverified users so they can trigger the resend.

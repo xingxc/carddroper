@@ -5,7 +5,6 @@ import { useSearchParams } from "next/navigation";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
 import { api, ApiError } from "@/lib/api";
-import { useAuth } from "@/context/auth";
 
 interface VerifyResponse {
   message: string;
@@ -24,7 +23,6 @@ export function VerifyEmailBody() {
   const token = searchParams.get("token");
 
   const queryClient = useQueryClient();
-  const { markLoggedOut } = useAuth();
 
   const firedRef = useRef(false);
 
@@ -32,9 +30,6 @@ export function VerifyEmailBody() {
     mutationFn: (t: string) =>
       api.post<VerifyResponse>("/auth/verify-email", { token: t }),
     onSuccess: () => {
-      // token_version was bumped — the existing access_token cookie is dead.
-      // Clear client auth state so the user must log in again.
-      markLoggedOut();
       void queryClient.invalidateQueries({ queryKey: ["auth", "me"] });
     },
   });
@@ -115,14 +110,14 @@ export function VerifyEmailBody() {
             Email verified
           </h1>
           <p className="mt-3 text-sm text-gray-600">
-            Your email is verified. Please log in to continue.
+            Your email is verified. You&apos;re all set.
           </p>
         </div>
         <Link
-          href="/login"
+          href="/app"
           className="inline-flex items-center justify-center rounded-md bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 transition-colors"
         >
-          Log in
+          Continue
         </Link>
       </div>
     );

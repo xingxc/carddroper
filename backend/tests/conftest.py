@@ -31,6 +31,7 @@ os.environ.setdefault("CONFIRM_EMAIL_CHANGE_RATE_LIMIT", "1000/minute")
 os.environ.setdefault("SENDGRID_API_KEY", "")
 
 import httpx  # noqa: E402
+from sqlalchemy.ext.asyncio import AsyncSession  # noqa: E402
 
 import app.models  # noqa: E402, F401 — register tables before Base is used
 from app.base import Base  # noqa: E402
@@ -52,3 +53,10 @@ async def client():
     transport = httpx.ASGITransport(app=fastapi_app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
+
+
+@pytest_asyncio.fixture
+async def db_session():
+    """Bare async DB session for direct row inspection in tests."""
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        yield session
