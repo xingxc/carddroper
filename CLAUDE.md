@@ -66,6 +66,8 @@ deviations, any env var or dep added.
 
 Keep briefs tight. The agent reads docs itself — don't paste spec content into the prompt.
 
+**Repo-root file scope.** Agents default to their assigned subtree (`backend/` or `frontend/`). When a ticket needs a change at the repo root (`cloudbuild.yaml`, `docker-compose.yml`, `.github/workflows/*.yml`, top-level `Dockerfile`), the brief must name the specific file(s) and explicitly state that the "backend/frontend only" default is relaxed for them. If the brief doesn't, the agent is right to stop and ask — see the 0014.5 Phase 1 first-dispatch postmortem.
+
 ## Testing policy
 
 Three-tier model in `doc/operations/testing.md`:
