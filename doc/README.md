@@ -14,7 +14,7 @@ How the system is put together.
 |---|---|
 | [architecture/overview.md](architecture/overview.md) | System diagram, component responsibilities, request flow. |
 | [architecture/tech-stack.md](architecture/tech-stack.md) | Each technology choice with rationale and rejected alternatives. |
-| [architecture/site-model.md](architecture/site-model.md) | **DRAFT / DISCUSSION.** Auth experience and page structure — login-first (Canva/Figma) vs. open-until-send (Paperless Post). |
+| [architecture/site-model.md](architecture/site-model.md) | **DECIDED.** Canva-model auth wall: public marketing + auth-gated app. Chassis/body split for reuse across projects. |
 
 ## Systems
 
