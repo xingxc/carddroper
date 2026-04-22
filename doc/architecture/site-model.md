@@ -29,12 +29,12 @@ The project is structured as a reusable **chassis** that hosts a product-specifi
 
 | Layer | Reusable? | What it contains |
 |---|---|---|
-| Auth frontend | ✅ chassis | `(auth)/` route group: login, register, verify-email-sent, verify-email, forgot-password, reset-password, change-email. `useAuth` hook, `lib/api.ts` wrappers, 401 silent refresh, `middleware.ts` cookie gate. |
+| Auth frontend | ✅ chassis | `(auth)/` route group: login, register, verify-email-sent, verify-email, forgot-password, reset-password, change-email. `useAuth` hook, `lib/api.ts` wrappers, 401 silent refresh, `proxy.ts` cookie gate (Next.js 16 rename of `middleware.ts`). |
 | Marketing frontend | ✅ chassis (structure) / 🎨 body (content) | `(marketing)/`: landing, features, pricing, about, contact, legal. Structure is reusable; text, imagery, and brand are product-specific. |
 | App frontend | ❌ body | `(app)/`: everything product-specific. Carddroper's card browser, customizer, send flow. New project swaps this entirely. |
 | Auth backend | ✅ chassis | `routes/auth.py`, `services/email_service.py`, `models/user.py`, `models/refresh_token.py`, `models/login_attempt.py`, their Alembic migrations. |
 | App backend | ❌ body | Product-specific. Carddroper's card models, Stripe ledger, send endpoints. |
-| Infrastructure | ✅ chassis | `cloudbuild.yaml`, `Dockerfile`s, `docker-compose.yml`, `backend/scripts/smoke_*.py` skeleton, `doc/operations/*`. |
+| Infrastructure | ✅ chassis | `cloudbuild.yaml`, `Dockerfile`s, `docker-compose.yml`, `scripts/smoke_chassis.sh` (local chassis smoke), `backend/scripts/smoke_*.py` (staging smokes), `doc/operations/*`. |
 | Legal | 🎨 body | `doc/legal/` drafts; every project re-drafts under its own attorney review. |
 
 ## Reusability constraints

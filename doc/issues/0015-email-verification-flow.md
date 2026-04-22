@@ -23,7 +23,9 @@ Grounded in:
 - `doc/operations/testing.md` — per-ticket coverage checklist applies
 - foodapp pattern source: `/Users/johnxing/mini/foodapp/frontend/src/lib/api.ts`
   (401-refresh interceptor), `context/auth.tsx` (auth context), `middleware.ts`
-  (edge route protection) — port patterns, don't copy verbatim
+  (edge route protection) — port patterns, don't copy verbatim. **Note:** Next.js 16
+  renamed `middleware.ts` → `proxy.ts` (see https://nextjs.org/docs/messages/middleware-to-proxy);
+  this ticket uses `proxy.ts`. Foodapp is on Next.js 15 and still uses the old name.
 
 **Backend state (per audit, already green):** `create_verify_token`,
 `decode_verify_token`, `POST /auth/verify-email`, `POST /auth/resend-verification`
@@ -36,7 +38,7 @@ expected in this ticket — flag if any surfaces.
 - F-1 high — 401 silent-refresh interceptor in `apiFetch`
 - F-2 high — auth context + `useAuth` + `GET /auth/me` query
 - F-6 low — typed `api.get/post/delete` wrappers (subsumes the 204 cast nit)
-- F-7 medium — `middleware.ts` + `(auth)` / `(dashboard)` route groups
+- F-7 medium — `proxy.ts` (Next.js 16 rename of `middleware.ts`) + `(marketing)` / `(auth)` / `(app)` route groups
 
 ## Scope
 
@@ -88,7 +90,7 @@ Deliverables:
 2. **`lib/api.ts` — typed wrappers.** Add `api.get<T>(path)`, `api.post<T>(path, body?)`, `api.patch<T>(path, body?)`, `api.put<T>(path, body?)`, `api.delete<T>(path)`. Each is a thin wrapper over `apiFetch` with the right `method` set. 204 handling uses `Promise<void>` on `delete` / `put` without return. This subsumes audit F-6 (204 cast nit).
 3. **`lib/api.ts` — 401 silent-refresh interceptor** (audit F-1). On any non-login-path 401, attempt `POST /auth/refresh` exactly once (deduplicate concurrent 401s via a module-level `refreshPromise`). Retry the original request on refresh success. On refresh failure, clear the `HAS_SESSION_KEY` sessionStorage flag and throw the original 401. Refresh-exempt paths: `/auth/refresh`, `/auth/login`, `/auth/register`, `/auth/forgot-password`, `/auth/reset-password`, `/auth/verify-email`. Do not attempt refresh if `HAS_SESSION_KEY` is not set (skip the round-trip for truly anonymous visits).
 4. **`context/auth.tsx` — `AuthProvider` + `useAuth`** (audit F-2). Provider wraps children with a React Query `['auth', 'me']` query (`retry: false`, `staleTime: 30_000`). Hook returns `{ user, isLoading, isAuthenticated, isVerified, markLoggedIn, markLoggedOut }`. `markLoggedIn` sets `HAS_SESSION_KEY` and invalidates the query. `markLoggedOut` clears it and resets the query. Nest `AuthProvider` inside `QueryClientProvider` in `app/providers.tsx`.
-5. **`middleware.ts`** (audit F-7). Single source of auth routing. File lives at `frontend/middleware.ts` (repo root of frontend, not under `app/`).
+5. **`proxy.ts`** (audit F-7; Next.js 16 rename of `middleware.ts`). Single source of auth routing. File lives at `frontend/proxy.ts` (repo root of frontend, not under `app/`). Export function is `proxy` (not `middleware`). Runs on Node.js runtime (Edge is not supported by `proxy`; acceptable for a cookie-presence check). See https://nextjs.org/docs/app/api-reference/file-conventions/proxy.
    - Path starts with `/app` and no `access_token` cookie → 307 to `/login`.
    - Path is `/login` or `/register` and `access_token` cookie present → 307 to `/app`.
    - Otherwise pass through.
