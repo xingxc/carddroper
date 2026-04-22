@@ -494,7 +494,13 @@ async def verify_email(
     user.token_version += 1
     await revoke_all_user_tokens(user.id, db)
 
-    return {"message": "Email verified."}
+    # Server-side invalidation happened above; clear the now-dead cookies from
+    # the browser so the proxy can't redirect /login → /app based on stale
+    # cookie presence. User must log in again, matching the "Please log in to
+    # continue." success-panel UX spec'd in 0015.
+    response = JSONResponse(content={"message": "Email verified."})
+    _clear_auth_cookies(response)
+    return response
 
 
 # ---------------------------------------------------------------------------

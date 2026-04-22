@@ -29,6 +29,8 @@ Each candidate is a hypothesis; the audit confirms or rejects based on actual ri
 - **Cookie `secure` flag** — should be true in prod (non-localhost). Today's middleware likely handles this; confirm.
 - **Rate-limit settings** (`RESEND_VERIFICATION_RATE_LIMIT` etc.) — sensible defaults exist; likely low-value to add validators, but flag any that must be non-zero.
 
+- **Token-version-bump-and-cookie-clear pattern.** Endpoints that bump `user.token_version` on an authenticated session must clear the dead auth cookies (via `_clear_auth_cookies`) or re-issue fresh ones (via `_set_auth_cookies` with the new tv). Established in 0015.7 for verify-email. Current audit: change-password (auth.py:381-388) re-issues fresh cookies ✓; reset-password (auth.py:462-463) is pre-auth ✓; verify-email (auth.py:492-) fixed in 0015.7 ✓. Future endpoints landing this pattern (e.g., change-email in ticket 0017, any admin "revoke session" feature) must honor the rule. Audit mechanic: `grep -n 'token_version += 1' backend/app/routes/` and classify each hit as "clears", "re-issues", or "no session" with reasoning.
+
 ## Approach
 
 1. Read `backend/app/config.py` end-to-end with the audit hat on.

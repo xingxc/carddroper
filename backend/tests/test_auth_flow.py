@@ -309,6 +309,67 @@ async def test_locked_user_can_still_access_me(client):
     assert me.json()["email"] == "locked_me@example.com"
 
 
+async def test_verify_email_newly_verified_clears_cookies(client):
+    """Case A: newly-verified branch sets Max-Age=0 clearing headers for access_token + refresh_token."""
+    from app.services.auth_service import create_verify_token
+
+    reg = await client.post(
+        "/auth/register",
+        json={"email": "clearck@example.com", "password": "verylongsecret"},
+    )
+    assert reg.status_code == 200
+    user_id = reg.json()["user"]["id"]
+
+    token = create_verify_token(user_id, 0)
+    r = await client.post("/auth/verify-email", json={"token": token})
+    assert r.status_code == 200
+    assert r.json() == {"message": "Email verified."}
+
+    # Collect all Set-Cookie header values from the response.
+    set_cookie_values = r.headers.get_list("set-cookie")
+
+    # Both access_token and refresh_token must be cleared (Max-Age=0).
+    access_cleared = any("access_token" in v and "Max-Age=0" in v for v in set_cookie_values)
+    refresh_cleared = any("refresh_token" in v and "Max-Age=0" in v for v in set_cookie_values)
+    assert access_cleared, f"Expected access_token clearing header; got: {set_cookie_values}"
+    assert refresh_cleared, f"Expected refresh_token clearing header; got: {set_cookie_values}"
+
+
+async def test_verify_email_idempotent_does_not_clear_cookies(client):
+    """Case B: idempotent 'already verified' branch does NOT emit any clearing Set-Cookie headers."""
+    from app.services.auth_service import create_verify_token
+
+    # Register and perform first verification.
+    reg = await client.post(
+        "/auth/register",
+        json={"email": "idem@example.com", "password": "verylongsecret"},
+    )
+    assert reg.status_code == 200
+    user_id = reg.json()["user"]["id"]
+
+    first_token = create_verify_token(user_id, 0)
+    r1 = await client.post("/auth/verify-email", json={"token": first_token})
+    assert r1.status_code == 200
+    assert r1.json() == {"message": "Email verified."}
+
+    # After first verify, token_version is 1. Mint a fresh token with the new tv.
+    fresh_token = create_verify_token(user_id, 1)
+    r2 = await client.post("/auth/verify-email", json={"token": fresh_token})
+    assert r2.status_code == 200
+    assert r2.json() == {"message": "Email already verified."}
+
+    # Idempotent path must not clear any auth cookies.
+    set_cookie_values = r2.headers.get_list("set-cookie")
+    clearing_headers = [
+        v
+        for v in set_cookie_values
+        if ("access_token" in v or "refresh_token" in v) and "Max-Age=0" in v
+    ]
+    assert clearing_headers == [], (
+        f"Idempotent path must not clear cookies; got: {clearing_headers}"
+    )
+
+
 async def test_register_succeeds_when_email_send_raises(client, monkeypatch):
     """Best-effort preservation: send_email raises after retries; registration still returns 201.
 
