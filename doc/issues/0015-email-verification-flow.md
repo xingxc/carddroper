@@ -15,6 +15,7 @@ verified state. This ticket builds those pages plus the foundational frontend
 auth plumbing they need.
 
 Grounded in:
+- `doc/architecture/site-model.md` — **DECIDED 2026-04-22.** Canva-model auth wall with chassis/body split. Authoritative for page structure and middleware scope in this ticket.
 - `doc/systems/auth.md` — token strategy, cookie delivery, 7-day lock, verification UX
 - `doc/architecture/overview.md` — request flow, where auth state lives
 - `doc/reference/backend-api.md` — endpoint catalogue (all target endpoints exist)
@@ -39,19 +40,24 @@ expected in this ticket — flag if any surfaces.
 
 ## Scope
 
-**In scope — MVP email-verification flow:**
-- Frontend auth plumbing (api wrappers, 401 interceptor, auth context, middleware + route groups).
+**In scope — chassis foundations + MVP email-verification flow:**
+- Frontend auth plumbing (api wrappers, 401 interceptor, auth context, middleware).
+- Three route groups per `site-model.md`: `(marketing)/`, `(auth)/`, `(app)/`.
+- `config/brand.ts` — single-source brand constants (`name`, `domain`, `fromEmail`, `supportEmail`).
+- `/` (marketing landing) — public. Auth-aware header: Sign in / Register for anon; `{email}` + Logout for authed.
 - `/register` — create account, triggers verification email, redirects to `/verify-email-sent`.
-- `/login` — existing-user login; post-login routing depends on `verified_at`.
-- `/verify-email-sent` — post-register / logged-in-unverified landing. Shows "check your inbox" + a "resend email" button (rate-limited via backend).
-- `/verify-email?token=…` — consumes token, flips `verified_at`, routes to `/` on success.
-- `/` (root) — auth-aware: unauthed → marketing stub; authed-unverified → redirect to `/verify-email-sent`; authed-verified → stub dashboard.
+- `/login` — existing-user login; on success → `/app`.
+- `/verify-email-sent` — post-register landing. Shows "check your inbox" + "resend email" button (rate-limited via backend).
+- `/verify-email?token=…` — consumes token, flips `verified_at`, redirects to `/login` (verification increments `token_version` → user must re-authenticate per auth.md).
+- `/app` — auth-gated stub. "You're logged in as `{email}`" + Logout button. Unverified users can reach it (per auth.md §Soft cap: days 0–6).
 
 **Explicitly out of scope (own tickets later):**
 - `/forgot-password`, `/reset-password` pages → ticket 0016.
-- Change-email settings page → ticket 0017+.
-- Logout UI affordance beyond a bare button on the dashboard stub.
-- Real dashboard content — a stub page that says "Welcome, {email}" is sufficient.
+- Change-email settings page → ticket 0017.
+- Legal acceptance checkbox + `/legal/terms` and `/legal/privacy` static pages → own ticket before first Stripe charge.
+- Real marketing content (hero copy, features page, pricing page) — design ticket, post-MVP.
+- Real `(app)/` body (card browser, customizer, send flow) — later Carddroper tickets.
+- Verification gating modal — no gated actions ship in 0015, so no modal yet.
 - Design system / shared form components beyond what naturally factors out.
 - Analytics, Sentry, RUM.
 
@@ -62,40 +68,71 @@ expected in this ticket — flag if any surfaces.
 - **Data fetching:** `@tanstack/react-query` v5 (already installed). Queries for reads, mutations for writes. Invalidate `['auth', 'me']` on login/register/logout/verify success.
 - **Auth state:** single React Query `useQuery({ queryKey: ['auth', 'me'], queryFn: () => api.get('/auth/me'), staleTime: 30_000, retry: false })` — exposed through `useAuth()` hook returning `{ user, isLoading, isAuthenticated, isVerified }`. `retry: false` on this query (override the global `retry: 1`) so logged-out users don't pay a retry round-trip.
 - **Access token storage:** HttpOnly cookie set by backend (already working). Frontend does not see or store access tokens in JS. Session "has logged in" signal lives in `sessionStorage` (`HAS_SESSION_KEY`) so anonymous visits don't trigger refresh attempts. Set on successful login/register, cleared on logout/401-after-refresh-fail.
-- **Middleware:** cookie presence check only (HttpOnly means it can't decode). Enough to redirect `/dashboard` routes to `/login` if no cookie. Actual validity confirmed by `GET /auth/me` in `AuthProvider`.
-- **Route groups:**
-  - `app/(auth)/` — `/login`, `/register`, `/verify-email-sent`, `/verify-email`. Layout redirects *authenticated-verified* users to `/` (the dashboard stub).
-  - `app/(dashboard)/` — `/` (post-auth landing). Layout redirects *unauthenticated* users to `/login`; *unverified* users to `/verify-email-sent`.
-  - Root `app/page.tsx` moves into `(dashboard)/page.tsx`. A public marketing landing can come later.
+- **Middleware:** cookie presence check only (HttpOnly means it can't decode). Gates `(app)/*` paths → redirect to `/login` if no `access_token` cookie. Also: authed user on `/login` or `/register` → redirect to `/app`. `(marketing)/*` and `(auth)/*` are otherwise public. Token validity confirmed by `GET /auth/me` in `AuthProvider`.
+- **Route groups (per `site-model.md`):**
+  - `app/(marketing)/` — `/` landing. Public. Layout renders auth-aware header but does not redirect either way.
+  - `app/(auth)/` — `/login`, `/register`, `/verify-email-sent`, `/verify-email`. Public entry; authed-redirect handled by middleware (not layout) to keep the boundary in one place.
+  - `app/(app)/` — `/app` stub. Middleware guarantees a cookie is present before layout runs; layout uses `useAuth()` to surface `{email}` and Logout.
+  - Existing `app/page.tsx` (`<h1>Carddroper</h1>`) moves into `(marketing)/page.tsx` as the marketing-landing stub.
 - **Error surface:** every form captures `ApiError` on mutation failure, renders the backend `error.message` as a form-level error. Zod handles field-level validation before the request fires. `code === "NETWORK_ERROR"` → show a generic retry prompt.
-- **Success surface:** after register, `queryClient.invalidateQueries(['auth', 'me'])` + `router.push('/verify-email-sent')`. After verify, same + push to `/`. After login, same + push to `/` (unverified users will bounce through the middleware to `/verify-email-sent`).
+- **Success surface:** after register → `markLoggedIn()` + `invalidateQueries(['auth','me'])` + `router.push('/verify-email-sent')`. After login → same + `router.push('/app')`. After verify → `markLoggedOut()` (token_version bumped, access token invalidated) + user clicks the inline "Log in" button to go to `/login`. No toast system in 0015 — all success feedback is inline on the page.
 
 ## Phases
 
-### Phase 0 — Frontend foundations (dispatch frontend-builder)
+### Phase 0 — Chassis foundations (dispatch frontend-builder — separate dispatch from Phase 1)
 
-Lands the plumbing. Nothing user-visible yet.
-
-Deliverables:
-1. **`lib/api.ts` — typed wrappers.** Add `api.get<T>(path)`, `api.post<T>(path, body?)`, `api.patch<T>(path, body?)`, `api.put<T>(path, body?)`, `api.delete<T>(path)`. Each is a thin wrapper over `apiFetch` with the right `method` set. 204 handling uses `Promise<void>` on `delete` / `put` without return. This subsumes audit F-6 (204 cast nit).
-2. **`lib/api.ts` — 401 silent-refresh interceptor** (audit F-1). On any non-login-path 401, attempt `POST /auth/refresh` exactly once (deduplicate concurrent 401s via a module-level `refreshPromise`). Retry the original request on refresh success. On refresh failure, clear the `HAS_SESSION_KEY` sessionStorage flag and throw the original 401. Refresh-exempt paths: `/auth/refresh`, `/auth/login`, `/auth/register`, `/auth/forgot-password`, `/auth/reset-password`, `/auth/verify-email`. Do not attempt refresh if `HAS_SESSION_KEY` is not set (skip the round-trip for truly anonymous visits).
-3. **`context/auth.tsx` — `AuthProvider` + `useAuth`** (audit F-2). Provider wraps children with a React Query `['auth', 'me']` query. Hook returns `{ user, isLoading, isAuthenticated, isVerified, markLoggedIn, markLoggedOut }`. `markLoggedIn` sets `HAS_SESSION_KEY` and invalidates the query. `markLoggedOut` clears it and resets the query. Nest `AuthProvider` inside `QueryClientProvider` in `app/providers.tsx`.
-4. **`middleware.ts`** (audit F-7). Check cookie presence; redirect `/` (and any future `/(dashboard)` routes) to `/login` if no `access_token` cookie. Auth'd-accessing-(auth) page redirection is handled in the `(auth)` layout, not middleware, because middleware can't know verification state without decoding the token.
-5. **Route groups.** Create `app/(auth)/layout.tsx` (redirects verified users to `/`) and `app/(dashboard)/layout.tsx` (redirects unauthed to `/login`, unverified to `/verify-email-sent`). Move existing `app/page.tsx` (`<h1>Carddroper</h1>`) to `app/(dashboard)/page.tsx` as the post-login stub.
-6. **Dependencies added:** `react-hook-form`, `@hookform/resolvers`, `zod`.
-
-Phase 0 acceptance: lint / tsc / build clean; `HAS_SESSION_KEY` round-trip works locally against docker-compose backend (anonymous visit → no refresh attempt; logged-in → refresh attempt on expiry); dashboard stub shows `<h1>Carddroper</h1>` for a verified user, middleware redirects to `/login` otherwise.
-
-### Phase 1 — Pages (dispatch frontend-builder, same dispatch or split — your call)
+**Reliability rationale for the split:** Phase 0 establishes the chassis boundary (route groups + middleware + auth plumbing) that every subsequent page sits on top of. If any of it is wrong, catching it before building five pages is cheaper. Ship Phase 0, verify the boundary in isolation (curl-driven), then dispatch Phase 1 with a known-good foundation.
 
 Deliverables:
-1. **`app/(auth)/register/page.tsx`** — email + password + confirm-password. Zod validation (email format, password ≥ 10 chars). On submit: `api.post('/auth/register', …)` → on success: `markLoggedIn()`, `invalidateQueries(['auth','me'])`, `router.push('/verify-email-sent')`. On 409 (email exists) → form-level error. On 422 (weak password) → field-level error.
-2. **`app/(auth)/login/page.tsx`** — email + password. Same patterns. On 401 → form-level "invalid credentials" (don't disambiguate email-exists vs wrong-password, per anti-enumeration). On 429 → rate-limit message with retry-after if the backend surfaces it.
-3. **`app/(auth)/verify-email-sent/page.tsx`** — "We sent a verification email to `{user.email}`. Click the link to verify your account." Shows a "Resend email" button that calls `api.post('/auth/resend-verification')`. Button is disabled during pending mutation and shows a success toast on 200. On 429, show "please wait before requesting another email." This page requires authentication; unverified users land here naturally via middleware, and `(auth)/layout.tsx` redirects *verified* users away to `/`.
-4. **`app/(auth)/verify-email/page.tsx`** — reads `?token=…` from searchParams. On mount, calls `api.post('/auth/verify-email', { token })`. States: pending (spinner), success ("Verified! Redirecting…" + `router.push('/')` after 2s + invalidate auth/me), 422 ("This verification link is invalid or expired. Try requesting a new one." with button to `/verify-email-sent`), 401 (subject user missing — treat same as 422 for UX), 429 (already verified — show "Your email is already verified" + link to `/`).
+1. **`config/brand.ts`** — `export const brand = { name: "Carddroper", domain: "carddroper.com", fromEmail: "noreply@carddroper.com", supportEmail: "support@carddroper.com" } as const;` Single-source for brand strings used across auth-page copy, email templates, and marketing layout. Per `site-model.md` §Reusability constraint 2.
+2. **`lib/api.ts` — typed wrappers.** Add `api.get<T>(path)`, `api.post<T>(path, body?)`, `api.patch<T>(path, body?)`, `api.put<T>(path, body?)`, `api.delete<T>(path)`. Each is a thin wrapper over `apiFetch` with the right `method` set. 204 handling uses `Promise<void>` on `delete` / `put` without return. This subsumes audit F-6 (204 cast nit).
+3. **`lib/api.ts` — 401 silent-refresh interceptor** (audit F-1). On any non-login-path 401, attempt `POST /auth/refresh` exactly once (deduplicate concurrent 401s via a module-level `refreshPromise`). Retry the original request on refresh success. On refresh failure, clear the `HAS_SESSION_KEY` sessionStorage flag and throw the original 401. Refresh-exempt paths: `/auth/refresh`, `/auth/login`, `/auth/register`, `/auth/forgot-password`, `/auth/reset-password`, `/auth/verify-email`. Do not attempt refresh if `HAS_SESSION_KEY` is not set (skip the round-trip for truly anonymous visits).
+4. **`context/auth.tsx` — `AuthProvider` + `useAuth`** (audit F-2). Provider wraps children with a React Query `['auth', 'me']` query (`retry: false`, `staleTime: 30_000`). Hook returns `{ user, isLoading, isAuthenticated, isVerified, markLoggedIn, markLoggedOut }`. `markLoggedIn` sets `HAS_SESSION_KEY` and invalidates the query. `markLoggedOut` clears it and resets the query. Nest `AuthProvider` inside `QueryClientProvider` in `app/providers.tsx`.
+5. **`middleware.ts`** (audit F-7). Single source of auth routing. File lives at `frontend/middleware.ts` (repo root of frontend, not under `app/`).
+   - Path starts with `/app` and no `access_token` cookie → 307 to `/login`.
+   - Path is `/login` or `/register` and `access_token` cookie present → 307 to `/app`.
+   - Otherwise pass through.
+   - Export a `config` object with a `matcher` that excludes `/_next/*`, `/favicon.ico`, and static assets so the middleware does NOT run on every asset request. Use the standard Next.js 16 negative-lookahead pattern:
+     ```typescript
+     export const config = {
+       matcher: ["/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp|ico)).*)"],
+     };
+     ```
+6. **Route groups + layouts.**
+   - Create `app/(marketing)/layout.tsx` with an auth-aware header (reads `useAuth()`): anon → "Sign in" / "Register" links; authed → `{email}` + Logout button. Move existing `app/page.tsx` (`<h1>Carddroper</h1>`) to `app/(marketing)/page.tsx`.
+   - Create `app/(auth)/layout.tsx` — minimal centered container; no auth redirects (middleware handles them).
+   - Create `app/(app)/layout.tsx` — minimal; uses `useAuth()` to expose email + Logout button in a thin header. Create `app/(app)/app/page.tsx` with the stub body: "You're logged in as `{user.email}`." + Logout.
+7. **Dependencies added:** `react-hook-form`, `@hookform/resolvers`, `zod`.
+
+Phase 0 acceptance:
+- `npm run lint` / `npx tsc --noEmit` / `npm run build` clean.
+- `docker build ./frontend` succeeds.
+- Middleware behavior verified with `curl -I` (no cookie on `/app` → 307 `/login`; cookie on `/login` → 307 `/app`; no cookie on `/` → 200).
+- Anonymous visit to `/` does NOT trigger a `POST /auth/refresh` (HAS_SESSION_KEY gate works).
+- `/app` stub renders `<h1>Carddroper</h1>` + email + Logout for a verified user logged in against docker-compose backend.
+
+### Phase 1 — Pages (dispatch frontend-builder after Phase 0 verified)
+
+Deliverables:
+1. **`app/(auth)/register/page.tsx`** — email + password + confirm-password. Zod validation (email format, password ≥ 10 chars). On submit: `api.post('/auth/register', …)` → on success: `markLoggedIn()`, `invalidateQueries(['auth','me'])`, `router.push('/verify-email-sent')`. On 409 (email exists) → form-level error. On 422 (weak password) → field-level error. No ToS checkbox in 0015 (deferred to legal-acceptance ticket).
+2. **`app/(auth)/login/page.tsx`** — email + password. Same patterns. On success → `markLoggedIn()` + `invalidateQueries(['auth','me'])` + `router.push('/app')`. On 401 → form-level "invalid credentials" (don't disambiguate email-exists vs wrong-password, per anti-enumeration). On 429 → rate-limit message with retry-after if the backend surfaces it. No "forgot password" link in 0015 (deferred to 0016).
+3. **`app/(auth)/verify-email-sent/page.tsx`** — "We sent a verification email to `{user.email}`. Click the link to verify your account." Shows a "Resend email" button that calls `api.post('/auth/resend-verification')`. Button is disabled during pending mutation. On 200, swap the button with an inline success message: "Verification email sent — check your inbox." On 429, swap with inline message: "Please wait before requesting another email." Requires an authenticated session to read `user.email` — if unauthed (direct hit, no `HAS_SESSION_KEY`), render a fallback "Check your inbox; if you don't have an account, [register]." No redirect; the page is informational. **No toast system is introduced in 0015** — inline feedback only.
+4. **`app/(auth)/verify-email/page.tsx`** — reads `?token=…` from searchParams. On mount, calls `api.post('/auth/verify-email', { token })`. **Backend response shapes (authoritative, from `backend/app/routes/auth.py`):**
+   - 200 OK `{ "message": "Email verified." }` — newly verified (this call set `verified_at` and bumped `token_version`).
+   - 200 OK `{ "message": "Email already verified." }` — idempotent path; user was already verified.
+   - 401 Unauthorized — invalid/expired token, or token's `sub` resolves to no user (deferred edge, see §deferrals).
+   - 422 Unprocessable — malformed token payload (non-string token, missing fields).
+
+   **Frontend states (pages must handle each):**
+   - **pending** — spinner + "Verifying your email…" centered.
+   - **success (200, either message)** — inline success panel: "Your email is verified. Please log in to continue." + primary button to `/login`. Call `markLoggedOut()` to clear `HAS_SESSION_KEY` — newly-verified users had their `token_version` bumped and their cookie is now dead; already-verified users reaching this page must also re-auth. Do NOT auto-redirect; let the user click the button. (Auto-redirect with a timer creates race conditions with toast-style feedback that we're deliberately not shipping.)
+   - **401 / 422** — treat identically: inline error panel: "This verification link is invalid or expired." + primary button to `/verify-email-sent` labeled "Request a new email" + secondary link to `/login`.
+   - **network error** (`code === "NETWORK_ERROR"`) — inline retry panel with a retry button that re-runs the mutation.
+
+   Guard against the React 19 strict-mode double-mount firing the mutation twice. The verify-email endpoint is idempotent on the second call (returns 200 "already verified") so this is safe, but use React Query's `useMutation` with a one-shot `useEffect(() => mutate({ token }), [])` pattern — not in-render-side-effects.
 5. **Tiny helper components that fall out naturally** — `<FormField>`, `<SubmitButton>`, `<FormError>`. Extract to `components/` only if used in ≥ 2 pages. Don't pre-factor.
 
-Phase 1 acceptance: each page renders; forms validate; mutations fire; error and success states render for each page. Lint / tsc / build clean. Local docker-compose golden path works end-to-end against the backend's dev email fallback (the `dev_preview_url` in the backend logs gives the verify URL to click).
+Phase 1 acceptance: each page renders; forms validate; mutations fire; error and success states render for each page. Lint / tsc / build clean. Local docker-compose golden path works end-to-end against the backend's dev email fallback (the `dev_preview_url` in the backend logs gives the verify URL to click). End-to-end flow: `/` → Register → `/register` → submit → `/verify-email-sent` → click dev preview URL → `/verify-email` → success → `/login` → submit → `/app`.
 
 ### Phase 2 — Staging smoke (user)
 
@@ -105,10 +142,12 @@ Phase 1 acceptance: each page renders; forms validate; mutations fire; error and
    - `.venv/bin/python backend/scripts/smoke_auth.py` (confirms backend golden path still works)
 3. Write a new smoke: `backend/scripts/smoke_verify_email.py` — registers a `smoke+<uuid>@carddroper.com` user against staging, asserts the register response, then asserts the verify-email-sent / resend-verification round-trip at the API level (not through the browser). The end-to-end browser flow is user-manual for v0.1.
 4. Manual browser check on `https://staging.carddroper.com`:
-   - Register with a personal inbox you control (not `@carddroper.com`).
+   - Register with a personal inbox you control (not `@carddroper.com`) → land on `/verify-email-sent`.
    - Receive the verification email (real SendGrid delivery — DKIM should pass).
-   - Click the link → land on `/verify-email` → success state → `/`.
-   - Sign out, sign back in — session persists, `/auth/me` returns `verified_at` non-null, no redirect to `/verify-email-sent`.
+   - Click the link → land on `/verify-email` → success state renders → click "Log in" → land on `/login`.
+   - Log in with the just-verified credentials → redirect to `/app` → `/app` stub shows `{email}` + Logout.
+   - Sign out → header swaps to anon state → `/app` now redirects to `/login`.
+   - `/auth/me` should return `verified_at` non-null after the verify click (inspect in devtools or a subsequent login session).
 
 ## Verification
 
@@ -127,14 +166,18 @@ Phase 1 acceptance: each page renders; forms validate; mutations fire; error and
 
 ## Out of scope — tracked deferrals
 
-From the 2026-04-21 audits and earlier:
-- **Backend F-3** (`users.updated_at` best-effort) — revisit when first filter on `updated_at` lands.
-- **Backend F-6** (`sleep 3` in `cloudbuild.yaml` migrate step) — revisit on first intermittent failure in staging.
-- **Frontend F-9** (`.dockerignore *.md` nit) — no action unless frontend `README.md` needs to ship.
-- **0009 F-2** (viewport export on layout) — add on next layout touch.
-- **0009 F-6** (`noUncheckedIndexedAccess` / `noImplicitOverride` tsconfig tightening) — separate maintenance ticket when the suite is mature enough to absorb the fallout.
-- **`verify-email` user-not-found-after-decode 401 path** — flagged during 0014 Phase 0. If the 422-vs-401 distinction surfaces in frontend error handling here, change the backend to 422 for consistency and add a regression test. Otherwise leave.
-- **Per-ticket checklist item: when deleting the last file in a build-context directory, check the Dockerfile for `COPY <dir>` references.** Surfaced by the 0014 Phase 3 hotfix. Add to `doc/operations/testing.md` §Per-ticket checklist when this ticket lands or earlier — orchestrator call.
+Post-0014.5 surviving deferrals:
+- **Backend F-3** (`users.updated_at` best-effort) — revisit when the first bulk UPDATE route lands. None in 0015 or 0016. Owned inline when a route surfaces.
+- **Frontend F-9** (`.dockerignore *.md` nit) — opportunistic, no ticket. Next time `.dockerignore` is touched for any other reason.
+- **`verify-email` user-not-found-after-decode 401 path** — flagged during 0014 Phase 0. **May surface in Phase 1 here.** If the 401 silent-refresh interceptor loops on this 401 during real verify-email UX testing, change the backend to 422 for consistency and add a regression test in this ticket. If the interceptor correctly scopes to non-auth routes (which it should — `/auth/verify-email` is on the refresh-exempt list), keep deferred. Decision made when Phase 1 lands.
+
+Scheduled elsewhere:
+- `/forgot-password` + `/reset-password` → ticket 0016.
+- `/change-email` + email-changed flow → ticket 0017.
+- Legal acceptance checkbox + `/legal/terms` + `/legal/privacy` → own ticket before first Stripe charge.
+
+Resolved pre-0015 (for traceability):
+- 0009 F-2 (viewport), 0009 F-6 (tsconfig tightening), Backend F-6 (`sleep 3` → socket probe), Dockerfile-COPY postmortem → all fixed in 0014.5 (commits `48faec7`, `c0779f5`).
 
 ## Report
 
