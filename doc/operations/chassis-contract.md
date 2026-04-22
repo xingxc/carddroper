@@ -24,4 +24,29 @@ Set CORS_ORIGINS to include FRONTEND_BASE_URL (CSV) or CORS_ORIGIN_REGEX to matc
 **How to satisfy:**
 
 - Common case (single environment): set `CORS_ORIGINS` to include `FRONTEND_BASE_URL` exactly. Example: `CORS_ORIGINS=https://staging.carddroper.com` when `FRONTEND_BASE_URL=https://staging.carddroper.com`.
-- Multi-subdomain projects: set `CORS_ORIGIN_REGEX` to a pattern that matches `FRONTEND_BASE_URL`. The literal list check is then not required. Note: `CORS_ORIGIN_REGEX` is not currently wired into `CORSMiddleware.allow_origin_regex` — set `CORS_ORIGINS` explicitly for each subdomain until that plumbing is added.
+- Multi-subdomain projects: set `CORS_ORIGIN_REGEX` to a pattern that matches `FRONTEND_BASE_URL`. The literal list check is then not required. Note: `CORS_ORIGIN_REGEX` is not currently wired into `CORSMiddleware.allow_origin_regex` in this version — set `CORS_ORIGINS` explicitly for each subdomain until that plumbing is added.
+
+---
+
+## Invariant: `FRONTEND_BASE_URL host ⊆ COOKIE_DOMAIN` (when `COOKIE_DOMAIN` is set)
+
+**Required:** only when `COOKIE_DOMAIN` is set. When unset (the default), this check is skipped — correct for local dev on localhost.
+
+**Purpose:** When frontend and backend live on different subdomains (e.g. `staging.carddroper.com` and `api.staging.carddroper.com`), auth cookies must be scoped to a common parent domain so both hosts can read them. If `COOKIE_DOMAIN` is set to a domain that does not cover `FRONTEND_BASE_URL`, the browser will not forward the cookies to the frontend host. The frontend proxy reads `request.cookies.has("access_token")` — with no cookie, it always sees "not logged in," making login appear broken while the backend logs show no error.
+
+**Error message on violation:**
+
+```
+Cookie-domain misconfiguration: FRONTEND_BASE_URL host=<host> is not covered by COOKIE_DOMAIN=<cookie_domain>.
+Browsers will not forward cookies scoped to COOKIE_DOMAIN to the frontend host, so the frontend proxy cannot gate auth routes.
+Either leave COOKIE_DOMAIN unset (single-host deployments) or set it to a parent domain of FRONTEND_BASE_URL (e.g. ".example.com" for https://app.example.com).
+```
+
+**Enforcement location:** `backend/app/config.py` — `Settings.validate_cookie_domain` (`@model_validator(mode="after")`).
+
+**How to satisfy:**
+
+- **Single-host deployment** (frontend and backend on the same origin): leave `COOKIE_DOMAIN` unset. The check is skipped entirely.
+- **Multi-subdomain deployment** (e.g. `app.X.com` + `api.X.com`): set `COOKIE_DOMAIN=.X.com`. Both hosts are under `.X.com`, so cookies are visible to both.
+- **Cross-domain deployment** (e.g. `app.A.com` + `api.B.net`): cookie-based auth across fully different domains is not supported by this chassis. Use a same-origin reverse-proxy or a bearer-token strategy instead.
+- **Caveat — backend host not validated:** the backend's own deployed host must also be under `COOKIE_DOMAIN` for the browser to accept the `Set-Cookie` response header. If it isn't, the browser silently rejects the `Set-Cookie`. The chassis does not validate the backend host (no `BACKEND_BASE_URL` setting exists today); adopters must verify this manually during deploy setup.

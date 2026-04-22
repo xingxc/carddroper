@@ -95,3 +95,87 @@ class TestCorsOriginsValidator:
         error_str = str(exc_info.value)
         assert "CORS misconfiguration" in error_str
         assert r"https://.*\.carddroper\.com" in error_str
+
+
+class TestCookieDomainValidator:
+    """Tests for Settings.validate_cookie_domain model validator (0015.6).
+
+    Each test passes CORS_ORIGINS equal to FRONTEND_BASE_URL so the earlier
+    CORS validator never trips before we reach the cookie-domain check.
+    """
+
+    def test_happy_cookie_domain_none(self):
+        """COOKIE_DOMAIN=None (default) — validator is skipped, constructs cleanly."""
+        s = __import__("app.config", fromlist=["Settings"]).Settings(
+            **_make(
+                FRONTEND_BASE_URL="http://localhost:3000",
+                CORS_ORIGINS="http://localhost:3000",
+                COOKIE_DOMAIN=None,
+            )
+        )
+        assert s.COOKIE_DOMAIN is None
+
+    def test_happy_cookie_domain_exact_match(self):
+        """COOKIE_DOMAIN covers FRONTEND_BASE_URL host exactly (with leading dot)."""
+        s = __import__("app.config", fromlist=["Settings"]).Settings(
+            **_make(
+                FRONTEND_BASE_URL="https://staging.carddroper.com",
+                CORS_ORIGINS="https://staging.carddroper.com",
+                COOKIE_DOMAIN=".staging.carddroper.com",
+            )
+        )
+        assert s.COOKIE_DOMAIN == ".staging.carddroper.com"
+
+    def test_happy_cookie_domain_parent_covers_subdomain(self):
+        """COOKIE_DOMAIN is a parent domain covering a deeper-nested FRONTEND_BASE_URL."""
+        s = __import__("app.config", fromlist=["Settings"]).Settings(
+            **_make(
+                FRONTEND_BASE_URL="https://app.carddroper.com",
+                CORS_ORIGINS="https://app.carddroper.com",
+                COOKIE_DOMAIN=".carddroper.com",
+            )
+        )
+        assert s.COOKIE_DOMAIN == ".carddroper.com"
+
+    def test_happy_cookie_domain_no_leading_dot(self):
+        """COOKIE_DOMAIN without leading dot — leading-dot stripping normalises it correctly."""
+        s = __import__("app.config", fromlist=["Settings"]).Settings(
+            **_make(
+                FRONTEND_BASE_URL="https://staging.carddroper.com",
+                CORS_ORIGINS="https://staging.carddroper.com",
+                COOKIE_DOMAIN="staging.carddroper.com",
+            )
+        )
+        assert s.COOKIE_DOMAIN == "staging.carddroper.com"
+
+    def test_failing_cookie_domain_wrong_domain(self):
+        """COOKIE_DOMAIN does not cover FRONTEND_BASE_URL host — must raise."""
+        with pytest.raises(ValidationError) as exc_info:
+            __import__("app.config", fromlist=["Settings"]).Settings(
+                **_make(
+                    FRONTEND_BASE_URL="https://staging.carddroper.com",
+                    CORS_ORIGINS="https://staging.carddroper.com",
+                    COOKIE_DOMAIN=".other.com",
+                )
+            )
+
+        error_str = str(exc_info.value)
+        assert "Cookie-domain misconfiguration" in error_str
+        assert "FRONTEND_BASE_URL host=staging.carddroper.com" in error_str
+        assert "COOKIE_DOMAIN=.other.com" in error_str
+        assert "Browsers will not forward cookies" in error_str
+
+    def test_failing_cookie_domain_localhost_mismatch(self):
+        """COOKIE_DOMAIN set but FRONTEND_BASE_URL is localhost — must raise."""
+        with pytest.raises(ValidationError) as exc_info:
+            __import__("app.config", fromlist=["Settings"]).Settings(
+                **_make(
+                    FRONTEND_BASE_URL="http://localhost:3000",
+                    CORS_ORIGINS="http://localhost:3000",
+                    COOKIE_DOMAIN=".staging.carddroper.com",
+                )
+            )
+
+        error_str = str(exc_info.value)
+        assert "Cookie-domain misconfiguration" in error_str
+        assert "FRONTEND_BASE_URL host=localhost" in error_str

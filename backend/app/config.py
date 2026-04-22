@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from typing import Optional
+from urllib.parse import urlparse
 
 from pydantic import SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -69,6 +70,33 @@ class Settings(BaseSettings):
                 f"and does not match CORS_ORIGIN_REGEX={regex_display}.\n"
                 f"A browser served from the frontend URL cannot call this API.\n"
                 f"Set CORS_ORIGINS to include FRONTEND_BASE_URL (CSV) or CORS_ORIGIN_REGEX to match it."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_cookie_domain(self) -> "Settings":
+        """Refuse to construct if COOKIE_DOMAIN is set but does not cover FRONTEND_BASE_URL.
+
+        When frontend and backend live on different subdomains, cookies must be
+        scoped to a parent domain that both hosts share. If COOKIE_DOMAIN is set
+        to a domain that does not cover FRONTEND_BASE_URL, browsers will not
+        forward the cookies to the frontend host and the proxy auth-gate will
+        always see 'no cookie', making login appear broken.
+        """
+        cookie_domain = self.COOKIE_DOMAIN
+        if not cookie_domain:
+            # None or empty string — unset, skip (correct for local dev).
+            return self
+
+        host = urlparse(self.FRONTEND_BASE_URL).hostname or ""
+        suffix = cookie_domain.lstrip(".")
+        valid = (host == suffix) or host.endswith("." + suffix)
+
+        if not valid:
+            raise ValueError(
+                f"Cookie-domain misconfiguration: FRONTEND_BASE_URL host={host} is not covered by COOKIE_DOMAIN={cookie_domain}.\n"
+                f"Browsers will not forward cookies scoped to COOKIE_DOMAIN to the frontend host, so the frontend proxy cannot gate auth routes.\n"
+                f'Either leave COOKIE_DOMAIN unset (single-host deployments) or set it to a parent domain of FRONTEND_BASE_URL (e.g. ".example.com" for https://app.example.com).'
             )
         return self
 

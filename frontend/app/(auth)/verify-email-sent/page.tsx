@@ -52,39 +52,41 @@ export default function VerifyEmailSentPage() {
         )}
       </div>
 
-      <div className="flex flex-col items-center gap-2">
-        {resendState === "idle" && (
-          <button
-            type="button"
-            onClick={() => void handleResend()}
-            className="rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 transition-colors"
-          >
-            Resend email
-          </button>
-        )}
+      {user && (
+        <div className="flex flex-col items-center gap-2">
+          {resendState === "idle" && (
+            <button
+              type="button"
+              onClick={() => void handleResend()}
+              className="rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 transition-colors"
+            >
+              Resend email
+            </button>
+          )}
 
-        {resendState === "pending" && (
-          <button
-            type="button"
-            disabled
-            className="rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-400 cursor-not-allowed opacity-60"
-          >
-            Sending…
-          </button>
-        )}
+          {resendState === "pending" && (
+            <button
+              type="button"
+              disabled
+              className="rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-400 cursor-not-allowed opacity-60"
+            >
+              Sending…
+            </button>
+          )}
 
-        {resendState === "success" && (
-          <p className="text-sm text-green-700 font-medium">
-            Verification email sent — check your inbox.
-          </p>
-        )}
+          {resendState === "success" && (
+            <p className="text-sm text-green-700 font-medium">
+              Verification email sent — check your inbox.
+            </p>
+          )}
 
-        {resendState === "rate_limited" && (
-          <p className="text-sm text-amber-700 font-medium">
-            Please wait before requesting another email.
-          </p>
-        )}
-      </div>
+          {resendState === "rate_limited" && (
+            <p className="text-sm text-amber-700 font-medium">
+              Please wait before requesting another email.
+            </p>
+          )}
+        </div>
+      )}
     </div>
   );
 }
