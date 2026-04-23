@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
@@ -31,7 +31,14 @@ type FormValues = z.infer<typeof schema>;
 export function LoginBody() {
   const router = useRouter();
   const queryClient = useQueryClient();
-  const { markLoggedIn } = useAuth();
+  const { markLoggedIn, isLoading, isAuthenticated } = useAuth();
+
+  useEffect(() => {
+    if (!isLoading && isAuthenticated) {
+      router.replace("/app");
+    }
+  }, [isLoading, isAuthenticated, router]);
+
   const [formError, setFormError] = useState<string | null>(null);
 
   const searchParams = useSearchParams();
