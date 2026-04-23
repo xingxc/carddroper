@@ -8,7 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, markLoggedIn, markLoggedOut, getRefreshPromise } from "@/lib/api";
+import { api, markLoggedIn, getRefreshPromise } from "@/lib/api";
 
 // 80% of TTL — Auth0/Clerk/industry default. 20% buffer absorbs
 // network latency + clock drift. See 0016.6 §Design decisions.
@@ -40,8 +40,6 @@ interface AuthState {
   expiresIn?: number;
   /** Set HAS_SESSION_KEY + invalidate ['auth','me'] after login or register */
   markLoggedIn: () => void;
-  /** Clear HAS_SESSION_KEY + reset ['auth','me'] after logout or verify-email */
-  markLoggedOut: () => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -78,11 +76,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const handleMarkLoggedIn = useCallback(() => {
     markLoggedIn();
     void queryClient.invalidateQueries({ queryKey: AUTH_QUERY_KEY });
-  }, [queryClient]);
-
-  const handleMarkLoggedOut = useCallback(() => {
-    markLoggedOut();
-    queryClient.resetQueries({ queryKey: AUTH_QUERY_KEY });
   }, [queryClient]);
 
   // Proactive token refresh scheduler — fires at 80% of TTL so active users
@@ -127,7 +120,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         isVerified,
         expiresIn,
         markLoggedIn: handleMarkLoggedIn,
-        markLoggedOut: handleMarkLoggedOut,
       }}
     >
       {children}
