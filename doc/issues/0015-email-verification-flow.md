@@ -223,11 +223,16 @@ Closed 2026-04-22. Golden-path walkthrough green on staging end-to-end.
 - Manual browser walkthrough — all steps pass: register → `/verify-email-sent`, real SendGrid delivery, click verify link → success panel → Continue → `/app` still logged in with `verified_at` set. Logout → proxy re-gates `/app`. Authed user on `/login` or `/register` redirects to `/app`. Re-click stale verify link → idempotent 200. Invalid token → error panel, no mutation.
 
 **Deferred, tracked elsewhere:**
-- Email deliverability (walkthrough step 1.3 observed email landed in spam) → future ops-tier ticket for SendGrid Sender Authentication + SPF/DKIM/DMARC on Cloudflare DNS. User-owned.
 - `0016` forgot/reset password pages.
 - `0017` change-email flow.
-- `0018` chassis-hardening audit (JWT_SECRET strength, SENDGRID-required-when-sandbox-off, etc.).
-- Legal acceptance checkbox + `/legal/terms` + `/legal/privacy` → own ticket before first Stripe charge.
+- `0018` chassis-hardening audit (JWT_SECRET strength, SENDGRID-required-when-sandbox-off, DATABASE_URL required in prod, etc.).
+- `0019` email deliverability (walkthrough step 1.3: verification email landed in spam). SendGrid Sender Authentication + SPF/DKIM/DMARC. User-owned DNS + SendGrid console work.
+- `0020` legal acceptance: ToS checkbox on `/register`, static `/legal/terms` + `/legal/privacy` pages. Gates first Stripe charge.
+- Backend audit F-3 (`users.updated_at` best-effort) — trigger: first bulk UPDATE route lands. Owned inline then. Still deferred.
+- Frontend audit F-9 (`.dockerignore *.md` nit) — trigger: next time `.dockerignore` is touched. Still deferred.
+
+**Retired (deferral closed, not worth a ticket):**
+- `verify-email` user-not-found-after-decode 401 path (originally flagged in 0014 audit). The backend returns 401 when the decoded token's `sub` has no matching user and 422 for undecodable tokens. The original concern was (a) API symmetry (both conditions are "bad token") and (b) a potential refresh loop. Both are moot: frontend treats 401 and 422 identically in the invalid-link panel, `/auth/verify-email` is on the refresh-exempt list, and 0015.8 removed the session-invalidation policy so there is no tv-mismatch loop to worry about. Closed as wontfix; do not re-open without new evidence.
 
 **Lessons captured in chassis:**
 - `chassis-contract.md` pattern + CLAUDE.md coupling rule (established 0015.5; extended 0015.6).
