@@ -6,6 +6,7 @@ Also: login lockout and email change.
 
 import pytest
 
+from app.config import settings
 
 pytestmark = pytest.mark.asyncio
 
@@ -21,11 +22,16 @@ async def test_register_login_me(client):
     assert body["refresh_token"]
     assert body["user"]["email"] == "a@example.com"
     assert body["user"]["verified_at"] is None
+    # expires_in present on register (OAuth 2.0 RFC 6749 §5.1)
+    assert isinstance(body["expires_in"], int) and body["expires_in"] > 0
+    assert body["expires_in"] == settings.JWT_EXPIRATION_MINUTES * 60
 
-    # me via Bearer
+    # me via Bearer — envelope shape {user, expires_in}
     me = await client.get("/auth/me", headers={"Authorization": f"Bearer {body['access_token']}"})
     assert me.status_code == 200
-    assert me.json()["email"] == "a@example.com"
+    me_body = me.json()
+    assert me_body["user"]["email"] == "a@example.com"
+    assert isinstance(me_body["expires_in"], int) and me_body["expires_in"] > 0
 
     # login
     lr = await client.post(
@@ -34,6 +40,9 @@ async def test_register_login_me(client):
     )
     assert lr.status_code == 200
     assert lr.json()["access_token"]
+    # expires_in present on login
+    assert isinstance(lr.json()["expires_in"], int) and lr.json()["expires_in"] > 0
+    assert lr.json()["expires_in"] == settings.JWT_EXPIRATION_MINUTES * 60
 
 
 async def test_duplicate_email_rejected(client):
@@ -66,7 +75,12 @@ async def test_refresh_by_body(client):
 
     r = await client.post("/auth/refresh", json={"refresh_token": refresh})
     assert r.status_code == 200
-    assert r.json()["access_token"]
+    rbody = r.json()
+    assert rbody["access_token"]
+    assert rbody["message"] == "Token refreshed."
+    # expires_in present on refresh (OAuth 2.0 RFC 6749 §5.1)
+    assert isinstance(rbody["expires_in"], int) and rbody["expires_in"] > 0
+    assert rbody["expires_in"] == settings.JWT_EXPIRATION_MINUTES * 60
 
 
 async def test_logout_revokes_refresh(client):
@@ -349,10 +363,10 @@ async def test_locked_user_can_still_access_me(client):
             update(User).where(User.id == user_id).values(created_at=stale_created_at)
         )
 
-    # GET /auth/me is exempt → must return 200.
+    # GET /auth/me is exempt → must return 200. Response is envelope {user, expires_in}.
     me = await client.get("/auth/me", headers={"Authorization": f"Bearer {access}"})
     assert me.status_code == 200, me.text
-    assert me.json()["email"] == "locked_me@example.com"
+    assert me.json()["user"]["email"] == "locked_me@example.com"
 
 
 async def test_verify_email_preserves_session(client, db_session):
@@ -393,9 +407,10 @@ async def test_verify_email_preserves_session(client, db_session):
     assert user.token_version == 0
 
     # Original access token from register still authenticates /auth/me.
+    # Response is envelope {user, expires_in}.
     me = await client.get("/auth/me", headers={"Authorization": f"Bearer {original_access_token}"})
     assert me.status_code == 200
-    assert me.json()["verified_at"] is not None
+    assert me.json()["user"]["verified_at"] is not None
 
 
 async def test_register_succeeds_when_email_send_raises(client, monkeypatch):
@@ -420,3 +435,33 @@ async def test_register_succeeds_when_email_send_raises(client, monkeypatch):
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["user"]["email"] == "besteffort@example.com"
+
+
+async def test_me_expires_in_decreases_over_time(client):
+    """expires_in on /auth/me decreases between two sequential calls (time-decreasing TTL)."""
+    import asyncio
+
+    reg = await client.post(
+        "/auth/register",
+        json={"email": "ttl@example.com", "password": "verylongsecret"},
+    )
+    assert reg.status_code == 200
+    token = reg.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    me1 = await client.get("/auth/me", headers=headers)
+    assert me1.status_code == 200
+    ei1 = me1.json()["expires_in"]
+    assert isinstance(ei1, int) and ei1 > 0
+
+    # Wait 1 second so the exp-based TTL computation produces a smaller value.
+    await asyncio.sleep(1)
+
+    me2 = await client.get("/auth/me", headers=headers)
+    assert me2.status_code == 200
+    ei2 = me2.json()["expires_in"]
+    assert isinstance(ei2, int) and ei2 >= 0
+
+    # Second value must be ≤ first; allow 2-second slack for scheduling jitter.
+    assert ei2 <= ei1, f"expires_in should decrease: first={ei1}, second={ei2}"
+    assert ei1 - ei2 <= 2, f"Decrease larger than 2s slack: first={ei1}, second={ei2}"

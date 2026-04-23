@@ -89,6 +89,12 @@ Standard for-money-handling pattern — keeps the legitimate user in the loop an
 
 We do not build a self-service "reverse this change" link in v1 — if a user reports an unauthorized change, support handles reversal manually. v2 ergonomic upgrade: a signed reversal link with 7-day TTL in the old-email notification.
 
+## Proactive refresh
+
+All four auth endpoints that issue or validate an access token now include `expires_in: int` (seconds) in their response bodies — `/auth/register`, `/auth/login`, `/auth/refresh`, and `/auth/me`. For `GET /auth/me` the body is an envelope `{ user, expires_in }` rather than a flat `UserResponse`, separating session state (TTL) from user state (id/email/verified_at). The field name follows OAuth 2.0 RFC 6749 §5.1 exactly, making the convention recognisable to any adopter familiar with OAuth providers.
+
+The frontend `AuthProvider` runs a client-side scheduler: after each successful `/auth/me` or `/auth/refresh` response, a `setTimeout` fires at 80% of `expires_in` to call `POST /auth/refresh` proactively. On success, the timer self-reschedules using the new `expires_in` from the refresh response body. On any failure the scheduler stops — no false-logout, no reschedule. The next user action will 401 and fall through to the existing 0016.2 + 0016.3 + 0016.4 + 0016.5 chain, which handles cleanup and re-auth cleanly. The 80% threshold (20% buffer) matches the Auth0/Clerk industry default and absorbs network latency plus minor clock drift. The scheduler shares the `getRefreshPromise` dedup with the 401 interceptor, so a simultaneous proactive refresh and a 401 retry share one in-flight fetch. Tab backgrounding and device sleep may delay or skip the timer (OS constraint); the fallback chain handles those cases transparently.
+
 ## Rate limits
 
 Two layers: per-IP rate limiting (slowapi) and per-account login lockout.

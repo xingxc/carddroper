@@ -6,13 +6,15 @@
 
 ## Auth (`/auth`)
 
+Responses for register, login, refresh, and me include `expires_in: int` (seconds until access token expires), following OAuth 2.0 RFC 6749 §5.1. `/auth/me` returns an envelope `{user, expires_in}` rather than a flat user object.
+
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| POST | `/auth/register` | none | Create account, send verification email. |
-| POST | `/auth/login` | none | Exchange email+password for access + refresh tokens. |
+| POST | `/auth/register` | none | Create account, send verification email. Response: `{access_token, refresh_token, user, expires_in}`. |
+| POST | `/auth/login` | none | Exchange email+password for access + refresh tokens. Response: `{access_token, refresh_token, user, expires_in}`. |
 | POST | `/auth/logout` | refresh (cookie or body) | Revoke refresh token, clear cookies. |
-| POST | `/auth/refresh` | refresh (cookie or body) | Mint new access token. |
-| GET  | `/auth/me` | access | Return current user profile. |
+| POST | `/auth/refresh` | refresh (cookie or body) | Mint new access token. Response: `{message, access_token, expires_in}`. |
+| GET  | `/auth/me` | access | Return current user profile + token TTL. Response: `{user, expires_in}`. |
 | PUT  | `/auth/password` | access | Change password (revokes old tokens). |
 | POST | `/auth/forgot-password` | none | Send password reset email. |
 | GET  | `/auth/validate-reset-token` | none | Check reset token validity without consuming it. |

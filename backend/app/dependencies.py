@@ -59,6 +59,7 @@ def _authenticate(request: Request) -> tuple[Optional[str], Optional[dict]]:
     user_id = payload.get("sub")
     if not user_id:
         return None, None
+    request.state.access_token_exp = payload.get("exp")
     return user_id, payload
 
 

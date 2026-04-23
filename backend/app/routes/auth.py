@@ -16,6 +16,7 @@ Endpoints:
     POST /auth/confirm-email-change
 """
 
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -167,6 +168,18 @@ class AuthResponse(BaseModel):
     access_token: str
     refresh_token: str
     user: UserResponse
+    expires_in: int
+
+
+class RefreshResponse(BaseModel):
+    message: str
+    access_token: str
+    expires_in: int
+
+
+class MeResponse(BaseModel):
+    user: UserResponse
+    expires_in: int
 
 
 class MessageResponse(BaseModel):
@@ -268,10 +281,12 @@ async def register(
         logger.exception("verification_email_send_failed", extra={"user_id": user.id})
         # do NOT raise — registration succeeded; email is best-effort.
 
+    expires_in = settings.JWT_EXPIRATION_MINUTES * 60
     payload = AuthResponse(
         access_token=access_tok,
         refresh_token=raw_refresh,
         user=_user_response(user),
+        expires_in=expires_in,
     )
     response = JSONResponse(content=payload.model_dump(mode="json"))
     _set_auth_cookies(response, access_tok, raw_refresh)
@@ -308,10 +323,12 @@ async def login(
     access_tok = create_access_token(user.id, user.token_version)
     raw_refresh, _ = await create_refresh_token(user.id, db)
 
+    expires_in = settings.JWT_EXPIRATION_MINUTES * 60
     payload = AuthResponse(
         access_token=access_tok,
         refresh_token=raw_refresh,
         user=_user_response(user),
+        expires_in=expires_in,
     )
     response = JSONResponse(content=payload.model_dump(mode="json"))
     _set_auth_cookies(response, access_tok, raw_refresh)
@@ -343,7 +360,7 @@ async def logout(
 # ---------------------------------------------------------------------------
 
 
-@router.post("/refresh", response_model=MessageResponse)
+@router.post("/refresh", response_model=RefreshResponse)
 @limiter.limit(settings.REFRESH_RATE_LIMIT)
 async def refresh(
     request: Request,
@@ -364,7 +381,14 @@ async def refresh(
         raise unauthorized("User not found.")
 
     access_tok = create_access_token(user.id, user.token_version)
-    response = JSONResponse(content={"message": "Token refreshed.", "access_token": access_tok})
+    expires_in = settings.JWT_EXPIRATION_MINUTES * 60
+    response = JSONResponse(
+        content={
+            "message": "Token refreshed.",
+            "access_token": access_tok,
+            "expires_in": expires_in,
+        }
+    )
     _set_access_cookie(response, access_tok)
     return response
 
@@ -374,9 +398,11 @@ async def refresh(
 # ---------------------------------------------------------------------------
 
 
-@router.get("/me", response_model=UserResponse)
-async def me(user: User = Depends(get_current_user)) -> UserResponse:
-    return _user_response(user)
+@router.get("/me", response_model=MeResponse)
+async def me(request: Request, user: User = Depends(get_current_user)) -> MeResponse:
+    exp = getattr(request.state, "access_token_exp", None)
+    expires_in = max(0, int(exp) - int(time.time())) if exp is not None else 0
+    return MeResponse(user=_user_response(user), expires_in=expires_in)
 
 
 # ---------------------------------------------------------------------------

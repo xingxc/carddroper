@@ -53,24 +53,30 @@ export function markLoggedOut(): void {
 }
 
 // ---------------------------------------------------------------------------
-// Refresh deduplication — a single Promise<boolean> shared across all
-// concurrent 401 callers so we fire POST /auth/refresh exactly once.
+// Refresh deduplication — a single Promise<{ok,expiresIn?}> shared across all
+// concurrent 401 callers and the proactive scheduler so we fire
+// POST /auth/refresh exactly once per in-flight cycle.
 // ---------------------------------------------------------------------------
-let refreshPromise: Promise<boolean> | null = null;
+let refreshPromise: Promise<{ ok: boolean; expiresIn?: number }> | null = null;
 
-async function attemptRefresh(): Promise<boolean> {
+async function attemptRefresh(): Promise<{ ok: boolean; expiresIn?: number }> {
   try {
     const res = await fetch(`${API_BASE_URL}/auth/refresh`, {
       method: "POST",
       credentials: "include",
     });
-    return res.ok;
+    if (!res.ok) return { ok: false };
+    const body = (await res.json()) as { expires_in?: number };
+    return { ok: true, expiresIn: body.expires_in };
   } catch {
-    return false;
+    return { ok: false };
   }
 }
 
-function getRefreshPromise(): Promise<boolean> {
+export function getRefreshPromise(): Promise<{
+  ok: boolean;
+  expiresIn?: number;
+}> {
   if (!refreshPromise) {
     refreshPromise = attemptRefresh().finally(() => {
       refreshPromise = null;
@@ -171,9 +177,9 @@ export async function apiFetch<T>(
   // Silent-refresh interceptor -----------------------------------------------
   if (response.status === 401 && !isRefreshExempt(path)) {
     if (hasSession()) {
-      const refreshed = await getRefreshPromise();
+      const result = await getRefreshPromise();
 
-      if (refreshed) {
+      if (result.ok) {
         // Retry original request with the freshly-minted access_token cookie.
         let retryResponse: Response;
         try {

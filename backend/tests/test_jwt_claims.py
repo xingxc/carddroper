@@ -64,7 +64,9 @@ async def test_access_token_accepted_by_me(client):
         headers={"Authorization": f"Bearer {body['access_token']}"},
     )
     assert r.status_code == 200
-    assert r.json()["email"] == "jwt@example.com"
+    # /auth/me returns envelope {user, expires_in}
+    assert r.json()["user"]["email"] == "jwt@example.com"
+    assert isinstance(r.json()["expires_in"], int) and r.json()["expires_in"] > 0
 
 
 # ---------------------------------------------------------------------------
