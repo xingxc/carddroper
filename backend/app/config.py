@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Optional
+from typing import Literal, Optional
 from urllib.parse import urlparse
 
 from pydantic import SecretStr, field_validator, model_validator
@@ -128,6 +128,47 @@ class Settings(BaseSettings):
     # Stripe (optional in Phase 1)
     STRIPE_SECRET_KEY: Optional[str] = None
     STRIPE_WEBHOOK_SECRET: Optional[str] = None
+
+    # Billing chassis
+    BILLING_ENABLED: bool = False
+    BILLING_CURRENCY: Literal["usd"] = "usd"
+    BILLING_TOPUP_MIN_MICROS: int = 500_000
+    BILLING_TOPUP_MAX_MICROS: int = 500_000_000
+    STRIPE_TAX_ENABLED: bool = False
+    BILLING_SIGNUP_BONUS_MICROS: int = 0
+    BILLING_VERIFY_BONUS_MICROS: int = 0
+
+    @model_validator(mode="after")
+    def validate_stripe_secret_key(self) -> "Settings":
+        """Refuse to construct when BILLING_ENABLED=True but STRIPE_SECRET_KEY is unset.
+
+        Stripe API calls at signup and in webhook handlers will fail immediately
+        with an AuthenticationError if the key is missing. Failing loudly at
+        startup is cheaper than a silent 401 from Stripe mid-request.
+        """
+        if self.BILLING_ENABLED and not self.STRIPE_SECRET_KEY:
+            raise ValueError(
+                "Stripe misconfiguration: BILLING_ENABLED=True but STRIPE_SECRET_KEY is not set.\n"
+                "Set STRIPE_SECRET_KEY to a valid Stripe secret key (sk_live_... or sk_test_...).\n"
+                "Required because BILLING_ENABLED=True enables Stripe Customer creation at registration."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_stripe_webhook_secret(self) -> "Settings":
+        """Refuse to construct when BILLING_ENABLED=True but STRIPE_WEBHOOK_SECRET is unset.
+
+        The webhook endpoint verifies every inbound event with this secret.
+        Without it, stripe.Webhook.construct_event raises immediately on every
+        POST /billing/webhook, making the endpoint non-functional.
+        """
+        if self.BILLING_ENABLED and not self.STRIPE_WEBHOOK_SECRET:
+            raise ValueError(
+                "Stripe misconfiguration: BILLING_ENABLED=True but STRIPE_WEBHOOK_SECRET is not set.\n"
+                "Set STRIPE_WEBHOOK_SECRET to the webhook signing secret (whsec_...).\n"
+                "Required because BILLING_ENABLED=True mounts POST /billing/webhook."
+            )
+        return self
 
     # SendGrid / Email — leave API key empty to log to stdout in dev.
     SENDGRID_API_KEY: SecretStr = SecretStr("")

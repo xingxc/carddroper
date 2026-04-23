@@ -28,7 +28,7 @@ Responses for register, login, refresh, and me include `expires_in: int` (second
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| POST | `/billing/webhook` | Stripe signature | Receive Stripe webhook events. |
+| POST | `/billing/webhook` | Stripe signature (`stripe-signature` header) | Receive and process Stripe webhook events. Returns 200 on success (including idempotent replays of the same `event.id`). Returns 400 on invalid or missing signature. Idempotent: duplicate `event.id` requests return 200 without reprocessing. Only mounted when `BILLING_ENABLED=true`; returns 404 when disabled. |
 | POST | `/billing/portal-session` | access + verified | Create Stripe Customer Portal session. |
 | GET  | `/billing/pricing` | none | Return available subscription tiers. |
 

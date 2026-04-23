@@ -104,3 +104,8 @@ async def health_check():
 
 
 app.include_router(auth_router)
+
+if settings.BILLING_ENABLED:
+    from app.routes.billing import router as billing_router  # noqa: E402
+
+    app.include_router(billing_router)

@@ -179,3 +179,101 @@ class TestCookieDomainValidator:
         error_str = str(exc_info.value)
         assert "Cookie-domain misconfiguration" in error_str
         assert "FRONTEND_BASE_URL host=localhost" in error_str
+
+
+class TestStripeSecretValidator:
+    """Tests for Settings.validate_stripe_secret_key model validator (0021).
+
+    Must pass CORS_ORIGINS=FRONTEND_BASE_URL so the CORS validator doesn't trip first.
+    """
+
+    def test_happy_billing_disabled_no_key(self):
+        """BILLING_ENABLED=False (default) — validator skipped, constructs cleanly."""
+        s = __import__("app.config", fromlist=["Settings"]).Settings(
+            **_make(
+                FRONTEND_BASE_URL="http://localhost:3000",
+                CORS_ORIGINS="http://localhost:3000",
+                BILLING_ENABLED=False,
+                STRIPE_SECRET_KEY=None,
+            )
+        )
+        assert s.BILLING_ENABLED is False
+
+    def test_happy_billing_enabled_with_key(self):
+        """BILLING_ENABLED=True + both keys set — constructs cleanly."""
+        s = __import__("app.config", fromlist=["Settings"]).Settings(
+            **_make(
+                FRONTEND_BASE_URL="http://localhost:3000",
+                CORS_ORIGINS="http://localhost:3000",
+                BILLING_ENABLED=True,
+                STRIPE_SECRET_KEY="sk_test_abc123",
+                STRIPE_WEBHOOK_SECRET="whsec_abc123",
+            )
+        )
+        assert s.STRIPE_SECRET_KEY == "sk_test_abc123"
+
+    def test_failing_billing_enabled_no_key(self):
+        """BILLING_ENABLED=True but STRIPE_SECRET_KEY missing — must raise ValidationError."""
+        with pytest.raises(ValidationError) as exc_info:
+            __import__("app.config", fromlist=["Settings"]).Settings(
+                **_make(
+                    FRONTEND_BASE_URL="http://localhost:3000",
+                    CORS_ORIGINS="http://localhost:3000",
+                    BILLING_ENABLED=True,
+                    STRIPE_SECRET_KEY=None,
+                    STRIPE_WEBHOOK_SECRET="whsec_abc123",
+                )
+            )
+        error_str = str(exc_info.value)
+        assert "Stripe misconfiguration" in error_str
+        assert "STRIPE_SECRET_KEY" in error_str
+        assert "BILLING_ENABLED=True" in error_str
+
+
+class TestStripeWebhookSecretValidator:
+    """Tests for Settings.validate_stripe_webhook_secret model validator (0021).
+
+    Must pass CORS_ORIGINS=FRONTEND_BASE_URL so the CORS validator doesn't trip first.
+    """
+
+    def test_happy_billing_disabled_no_secret(self):
+        """BILLING_ENABLED=False — validator skipped, constructs cleanly."""
+        s = __import__("app.config", fromlist=["Settings"]).Settings(
+            **_make(
+                FRONTEND_BASE_URL="http://localhost:3000",
+                CORS_ORIGINS="http://localhost:3000",
+                BILLING_ENABLED=False,
+                STRIPE_WEBHOOK_SECRET=None,
+            )
+        )
+        assert s.BILLING_ENABLED is False
+
+    def test_happy_billing_enabled_with_secret(self):
+        """BILLING_ENABLED=True + both secrets set — constructs cleanly."""
+        s = __import__("app.config", fromlist=["Settings"]).Settings(
+            **_make(
+                FRONTEND_BASE_URL="http://localhost:3000",
+                CORS_ORIGINS="http://localhost:3000",
+                BILLING_ENABLED=True,
+                STRIPE_SECRET_KEY="sk_test_abc123",
+                STRIPE_WEBHOOK_SECRET="whsec_abc123",
+            )
+        )
+        assert s.STRIPE_WEBHOOK_SECRET == "whsec_abc123"
+
+    def test_failing_billing_enabled_no_secret(self):
+        """BILLING_ENABLED=True but STRIPE_WEBHOOK_SECRET missing — must raise ValidationError."""
+        with pytest.raises(ValidationError) as exc_info:
+            __import__("app.config", fromlist=["Settings"]).Settings(
+                **_make(
+                    FRONTEND_BASE_URL="http://localhost:3000",
+                    CORS_ORIGINS="http://localhost:3000",
+                    BILLING_ENABLED=True,
+                    STRIPE_SECRET_KEY="sk_test_abc123",
+                    STRIPE_WEBHOOK_SECRET=None,
+                )
+            )
+        error_str = str(exc_info.value)
+        assert "Stripe misconfiguration" in error_str
+        assert "STRIPE_WEBHOOK_SECRET" in error_str
+        assert "BILLING_ENABLED=True" in error_str

@@ -29,3 +29,9 @@ class User(Base):
     refresh_tokens: Mapped[List["RefreshToken"]] = relationship(  # noqa: F821
         "RefreshToken", back_populates="user", cascade="all, delete-orphan"
     )
+    subscription: Mapped[Optional["Subscription"]] = relationship(  # noqa: F821
+        "Subscription", back_populates="user", uselist=False
+    )
+    balance_ledger_entries: Mapped[List["BalanceLedger"]] = relationship(  # noqa: F821
+        "BalanceLedger", back_populates="user"
+    )

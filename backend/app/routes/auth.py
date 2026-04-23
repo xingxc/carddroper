@@ -49,6 +49,7 @@ from app.services.auth_service import (
     verify_password,
     verify_refresh_token,
 )
+from app import billing
 from app.services.email_service import EmailTemplate, send_email
 from app.services.hibp import validate_password
 from app.services.lockout_service import (
@@ -263,6 +264,23 @@ async def register(
         await db.flush()
     except IntegrityError:
         raise conflict("A user with this email already exists.")
+
+    if settings.BILLING_ENABLED:
+        try:
+            async with db.begin_nested():
+                customer_id = await billing.create_customer(user, db)
+                user.stripe_customer_id = customer_id
+                if settings.BILLING_SIGNUP_BONUS_MICROS > 0:
+                    await billing.grant(
+                        user_id=user.id,
+                        amount_micros=settings.BILLING_SIGNUP_BONUS_MICROS,
+                        reason=billing.Reason.SIGNUP_BONUS,
+                        db=db,
+                    )
+        except Exception:
+            logger.exception("billing_register_hook_failed", extra={"user_id": user.id})
+            # best-effort: register succeeds without Stripe linkage;
+            # future topup/subscribe lazy-creates the Customer.
 
     access_tok = create_access_token(user.id, user.token_version)
     raw_refresh, _ = await create_refresh_token(user.id, db)
@@ -543,6 +561,19 @@ async def verify_email(
         return {"message": "Email already verified."}
 
     user.verified_at = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    if settings.BILLING_ENABLED and settings.BILLING_VERIFY_BONUS_MICROS > 0:
+        try:
+            async with db.begin_nested():
+                await billing.grant(
+                    user_id=user.id,
+                    amount_micros=settings.BILLING_VERIFY_BONUS_MICROS,
+                    reason=billing.Reason.VERIFY_BONUS,
+                    db=db,
+                )
+        except Exception:
+            logger.exception("billing_verify_hook_failed", extra={"user_id": user.id})
+
     return {"message": "Email verified."}
 
 
