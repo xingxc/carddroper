@@ -23,7 +23,6 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr
 from slowapi import Limiter
-from slowapi.util import get_remote_address
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -60,7 +59,27 @@ from app.services.lockout_service import (
 
 logger = get_logger(__name__)
 
-limiter = Limiter(key_func=get_remote_address)
+
+def get_client_ip(request: Request) -> str:
+    """Return the real client IP.
+
+    On Cloud Run, ``request.client.host`` is Google Frontend's IP, not the
+    end-user's — Google sets ``X-Forwarded-For`` with the real client IP and
+    we trust it because Cloud Run ingress is locked (a malicious client
+    cannot spoof the header because GFE overwrites client-supplied values).
+
+    Locally or in tests, XFF is absent and we fall back to
+    ``request.client.host`` (or ``"unknown"`` if even that is missing —
+    edge case with non-HTTP ASGI scopes).
+    """
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        # First entry is the original client; subsequent entries are proxies.
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+limiter = Limiter(key_func=get_client_ip)
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
@@ -271,7 +290,7 @@ async def login(
     body: LoginRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    ip = get_remote_address(request)
+    ip = get_client_ip(request)
 
     if await is_locked_out(body.email, db):
         raise too_many_requests("Too many login attempts. Try again later.")
