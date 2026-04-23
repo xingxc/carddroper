@@ -1,7 +1,7 @@
 ---
 id: 0015
 title: email verification flow — frontend foundations + register/login/verify pages
-status: open
+status: resolved
 priority: high
 found_by: PLAN.md §10.5 remainder; pre-0015 frontend audit 2026-04-21
 ---
@@ -205,4 +205,31 @@ Phase 2 (user):
 
 ## Resolution
 
-*(filled in by orchestrator on close)*
+Closed 2026-04-22. Golden-path walkthrough green on staging end-to-end.
+
+**What shipped:**
+- **Phase 0 chassis** (commit `ffac324`): three route groups `(marketing)/(auth)/(app)`, `frontend/proxy.ts` cookie-presence auth gate (Next.js 16 rename of `middleware.ts`), `useAuth` + `AuthProvider`, typed `api.get/post/...` wrappers, 401 silent-refresh with `HAS_SESSION_KEY` anonymous gate, `config/brand.ts`, `scripts/smoke_chassis.sh` (17-assertion end-to-end smoke).
+- **Phase 1 pages** (commit `c26498f`): `/register` (RHF+Zod, 409/422/network handling), `/login` (anti-enumeration on 401, rate-limit on 429), `/verify-email-sent` (useAuth-gated Resend), `/verify-email?token=` (useSearchParams wrapped in Suspense, useRef guard for React 19 strict-mode double-mount). Helpers extracted at `components/forms/`: FormField, FormError, SubmitButton.
+- **Staging smoke** (commit `b1bad78`): `backend/scripts/smoke_verify_email.py` covering register + `/auth/me` + resend-verification + logout at API level. Verify-token click is manual-only (no public token-mint).
+
+**Follow-ups that landed inside this epic:**
+- `0015.5` — CORS chassis guard + first `chassis-contract.md` entry (the Option C coupling rule established here).
+- `0015.6` — cross-subdomain cookie chassis invariant (`COOKIE_DOMAIN`) + Resend-button auth guard. Unblocked the staging browser flow.
+- `0015.7` — verify-email clears dead cookies. **Superseded by 0015.8** after user feedback: the underlying spec (force re-login on verify) was an industry-minority position with marginal security gain and real UX friction.
+- `0015.8` — verify-email is a capability toggle. Dropped `token_version` bump + `revoke_all_user_tokens` from the verify-email endpoint; frontend success panel redirects to `/app` instead of `/login`. Matches the session-preserving convention of GitHub/Linear/Notion/Stripe/Canva.
+
+**Staging validation (2026-04-22):**
+- All four smokes green: `smoke_healthz`, `smoke_auth --expected-cookie-domain=.staging.carddroper.com`, `smoke_verify_email`, `smoke_cors`.
+- Manual browser walkthrough — all steps pass: register → `/verify-email-sent`, real SendGrid delivery, click verify link → success panel → Continue → `/app` still logged in with `verified_at` set. Logout → proxy re-gates `/app`. Authed user on `/login` or `/register` redirects to `/app`. Re-click stale verify link → idempotent 200. Invalid token → error panel, no mutation.
+
+**Deferred, tracked elsewhere:**
+- Email deliverability (walkthrough step 1.3 observed email landed in spam) → future ops-tier ticket for SendGrid Sender Authentication + SPF/DKIM/DMARC on Cloudflare DNS. User-owned.
+- `0016` forgot/reset password pages.
+- `0017` change-email flow.
+- `0018` chassis-hardening audit (JWT_SECRET strength, SENDGRID-required-when-sandbox-off, etc.).
+- Legal acceptance checkbox + `/legal/terms` + `/legal/privacy` → own ticket before first Stripe charge.
+
+**Lessons captured in chassis:**
+- `chassis-contract.md` pattern + CLAUDE.md coupling rule (established 0015.5; extended 0015.6).
+- `scripts/smoke_chassis.sh` env-var-parameterized for reuse across future chassis-based projects.
+- Option C doc-coupling policy: every Settings validator lands its contract entry in the same commit.
