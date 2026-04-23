@@ -1,7 +1,7 @@
 ---
 id: 0021
 title: Stripe foundation (chassis) — balance ledger, billing primitives, webhook skeleton
-status: open
+status: resolved
 priority: medium (unblocks 0022 topup + 0023 subscribe; zero user-facing behavior change on its own)
 found_by: PLAN.md §10.6 Stripe layer; scoped per 2026-04-23 chassis reframe in `doc/systems/payments.md`
 ---
@@ -290,4 +290,18 @@ Orchestrator (on close):
 
 ## Resolution
 
-*(filled in by orchestrator after user confirms Phase 1 base + Phase 2 staging pass; stretch verification is optional but captured if run)*
+Landed on dev (2026-04-23; ticket `ad7b5bc`, audit fixes `049bf8c`, impl `5b92f0f`); merged to main; pushed; Cloud Build redeployed to staging cleanly.
+
+**Phase 0a (backend):** 89 pytest green (66 pre-existing + 23 new), ruff clean, alembic cycle clean. 21 files changed, 1327 insertions. All chassis primitives land with the prescribed shape: `with_for_update()` lock on debit, idempotency_key on Stripe Customer creation, savepoint-wrapped register/verify hooks, webhook signature verification + `stripe_events`-backed replay idempotency, two new `chassis-contract.md` invariants for `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET` when `BILLING_ENABLED=true`.
+
+**Phase 1 base (local):** migration applied, register/verify flows unchanged with `BILLING_ENABLED=false` default, `users.stripe_customer_id` stays NULL. Zero-behavior-change default confirmed.
+
+**Phase 1 stretch (local):** `BILLING_ENABLED=true` + Stripe test-mode keys + `stripe listen` forwarder. Registration fired `customer.created` webhook → `users.stripe_customer_id` populated → Customer visible in Stripe test dashboard. `stripe trigger payment_intent.succeeded` generated the full PaymentIntent lifecycle (4 events: `payment_intent.created`, `charge.succeeded`, `payment_intent.succeeded`, `charge.updated`) — all signed, dispatched to the stub handler, logged as "Unhandled Stripe event type: …", and recorded in `stripe_events`. Replay via `stripe events resend <evt_id>` → second POST returned 200 but `stripe_events` row count stayed at 1 (primary-key idempotency working).
+
+**Phase 2 (staging):**
+- Cloud Build `migrate` step clean; `alembic_version` advanced from `ee2ded47d8da` to `84b050bfae31`.
+- Smoke battery: `smoke_healthz` ✓, `smoke_cors` ✓. `smoke_auth` + `smoke_verify_email` initially failed with `/auth/me email mismatch: expected '...', got ''` — **pre-existing gap from ticket 0016.6 (envelope shape change)** where the smoke scripts were never updated to read `me_body["user"]["email"]`. Fixed in commit `59b0b04` (also added `expires_in` positive-int assertion as a future-regression guard). After the fix, all 4 smokes pass.
+
+**Zero-behavior-change at deploy:** `BILLING_ENABLED=false` default means staging and prod inherit the chassis without any billing surface exposed. Flipping the flag + provisioning Stripe Secret Manager values will be part of the first ticket that needs live billing (0022 PAYG topup).
+
+**Chassis implications:** payments is now the third chassis subsystem after auth + email. Two new `chassis-contract.md` invariants added. Billing primitives (`create_customer`, `get_balance_micros`, `grant`, `debit`, `format_balance`) ready for project-layer integration; future projects adopting this chassis flip `BILLING_ENABLED=true` + configure Stripe Product metadata (`lookup_key`, `metadata.grant_micros`, `metadata.tier_name`) in their Dashboard to gain complete billing infrastructure.

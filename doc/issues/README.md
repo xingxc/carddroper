@@ -70,4 +70,4 @@ The Verification section exists because "tsc passes" and "lint passes" are neces
 | 0018 | chassis-hardening audit — find missing validators, grow chassis-contract.md | open | medium |
 | 0019 | email deliverability — SendGrid Sender Authentication + SPF / DKIM / DMARC | open | high |
 | 0020 | legal acceptance — ToS checkbox on /register + /legal/terms + /legal/privacy static pages | open | high |
-| 0021 | Stripe foundation (chassis) — balance ledger, billing primitives, webhook skeleton | open | medium |
+| 0021 | Stripe foundation (chassis) — balance ledger, billing primitives, webhook skeleton | resolved | medium |

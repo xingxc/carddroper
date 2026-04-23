@@ -20,6 +20,17 @@ Cross-ref: [environments.md](environments.md) defines the three environments the
 
 Corollary: the moment you catch a class of bug only in staging, you've identified a gap in the local suite. Backport a local test before resolving the ticket.
 
+### Breaking-change audit checklist
+
+A chassis API-shape change (response envelope, error-code split, endpoint rename, etc.) has **four** consumer layers, each of which can silently lag behind. When drafting a breaking-change ticket, the orchestrator audit must tick every box before dispatch:
+
+1. **Local unit tests** (`backend/tests/` + frontend suite when it exists) — every assertion that reads the old shape migrated to the new shape.
+2. **Frontend / client consumers** — every component, hook, and API-client parse site migrated; TypeScript types updated; `useQuery<T>` generics tightened.
+3. **Staging smoke scripts** (`backend/scripts/smoke_*.py`) — every script that hits the changed endpoint re-checked. Easy to miss because smokes only run on deploy, not on PR; a missed migration manifests as a staging failure weeks after the breaking change.
+4. **Documentation** — `doc/systems/*.md`, `doc/reference/backend-api.md`, chassis-contract entries if applicable. Adopter-facing docs must describe the new shape, not the old.
+
+Origin: 0021 Phase 2 smoke battery on 2026-04-23 failed on `smoke_auth` + `smoke_verify_email` because ticket 0016.6's envelope change (`/auth/me` → `{user, expires_in}`) updated layers 1, 2, and 4 but missed layer 3. Retroactive fix landed in commit `59b0b04`. Future chassis-shape tickets must audit all four layers explicitly in their Acceptance section.
+
 ---
 
 ## Local tier
