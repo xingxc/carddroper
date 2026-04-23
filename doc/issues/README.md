@@ -53,4 +53,21 @@ The Verification section exists because "tsc passes" and "lint passes" are neces
 | 0013 | testing methodology doc + coverage audit + backfill | resolved | high |
 | 0014 | pre-0015 cleanup — backend + frontend hygiene batch from audit 2026-04-21 | resolved | medium |
 | 0014.5 | pre-0015 micro-cleanup — viewport, tsconfig strict, cloudbuild sleep, dockerfile-copy doc | resolved | medium |
-| 0015 | email verification flow — register, login, verify-email pages + auth foundations | open | high |
+| 0015 | email verification flow — register, login, verify-email pages + auth foundations | resolved | high |
+| 0015.5 | staging CORS unblock + chassis boot-time guard + chassis contract doc | resolved | high |
+| 0015.6 | cross-subdomain cookie domain chassis invariant + verify-email-sent Resend guard | resolved | high |
+| 0015.7 | verify-email clears dead cookies (reverted — wrong direction) | superseded by 0015.8 | high |
+| 0015.8 | verify-email is a capability toggle, not a session reset — supersedes 0015.7 | resolved | high |
+| 0016 | forgot-password + reset-password pages + /login link + reset ghost-session fix | resolved | high |
+| 0016.1 | rate-limiter keys on Cloud Run GFE IP, not client IP — X-Forwarded-For resolution | resolved | high |
+| 0016.2 | (app)/ auto-redirect to /login on cross-device stale-cookie ghost state | resolved | medium |
+| 0016.3 | 401 interceptor calls /auth/logout to clear stale cookies — escapes proxy loop | resolved | high |
+| 0016.4 | /login auto-redirects to /app on silent-refresh re-auth — proxy-symmetric redirect pair | resolved | medium |
+| 0016.5 | chassis blurry LoadingScreen — unify pre-decision loading states | resolved | medium |
+| 0016.6 | proactive access-token refresh — OAuth 2.0 expires_in + 80%-TTL scheduler | resolved | medium |
+| 0016.7 | drop redundant logout client-state reset — hard-reload supersedes in-tree cache invalidation | resolved | low |
+| 0016.8 | distinct 401 error codes — stop wasted /auth/logout cleanup POSTs on anonymous + post-logout loads | resolved | medium |
+| 0018 | chassis-hardening audit — find missing validators, grow chassis-contract.md | open | medium |
+| 0019 | email deliverability — SendGrid Sender Authentication + SPF / DKIM / DMARC | open | high |
+| 0020 | legal acceptance — ToS checkbox on /register + /legal/terms + /legal/privacy static pages | open | high |
+| 0021 | Stripe foundation (chassis) — balance ledger, billing primitives, webhook skeleton | open | medium |

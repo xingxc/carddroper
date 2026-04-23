@@ -1,7 +1,7 @@
 ---
 id: 0016
 title: forgot-password + reset-password pages + /login "Forgot password?" link + reset ghost-session fix
-status: open
+status: resolved
 priority: high
 found_by: 0015 Phase 1 deferrals (forgot-password link + pages); 0016 pre-draft audit (reset-password ghost-session class matches pre-0015.7 verify-email bug)
 ---
