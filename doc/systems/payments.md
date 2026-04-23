@@ -1,52 +1,87 @@
-# Payments
+# Payments (chassis subsystem)
 
-## Model
+> Chassis-level design for Stripe-integrated balance and subscription payments.
+> Agnostic to any specific product. Project layers configure tiers, display
+> copy, and what actions debit the balance. This is the third chassis
+> subsystem after auth and email.
 
-**Usage-based (pay-as-you-go, PAYG) is the default. Subscriptions are optional.** Signup is free; nobody is asked for a card until they choose to pay.
+## Chassis boundary
 
-This is a fundamental departure from foodapp, where registration required a payment method and a subscription. Carddroper decouples account from payment.
+| Layer | Owns | Example |
+|---|---|---|
+| **Chassis** | Stripe Customer lifecycle, append-only balance ledger, topup + subscribe endpoints, webhook handling (idempotency + signature verification), Customer Portal integration, balance query, grant/debit primitives, display-format policy | `POST /billing/topup`, `POST /billing/subscribe`, `billing.debit(user, 400, ref_type='send', ref_id='123')` |
+| **Project** | What actions exist, what each costs in micros, display copy for those actions, tier count and prices in Stripe Dashboard, pricing-page content, free-form vs preset topup UI, optional bonus amounts | A project's `send()` handler calls `billing.debit(user, 400, 'send', send_id)` — a $0.0004 per-recipient cost |
 
-## User states
+The chassis has **zero knowledge** of what the project sells. Future projects
+inherit this subsystem and wire their own actions on top of the debit primitive.
 
-| State | Can log in | Can read account pages | Can buy credits / subscribe | Can "send" (paid action) |
-|---|---|---|---|---|
-| Registered, unverified | ✓ | ✓ | ✗ | ✗ |
-| Verified, no credits, no sub | ✓ | ✓ | ✓ | ✗ (unless free tier exists later) |
-| Verified, with credits | ✓ | ✓ | ✓ | ✓ (deducts credits) |
-| Verified, with active subscription | ✓ | ✓ | ✓ | ✓ (uses quota; overage deducts credits) |
+## Denomination — gift-card model (Model B)
+
+Users see a USD balance and spend USD. No abstract "credits." Gift-card mental
+model (Starbucks app, Amazon gift card): load money, see balance, spend down.
+
+### Precision: micro-dollars (bigint)
+
+**1 USD = 1,000,000 micros.** Ledger stores `BIGINT amount_micros`.
+
+Rationale:
+- **Sub-cent action costs representable.** Email at $0.0004 = 400 micros.
+  Cent-precision can't express this without rounding-based bias.
+- **Industry-standard.** AWS, GCP, Twilio, SendGrid all bill internally in
+  micro-units. Integration at the boundary is natural.
+- **Integer arithmetic.** Fast, exact, no float-rounding bugs.
+- **Stripe conversion is trivial.** Stripe API uses cents: `cents = micros / 10_000`,
+  `micros = cents * 10_000`. Conversion happens at the API boundary only.
+- **Headroom.** BIGINT fits ~9.2 trillion USD per row.
+
+### Display policy
+
+Chassis exposes `billing.format_balance(micros) -> str`:
+- `>= $0.01`: rounded to 2 decimals → `"$1.23"`
+- `0 < micros < $0.01`: 4 decimals → `"$0.0034"` (so users don't see "$0.00" when they have sub-cent balance)
+- `= 0`: `"$0.00"`
+
+Default covers US/EN. Projects override via a config hook for localized display.
+
+### Balance invariants
+
+- Balance = `SUM(balance_ledger.amount_micros) WHERE user_id = ?`.
+- Balance floor is **zero** — the `debit` primitive raises `InsufficientBalanceError` rather than letting balance go negative. Debits and checks happen inside the caller's DB transaction so a concurrent debit can't underflow.
+- `refund` and `adjustment` ledger entries can be any sign; they're admin-initiated. They still cannot drive live balance below zero (a refund is typically the inverse of a prior topup).
+
+### Currency
+
+USD-only in v1. `BILLING_CURRENCY=usd` is the only supported value. Multi-currency
+is a future chassis extension (add `currency` column to ledger + subscriptions;
+require per-user currency selection) — not in v1 scope.
 
 ## Stripe resources
 
-- **Customer** — created at signup for every user, stored as `users.stripe_customer_id`. No charges, no payment methods yet.
-- **PaymentMethod** — attached when the user first tops up credits or starts a subscription.
-- **PaymentIntent** — one-shot charges for PAYG credit purchases.
-- **Product + Price** — one or more Stripe Products representing subscription tiers (e.g. "Starter — 100 sends/mo", "Pro — 1000 sends/mo"). Kept simple in v1 — exact tiers TBD.
-- **Subscription** — optional, one per user, recurring monthly.
+- **Customer** — created on `POST /auth/register` (when billing is enabled), stored as `users.stripe_customer_id`. No payment method, no charges until the user acts.
+- **PaymentMethod** — attached on first topup or subscribe.
+- **PaymentIntent** — one-shot charge for topups.
+- **Product + Price** — subscription tiers. Chassis reads `Price.lookup_key` + `Price.metadata.grant_micros` + `Price.metadata.tier_name` to know what each tier grants on each period. Projects define tiers in Stripe Dashboard, not in chassis code.
+- **Subscription** — optional, one per user, recurring.
 
-## UX split (matches foodapp's pattern)
+## UX split
 
 | Action | Surface | Where the user is |
 |---|---|---|
-| Initial PAYG top-up | Embedded **Stripe Elements** (`<PaymentElement>` or `<CardElement>`) | carddroper.com |
-| Initial subscription signup | Embedded **Stripe Elements** | carddroper.com |
+| First topup | Embedded **Stripe Elements** | project origin |
+| First subscribe | Embedded **Stripe Elements** | project origin |
 | Update payment method | **Stripe Customer Portal** (redirect) | billing.stripe.com |
-| Cancel subscription | **Stripe Customer Portal** (redirect) | billing.stripe.com |
-| View / download invoices | **Stripe Customer Portal** (redirect) | billing.stripe.com |
-| Change billing details | **Stripe Customer Portal** (redirect) | billing.stripe.com |
+| Cancel subscription | **Stripe Customer Portal** | billing.stripe.com |
+| View / download invoices | **Stripe Customer Portal** | billing.stripe.com |
+| Change billing details | **Stripe Customer Portal** | billing.stripe.com |
 
-**Why the split.** Entering a card is conversion-critical; redirecting hurts conversion, so we use Elements (card data goes browser → Stripe; our server only sees the `PaymentMethod` ID). Managing billing is rare back-office work; the Portal saves us maintaining screens that Stripe updates for free (Apple Pay, 3DS, new tax rules). If we later want a custom cancellation / retention flow, we build only that single page in-app and keep the Portal for everything else.
+Card data never touches the project server — Elements collects directly to
+Stripe, returning a `PaymentMethod` ID. PCI scope stays **SAQ A**.
 
-Card data never touches our server on either path. PCI scope stays **SAQ A** (the narrowest questionnaire).
+Subscription cancellation is always **cancel-at-period-end** (Stripe default,
+Portal-managed). User retains access through `current_period_end`; chassis
+does not build custom cancellation UI.
 
-**Cloudflare caveat:** when proxy mode is enabled, ensure the Portal's `return_url` (`https://carddroper.com/billing/return`) isn't behind a WAF challenge — Stripe's 302 redirect must complete cleanly.
-
-## Currency
-
-All `credit_ledger.amount` values are **integer USD cents**. No floats, no currency column.
-
-Carddroper is **USD-only** in v1. International users pay in USD; their issuing bank handles FX. Stripe PaymentIntents always use `currency: 'usd'`. Revisit multi-currency only if international signups are a material share of traffic.
-
-## Local data model
+## Data model (chassis schema)
 
 ```sql
 subscriptions (
@@ -54,122 +89,323 @@ subscriptions (
     user_id                 INT NOT NULL REFERENCES users(id) UNIQUE,
     stripe_subscription_id  VARCHAR(64) UNIQUE NOT NULL,
     stripe_price_id         VARCHAR(64) NOT NULL,
-    tier_key                VARCHAR(32),           -- e.g. "starter" / "pro"; mirrors Stripe lookup_key
-    status                  VARCHAR(32) NOT NULL,  -- trialing/active/past_due/cancelled
-    included_quota          INT NOT NULL,          -- sends included per period
+    tier_key                VARCHAR(64) NOT NULL,   -- mirrors Stripe Price lookup_key
+    status                  VARCHAR(32) NOT NULL,   -- trialing | active | past_due | cancelled | incomplete
+    grant_micros            BIGINT NOT NULL,        -- per-period balance grant, mirrored from Price metadata at subscribe time
     current_period_start    TIMESTAMP,
     current_period_end      TIMESTAMP,
+    cancel_at_period_end    BOOLEAN NOT NULL DEFAULT false,
     created_at              TIMESTAMP DEFAULT now(),
     updated_at              TIMESTAMP DEFAULT now()
 );
 
--- Append-only ledger. Current credit balance = SUM(amount) WHERE user_id = ?.
-credit_ledger (
+-- Append-only. Current balance = SUM(amount_micros) WHERE user_id = ?.
+balance_ledger (
     id               BIGSERIAL PRIMARY KEY,
     user_id          INT NOT NULL REFERENCES users(id),
-    amount           INT NOT NULL,      -- positive = grant, negative = debit
-    reason           VARCHAR(32) NOT NULL, -- 'purchase' | 'send' | 'subscription_quota' | 'subscription_period_reset' | 'refund' | 'adjustment'
-    stripe_event_id  VARCHAR(64) NULL,  -- for idempotency of webhook-driven grants
-    ref_type         VARCHAR(32) NULL,  -- e.g. 'send_id', for linking debits to specific actions
-    ref_id           VARCHAR(64) NULL,
+    amount_micros    BIGINT NOT NULL,         -- positive grant, negative debit
+    reason           VARCHAR(32) NOT NULL,    -- chassis-closed vocabulary (below)
+    stripe_event_id  VARCHAR(64) NULL,        -- idempotency key for webhook-driven grants
+    ref_type         VARCHAR(32) NULL,        -- project-layer debit identifier ('send', 'api_call', etc.)
+    ref_id           VARCHAR(64) NULL,        -- project-layer action ID
     created_at       TIMESTAMP DEFAULT now()
 );
-CREATE INDEX ON credit_ledger(user_id, created_at);
-CREATE UNIQUE INDEX ON credit_ledger(stripe_event_id) WHERE stripe_event_id IS NOT NULL;
+CREATE INDEX ON balance_ledger(user_id, created_at);
+CREATE UNIQUE INDEX ON balance_ledger(stripe_event_id) WHERE stripe_event_id IS NOT NULL;
 
--- Track processed Stripe webhook events for idempotency.
+-- Webhook idempotency. Every processed event.id is recorded here.
 stripe_events (
-    id               VARCHAR(64) PRIMARY KEY,  -- Stripe event.id
-    event_type       VARCHAR(64) NOT NULL,
-    processed_at     TIMESTAMP NOT NULL DEFAULT now()
+    id            VARCHAR(64) PRIMARY KEY,     -- Stripe event.id
+    event_type    VARCHAR(64) NOT NULL,
+    processed_at  TIMESTAMP NOT NULL DEFAULT now()
 );
 ```
 
-Exact schema lands in Alembic; this is documentation.
+### Reason vocabulary (chassis-closed)
+
+`balance_ledger.reason` is a closed set. Project layers **do not** add reason
+values; project-specific debits are identified by `ref_type` + `ref_id`, not
+by reason.
+
+| Reason | Sign | Triggered by |
+|---|---|---|
+| `topup` | + | `payment_intent.succeeded` for a user-initiated purchase |
+| `subscription_grant` | + | `customer.subscription.created` (initial period grant) |
+| `subscription_reset` | ± | `invoice.paid` for subscription renewal (zero remaining prior-period grant + grant new period) |
+| `signup_bonus` | + | User registration (opt-in, off by default) |
+| `verify_bonus` | + | Email verification (opt-in, off by default) |
+| `debit` | − | Project-layer action via `billing.debit()` |
+| `refund` | − | Admin-issued refund (typically inverts a prior topup) |
+| `adjustment` | ± | Admin manual correction (audit trail) |
+
+## Subscription tier contract
+
+Projects define tiers in Stripe Dashboard. The chassis reads the Price
+metadata to learn what each tier grants. **Required per Price:**
+
+- `lookup_key` (Stripe top-level field, e.g., `"starter_monthly"`) — stable identifier the chassis cross-references.
+- `metadata.grant_micros` (string of int, e.g., `"5000000"`) — balance granted per billing period.
+- `metadata.tier_name` (e.g., `"Starter"`) — display name.
+
+Chassis does not hardcode tier count, prices, or grant amounts. A one-tier or
+ten-tier structure works identically. Adding/removing/renaming/repricing tiers
+is a Stripe Dashboard action, not a chassis migration.
+
+**Monthly-only in v1.** The schema supports any interval (Stripe drives
+`current_period_start`/`end` from the Price's `recurring.interval`), but the
+chassis hasn't been exercised against annual/weekly intervals. Chassis code is
+interval-agnostic; validation happens via Stripe. Annual billing is a future
+extension that likely requires no chassis changes — just a new Stripe Price.
 
 ## Flows
 
-### 1. Signup — create Stripe Customer
+### 1. Signup — create Customer
 
-`POST /auth/register` →
-1. Create `users` row.
-2. Create Stripe Customer (email, metadata `user_id`, no payment method).
-3. Store `stripe_customer_id` on the user.
-4. Send verification email.
+Already owned by auth chassis (`POST /auth/register`). When `BILLING_ENABLED=true`:
 
-No card, no charges.
+1. Register handler creates `users` row.
+2. Calls `billing.create_customer(user)` → Stripe Customer created with `email` + `metadata.user_id`.
+3. Stores `stripe_customer_id` on the user.
+4. If `BILLING_SIGNUP_BONUS_MICROS > 0`, grants bonus via ledger (reason `signup_bonus`).
+5. Sends verification email.
 
-### 2. PAYG credit purchase
+When `BILLING_ENABLED=false`, the register handler skips all Stripe calls.
+Enabling billing later requires a backfill job (create Customers for existing users).
 
-`POST /credits/purchase { amount_usd }` →
+### 2. Topup (PAYG purchase)
+
+`POST /billing/topup { amount_micros }` →
+
 1. Require verified user.
-2. Create a Stripe PaymentIntent for `amount_usd * 100` cents on the user's Customer.
-3. Insert a *pending* `credit_ledger` row with `amount=0`, `reason='purchase'`, `stripe_event_id=NULL` (we'll write the real row on webhook).
-4. Return `client_secret` to the frontend.
+2. Reject if `amount_micros` outside `[BILLING_TOPUP_MIN_MICROS, BILLING_TOPUP_MAX_MICROS]`.
+3. Create Stripe PaymentIntent for `amount_micros / 10_000` cents on the user's Customer.
+4. Return `{client_secret}` to frontend.
 
-Frontend confirms the intent with Stripe Elements. Stripe fires `payment_intent.succeeded`. Webhook handler:
-1. Look up `stripe_events` by event id — return 200 if already processed (idempotency).
-2. Write `credit_ledger` row: `amount = credits_purchased`, `reason='purchase'`, `stripe_event_id=event.id`.
+Frontend confirms via Stripe Elements. Stripe fires `payment_intent.succeeded`.
+Webhook handler:
+
+1. Check `stripe_events` by `event.id` — return 200 if already processed.
+2. Write `balance_ledger`: `+amount_micros`, `reason='topup'`, `stripe_event_id=event.id`.
 3. Record event in `stripe_events`.
 
-Credits are available immediately.
+Balance is live immediately after webhook. Frontend polls `GET /billing/balance`
+or invalidates React Query on Stripe confirmation to refresh display.
 
-### 3. Spending credits (a "send")
+**Preset + free-form UX.** Chassis endpoint accepts any `amount_micros` in the
+configured range. Project UI can render preset buttons (`$5`, `$20`, `$50`), a
+free-form input, or both side-by-side. Preset amounts are a project-layer
+config, not a chassis field.
 
-Inside a DB transaction:
-1. Check `SUM(amount)` from `credit_ledger` where `user_id`.
-2. If balance < cost, fail.
-3. Insert `credit_ledger` row with `amount = -cost`, `reason='send'`, `ref_type='send_id'`, `ref_id=<...>`.
+### 3. Debit (project-layer action)
 
-Atomic, auditable, explains every change in balance.
+Project code calls the chassis primitive directly, inside the project's own DB transaction:
 
-### 4. Subscription sign-up (optional)
+```python
+await billing.debit(
+    user_id=user.id,
+    amount_micros=400,          # $0.0004
+    ref_type="send",             # project-specific
+    ref_id=str(send.id),
+    db=db,
+)
+```
 
-`POST /subscriptions { price_id, payment_method_id }` →
+Implementation:
+1. `SELECT COALESCE(SUM(amount_micros), 0) FROM balance_ledger WHERE user_id=?` (within txn).
+2. If `balance < amount_micros`, raise `InsufficientBalanceError`.
+3. Insert `balance_ledger`: `-amount_micros`, `reason='debit'`, `ref_type`, `ref_id`.
+
+The chassis never initiates debits itself. All debits are driven by
+project-layer actions calling this primitive.
+
+### 4. Subscribe
+
+`POST /billing/subscribe { price_lookup_key, payment_method_id }` →
+
 1. Require verified user.
-2. Attach payment method to the customer, set as default.
-3. Create Stripe Subscription.
-4. Upsert local `subscriptions` row.
-5. Insert `credit_ledger` row granting `included_quota` credits with `reason='subscription_quota'` and `stripe_event_id` set to the subscription creation event.
+2. Attach `payment_method_id` to the Customer, set as default.
+3. Resolve Stripe Price from `lookup_key`. Read `metadata.grant_micros` + `metadata.tier_name`.
+4. Create Stripe Subscription with `automatic_tax.enabled=STRIPE_TAX_ENABLED`.
+5. Upsert `subscriptions` row (keyed on `user_id`; one active subscription per user in v1).
+6. Grant `subscription_grant`: `+grant_micros` ledger entry with `stripe_event_id` from `customer.subscription.created`.
 
-Each billing period, webhook `invoice.paid` triggers a `subscription_period_reset` ledger entry that zeroes any remaining subscription-granted credits and grants the new period's `included_quota`. (We keep PAYG credits separate by using `reason='purchase'` vs `reason='subscription_quota'` — see "overage" below.)
-
-### 5. Overage handling
-
-When a user with an active subscription runs out of their included quota:
-- If they have PAYG credits, debits continue from the PAYG balance.
-- If they have no PAYG credits, the `send` action fails with a clear "out of credits, top up or wait for period reset" error.
-
-We intentionally do *not* auto-charge for overages in v1. Users explicitly top up — zero billing surprises.
-
-### 6. Subscription lifecycle (webhooks)
+### 5. Subscription lifecycle (webhooks)
 
 | Event | Action |
 |---|---|
-| `customer.subscription.created` | Upsert `subscriptions`. Grant `included_quota` credits. |
-| `customer.subscription.updated` | Update status, period bounds, tier. |
-| `customer.subscription.deleted` | Mark `status='cancelled'`. Do not revoke already-granted credits. |
-| `invoice.paid` | If subscription invoice, reset period and grant new `included_quota`. |
-| `invoice.payment_failed` | Mark subscription `past_due`. Send notification email. |
-| `payment_intent.succeeded` | PAYG: grant credits in ledger. |
+| `customer.subscription.created` | Upsert subscription row. Grant `subscription_grant`. |
+| `customer.subscription.updated` | Update `status`, `current_period_end`, `cancel_at_period_end`, `tier_key`, `grant_micros` (re-read from Price metadata). |
+| `customer.subscription.deleted` | Mark `status='cancelled'`. Do NOT revoke already-granted balance. |
+| `invoice.paid` | If subscription renewal, post `subscription_reset` entries: zero remaining prior-period subscription grant, grant new period's `grant_micros`. |
+| `invoice.payment_failed` | Mark subscription `past_due`. Balance stays spendable. |
+| `payment_intent.succeeded` | Topup: grant `topup`. |
+| `charge.refunded` | Record `refund` ledger entry (negative). |
 
-All handlers check `stripe_events` first for idempotency.
+All handlers:
+1. Verify Stripe webhook signature (fail if invalid).
+2. Check `stripe_events` for idempotency (return 200 early if already processed).
+3. Perform the side effect.
+4. Insert `stripe_events` row.
 
-## Customer Portal
+### 6. Past-due behavior
 
-For managing payment methods, invoices, and cancelling subscriptions: `POST /billing/portal-session` returns a Stripe Customer Portal URL. We don't build our own billing UI in v1.
+On `invoice.payment_failed`:
+- `subscriptions.status = 'past_due'`.
+- Balance remains **fully spendable** — prior topups and prior subscription
+  grants are money the user already has. They can continue to debit until
+  balance hits zero.
+- No new subscription grants fire until Stripe's dunning resolves (`invoice.paid`)
+  or the subscription is cancelled (`subscription.deleted`).
+- Project UI can render a past-due banner + "update card" CTA linking to the
+  Customer Portal.
+
+### 7. Cancellation
+
+User cancels via Customer Portal. Stripe fires `customer.subscription.updated`
+with `cancel_at_period_end=true`; chassis records the flag. User retains
+subscription benefits through `current_period_end`. At period end, Stripe fires
+`customer.subscription.deleted`; chassis marks `status='cancelled'`.
+
+Already-granted balance is **never revoked** on cancellation. If the user had
+$3 left from this period's subscription grant plus a $20 prior topup, they
+keep both.
+
+## Chassis-exposed primitives
+
+Python package `app.billing` (chassis module). Project layers import and call:
+
+```python
+async def create_customer(user: User, db: AsyncSession) -> str:
+    """Create Stripe Customer. Returns stripe_customer_id. Called by auth chassis at register."""
+
+async def get_balance_micros(user_id: int, db: AsyncSession) -> int:
+    """Current balance. Sums balance_ledger. Returns int (never negative)."""
+
+async def grant(
+    user_id: int,
+    amount_micros: int,
+    reason: GrantReason,
+    db: AsyncSession,
+    *,
+    stripe_event_id: str | None = None,
+) -> None:
+    """Positive ledger entry. `reason` must be a GrantReason enum value."""
+
+async def debit(
+    user_id: int,
+    amount_micros: int,
+    ref_type: str,
+    ref_id: str,
+    db: AsyncSession,
+) -> None:
+    """Negative ledger entry. Raises InsufficientBalanceError if balance insufficient.
+    Must be called inside the caller's active DB transaction."""
+
+def format_balance(micros: int) -> str:
+    """Chassis display policy: '$1.23' or '$0.0034'."""
+```
+
+Projects **never write to `balance_ledger` directly** — always go through these
+primitives so the chassis owns the invariants (non-negative balance, reason
+vocabulary, idempotency).
+
+## Chassis-exposed HTTP endpoints
+
+- `GET /billing/balance` — returns `{balance_micros: int, formatted: str}`. Authed.
+- `POST /billing/topup` — returns Stripe `client_secret`. Verified user only.
+- `POST /billing/subscribe` — creates subscription. Verified user only.
+- `POST /billing/portal-session` — returns Stripe Customer Portal URL. Authed.
+- `POST /billing/webhook` — Stripe webhook handler. Signature-verified; no auth dep.
+
+## Optional lifecycle bonuses
+
+Chassis supports one-time promotional balance grants on auth lifecycle events.
+Both default **OFF**:
+
+- `BILLING_SIGNUP_BONUS_MICROS` — granted on successful `POST /auth/register`, reason `signup_bonus`.
+- `BILLING_VERIFY_BONUS_MICROS` — granted on successful `POST /auth/verify-email`, reason `verify_bonus`.
+
+When enabled, the auth chassis calls `billing.grant(...)` conditionally. Projects
+decide the amount; chassis provides the hook. Disabling at any later time leaves
+past grants intact (ledger is append-only).
+
+**Legal note:** promotional grants are generally not subject to the gift-card
+laws that regulate purchased credits. Projects should confirm with counsel
+before enabling.
+
+## Tax
+
+**Stripe Tax is a drop-in.** When `STRIPE_TAX_ENABLED=true`, chassis passes
+`automatic_tax: {enabled: true}` to all PaymentIntent and Subscription creations.
+Stripe computes sales tax / VAT at checkout, displays it to the user, and
+handles remittance per jurisdiction.
+
+Chassis code is ~1 line per endpoint. Adopter responsibilities (out of chassis
+scope):
+- Register Stripe Tax in the Stripe Dashboard.
+- Assign tax codes to Stripe Products.
+- Monitor US state nexus thresholds.
+
+Approximately $0.50/invoice as of 2026-04.
+
+## Refunds
+
+Chassis exposes:
+
+```python
+async def refund(
+    topup_ledger_entry_id: int,
+    admin_user_id: int,
+    reason_note: str,
+    db: AsyncSession,
+) -> None:
+    """Inverts a prior topup. Issues Stripe refund + writes negative ledger entry (reason='refund')."""
+```
+
+No user-facing self-service refund endpoint. Projects define their own refund
+policy (posted in ToS / FAQ) and back it with calls to this primitive via
+admin tooling. Default project posture should be "no self-service refunds"
+unless operational needs say otherwise.
+
+## Config
+
+Existing (auth chassis already has these optional):
+- `STRIPE_SECRET_KEY` — required when `BILLING_ENABLED=true`.
+- `STRIPE_WEBHOOK_SECRET` — required when the webhook endpoint is mounted.
+
+New (add when the billing chassis lands):
+- `BILLING_ENABLED` (bool, default `false`) — master switch. When false, no billing endpoints mount, no Stripe Customer creation at signup.
+- `BILLING_CURRENCY` (default `"usd"`) — USD-only supported in v1.
+- `BILLING_TOPUP_MIN_MICROS` (default `500_000` = $0.50) — minimum topup.
+- `BILLING_TOPUP_MAX_MICROS` (default `500_000_000` = $500) — maximum single topup.
+- `STRIPE_TAX_ENABLED` (bool, default `false`).
+- `BILLING_SIGNUP_BONUS_MICROS` (int, default `0`).
+- `BILLING_VERIFY_BONUS_MICROS` (int, default `0`).
+
+When `BILLING_ENABLED=true`, pydantic validators must enforce that
+`STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET` are non-empty. This becomes a
+`chassis-contract.md` entry when the billing layer lands.
 
 ## Why this design
 
-- **Free signup** removes the friction foodapp has; users can explore carddroper and verify email before any money question.
-- **Credit ledger is append-only.** Every balance change is traceable. Bugs don't corrupt balance — they leave a visible entry.
-- **Idempotent webhook handling** is non-negotiable because Stripe retries. `stripe_events` + unique index on `credit_ledger.stripe_event_id` makes double-processing impossible.
-- **PAYG separate from subscription quota** lets us grow more pricing models later (roll-over, tier upgrades, gift credits) without schema changes.
-- **No metered Stripe billing in v1.** We can revisit when we see real usage patterns; for now the ledger-in-our-DB model is simpler, cheaper, and user-visible.
+- **Chassis agnosticism.** No verbs or nouns from any specific product. Next
+  project using this chassis gets a complete billing subsystem; they only
+  configure tier metadata in Stripe and wire `billing.debit()` into their
+  actions.
+- **USD balance transparency.** Users see real USD, not abstract credits.
+  Matches the gift-card mental model (load money, watch balance decrease).
+- **Micro-precision.** Sub-cent action costs are first-class. Integer math
+  throughout; no float-rounding bugs; standard industry practice.
+- **Append-only ledger.** Every balance change is auditable. Bugs leave
+  visible entries rather than corrupting state silently.
+- **Idempotent webhooks.** Stripe retries are safe by construction via
+  `stripe_events` + unique index on `balance_ledger.stripe_event_id`.
+- **Tier structure in Stripe, not code.** Repricing, renaming, adding tiers
+  is a Dashboard action. Chassis reads metadata at subscribe time.
+- **Project owns vocabulary and UX.** Chassis provides primitives; project
+  decides what actions cost, what to name them, and how to render balance.
 
-## Open design questions
+## Open questions (chassis-level)
 
-- **Credit denomination value.** Shape is locked: 1 credit = 1 send, priced in round USD cents. The specific cents number depends on SendGrid's per-email cost + our margin — finalize once the SendGrid account is live and we know per-email cost.
-- **Subscription grace period** on payment failure — Stripe's default 3-week dunning flow is probably fine; confirm during implementation.
-- **Refund path** for PAYG credits — refund via Stripe + negative ledger entry, or disable refunds and handle case-by-case?
-- **Tax** — Stripe Tax ($0.50/invoice, handles US sales tax + VAT) from day one, or stay tax-exempt until we cross a US state nexus?
+None currently. Project-level decisions (tier count, preset topup amounts,
+bonus amounts, action pricing) are configuration — not chassis design work.
