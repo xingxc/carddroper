@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation";
 import { useAuth } from "@/context/auth";
 import { LogoutButton } from "@/components/auth/LogoutButton";
 import { brand } from "@/config/brand";
+import { LoadingScreen } from "@/components/loading/LoadingScreen";
 
 function AppHeader() {
   const { user } = useAuth();
@@ -37,6 +38,9 @@ export default function AppLayout({ children }: { children: ReactNode }) {
       router.replace("/login");
     }
   }, [isLoading, isAuthenticated, router]);
+
+  // Pre-decision: show blurry screen until auth resolves or redirect fires.
+  if (isLoading || !isAuthenticated) return <LoadingScreen />;
 
   return (
     <>

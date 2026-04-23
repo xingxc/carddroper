@@ -14,6 +14,7 @@ import { brand } from "@/config/brand";
 import { FormField } from "@/components/forms/FormField";
 import { FormError } from "@/components/forms/FormError";
 import { SubmitButton } from "@/components/forms/SubmitButton";
+import { LoadingScreen } from "@/components/loading/LoadingScreen";
 
 const schema = z.object({
   email: z.string().email("Please enter a valid email address."),
@@ -53,6 +54,9 @@ export function LoginBody() {
   } = useForm<FormValues>({
     resolver: zodResolver(schema),
   });
+
+  // Pre-decision: show blurry screen while auth resolves or redirect is firing.
+  if (isLoading || isAuthenticated) return <LoadingScreen />;
 
   async function onSubmit(values: FormValues) {
     setFormError(null);
