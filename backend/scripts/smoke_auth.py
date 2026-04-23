@@ -119,10 +119,14 @@ def main() -> None:
         if resp.status_code != 200:
             _fail(f"/auth/me returned {resp.status_code}: {resp.text[:200]}")
 
+        # /auth/me returns envelope {user, expires_in} per ticket 0016.6 (OAuth 2.0 shape).
         me_body = resp.json()
-        returned_email = me_body.get("email", "")
+        user_obj = me_body.get("user") or {}
+        returned_email = user_obj.get("email", "")
         if returned_email.lower() != email.lower():
             _fail(f"/auth/me email mismatch: expected {email!r}, got {returned_email!r}")
+        if not isinstance(me_body.get("expires_in"), int) or me_body["expires_in"] <= 0:
+            _fail(f"/auth/me envelope missing/invalid expires_in: got {me_body.get('expires_in')!r}")
 
         # ------------------------------------------------------------------
         # 4. POST /auth/refresh

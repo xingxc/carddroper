@@ -169,8 +169,10 @@ def main() -> None:
             if resp.status_code != 200:
                 _fail("/auth/me status", f"expected 200, got {resp.status_code}: {resp.text[:200]}")
             else:
+                # /auth/me returns envelope {user, expires_in} per ticket 0016.6 (OAuth 2.0 shape).
                 me_body = resp.json()
-                returned_email = me_body.get("email", "")
+                user_obj = me_body.get("user") or {}
+                returned_email = user_obj.get("email", "")
                 if returned_email.lower() != email.lower():
                     _fail(
                         "/auth/me email",
@@ -179,7 +181,16 @@ def main() -> None:
                 else:
                     _pass(f"/auth/me returned 200, email={returned_email!r}")
 
-                me_verified = me_body.get("verified_at")
+                expires_in = me_body.get("expires_in")
+                if not isinstance(expires_in, int) or expires_in <= 0:
+                    _fail(
+                        "/auth/me envelope",
+                        f"expected expires_in: positive int, got {expires_in!r}",
+                    )
+                else:
+                    _pass(f"/auth/me returned expires_in={expires_in}s")
+
+                me_verified = user_obj.get("verified_at")
                 if me_verified is not None:
                     _fail(
                         "/auth/me verified_at",
