@@ -48,32 +48,33 @@ All major shape decisions are already in `payments.md`. What's pre-committed for
 Before starting, read `doc/systems/payments.md` end-to-end. Every chassis contract (data model, reason vocabulary, primitive signatures, config knobs, webhook idempotency rule) is spelled out there. This ticket implements that doc.
 
 **1. Dependency (`backend/pyproject.toml`):**
-- Add `stripe` to the `[project.dependencies]` list. Pin to a recent minor (e.g., `stripe>=11.0,<12.0` — verify the current stable major at implementation time). Regenerate any lockfile if one exists.
+- `stripe==11.4.1` is **already** in `[project.dependencies]`. Verify it imports cleanly at `stripe.Customer`, `stripe.PaymentIntent`, `stripe.Webhook`, `stripe.Subscription` — no changes needed unless the version is broken. Do NOT upgrade unless there's a concrete reason.
 
 **2. Config (`backend/app/config.py`):**
 - Add new fields:
   - `BILLING_ENABLED: bool = False`
-  - `BILLING_CURRENCY: str = "usd"`
-  - `BILLING_TOPUP_MIN_MICROS: int = 500_000`  (= $0.50; Stripe's minimum charge)
-  - `BILLING_TOPUP_MAX_MICROS: int = 500_000_000`  (= $500; arbitrary chassis-generic upper bound for fraud reduction)
+  - `BILLING_CURRENCY: Literal["usd"] = "usd"` — tighten via `typing.Literal` so non-USD values fail at Settings construction. Multi-currency is a future chassis extension.
+  - `BILLING_TOPUP_MIN_MICROS: int = 500_000`  (= $0.50; Stripe's minimum chargeable amount)
+  - `BILLING_TOPUP_MAX_MICROS: int = 500_000_000`  (= $500; chassis-generic upper bound for fraud reduction)
   - `STRIPE_TAX_ENABLED: bool = False`
-  - `BILLING_SIGNUP_BONUS_MICROS: int = 0`  (off by default; projects opt in)
+  - `BILLING_SIGNUP_BONUS_MICROS: int = 0`  (off by default; projects opt in at deploy time)
   - `BILLING_VERIFY_BONUS_MICROS: int = 0`  (off by default)
-- `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET` are already declared as `Optional[str] = None`. Keep the declarations; add validators (below) instead of making them required unconditionally.
-- Add two new `@model_validator(mode="after")` methods, following the shape of `validate_cors_origins` and `validate_cookie_domain`:
-  - `validate_stripe_secret_key` — if `BILLING_ENABLED=True` and `STRIPE_SECRET_KEY` is empty/None, raise `ValueError` with a clear remediation message.
-  - `validate_stripe_webhook_secret` — same shape for `STRIPE_WEBHOOK_SECRET`.
-  - Error message template should match the CORS/cookie-domain error messages: quote the offending setting value, tell the adopter what to set, and why.
+- `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET` are **already declared** as `Optional[str] = None` at `config.py:129-130`. Keep them Optional; add validators (below) so they're required only when `BILLING_ENABLED=true`.
+- Add two new `@model_validator(mode="after")` methods, matching the shape of the existing `validate_cors_origins` and `validate_cookie_domain`:
+  - `validate_stripe_secret_key` — if `BILLING_ENABLED=True` and `STRIPE_SECRET_KEY` is empty/None, raise `ValueError` with remediation message.
+  - `validate_stripe_webhook_secret` — same for `STRIPE_WEBHOOK_SECRET`.
+  - Error-message style: quote the offending setting value, name exactly what to set, explain why (mirror CORS/cookie-domain messages — see `test_settings_validator.py` for the assertion shape).
 
 **3. `backend/.env.example`:**
-- Add documented commented-out examples for each new var. Keep `BILLING_ENABLED=false` as the documented default so adopters see the master switch exists.
+- `STRIPE_SECRET_KEY=` and `STRIPE_WEBHOOK_SECRET=` are **already present** at lines 55-56. Leave them.
+- Add a new billing block: `BILLING_ENABLED=false`, `BILLING_CURRENCY=usd`, `BILLING_TOPUP_MIN_MICROS=500000`, `BILLING_TOPUP_MAX_MICROS=500000000`, `STRIPE_TAX_ENABLED=false`, `BILLING_SIGNUP_BONUS_MICROS=0`, `BILLING_VERIFY_BONUS_MICROS=0`. Group them together with a header comment `# Billing (chassis — optional)`.
 
 **4. Alembic migration (`backend/alembic/versions/<timestamp>_0021_billing_foundation.py`):**
+- `down_revision = "ee2ded47d8da"` (only existing migration — verified at audit time 2026-04-23).
 - Add nullable `stripe_customer_id VARCHAR(64)` column to `users` table.
-- Create `subscriptions`, `balance_ledger`, `stripe_events` tables — exact schema in `payments.md` §Data model. Match the column types, nullability, defaults, and unique/plain indexes exactly.
-- Alembic down-revision is the most recent existing migration.
-- `downgrade()` drops in reverse order. Tables are empty if billing was never enabled; non-null `users.stripe_customer_id` rows are dropped along with the column, but that data loss is acceptable for chassis rollback (prod would have a backfill script to restore).
-- Migration must apply cleanly on an empty DB and on the current-main DB snapshot. Verify both.
+- Create `subscriptions`, `balance_ledger`, `stripe_events` tables — exact schema in `payments.md` §Data model. Match column types, nullability, defaults, and unique/plain indexes exactly. Partial unique index on `balance_ledger(stripe_event_id) WHERE stripe_event_id IS NOT NULL` is critical — it's the webhook idempotency guarantee.
+- `downgrade()` drops in reverse order. Tables are empty if billing was never enabled; non-null `users.stripe_customer_id` values are lost on rollback, acceptable for chassis (prod ops would reconcile via Stripe Dashboard).
+- Verify migration cycle: `alembic upgrade head && alembic downgrade -1 && alembic upgrade head` on an empty DB and on the current-main snapshot.
 
 **5. Models (`backend/app/models/`):**
 - Add `stripe_customer_id: Mapped[Optional[str]]` to the existing `User` model.
@@ -85,7 +86,17 @@ Before starting, read `doc/systems/payments.md` end-to-end. Every chassis contra
 - `exceptions.py` — `InsufficientBalanceError` (subclass of `Exception`; never `AppError` — the chassis primitive raises a typed exception, the HTTP layer translates if needed).
 - `reason.py` — single `Reason` enum with all chassis-closed values: `TOPUP`, `SUBSCRIPTION_GRANT`, `SUBSCRIPTION_RESET`, `SIGNUP_BONUS`, `VERIFY_BONUS`, `DEBIT`, `REFUND`, `ADJUSTMENT`. Enum values are lowercase strings matching `payments.md` reason vocabulary.
 - `format.py` — `format_balance(micros: int) -> str` per the display policy in `payments.md` §Display policy. Pure function; no I/O.
-- `primitives.py` — the async functions (`create_customer`, `get_balance_micros`, `grant`, `debit`). All take `db: AsyncSession`. `grant` and `debit` use `db.execute()` / `db.add()`; they do NOT commit — the caller's transaction does. `debit` does the sum-then-insert inside a single `SELECT ... FOR UPDATE` pattern or equivalent that tolerates concurrent debits without underflow. (Implementation choice between row-lock on the user + sum, or a pessimistic lock on a balance summary row — backend-builder picks the safer/simpler approach and documents which.)
+- `primitives.py` — the async functions (`create_customer`, `get_balance_micros`, `grant`, `debit`). All take `db: AsyncSession`. `grant` and `debit` use `db.execute()` / `db.add()`; they do NOT commit — the caller's transaction does.
+- **`debit` concurrency safety — prescribed pattern:** inside the caller's transaction, acquire a row-level lock on the user before reading the balance, then insert the negative ledger entry:
+  ```python
+  await db.execute(select(User.id).where(User.id == user_id).with_for_update())
+  balance = await _sum_ledger(user_id, db)
+  if balance < amount_micros:
+      raise InsufficientBalanceError(...)
+  db.add(BalanceLedger(user_id=user_id, amount_micros=-amount_micros, reason=Reason.DEBIT.value, ref_type=ref_type, ref_id=ref_id))
+  ```
+  Rationale: serializes concurrent debits per user without requiring a denormalized balance column. Two debits arriving at the same moment block each other at the `SELECT ... FOR UPDATE`; the second one sees the first's ledger row and fails cleanly with `InsufficientBalanceError` if the balance is now too low. O(n) balance read per debit is acceptable at expected scale (hundreds of ledger entries per user); future denormalization is a separate optimization ticket if it becomes hot.
+- `create_customer` uses Stripe idempotency key `f"register:{user.id}"` so a retried registration doesn't create duplicate Stripe Customers: `stripe.Customer.create(..., idempotency_key=f"register:{user.id}")`.
 - `stripe_client.py` — small module that wraps the `stripe` SDK initialization (`stripe.api_key = settings.STRIPE_SECRET_KEY` lazy-init). Keeps the SDK integration surface narrow for monkey-patching in tests.
 
 **7. Webhook route (`backend/app/routes/billing.py`):**
@@ -100,38 +111,40 @@ Before starting, read `doc/systems/payments.md` end-to-end. Every chassis contra
 - **Endpoint is mounted conditionally.** In `backend/app/main.py`, only include the billing router when `settings.BILLING_ENABLED`. When disabled, the route returns 404 (Cloud Run behavior — unmounted route is invisible, not a maintained-but-disabled state).
 
 **8. Auth integration (`backend/app/routes/auth.py`):**
-- In `register`, after `db.flush()` succeeds and before access-token issuance:
+- **Register hook** — slot right after `await db.flush()` at line 263 (where IntegrityError on duplicate email is handled), before the `create_verify_token` call at line 270. Wrap in a SQL **SAVEPOINT** (`async with db.begin_nested()`) so a billing failure rolls back only the billing changes without poisoning the outer txn:
   ```python
   if settings.BILLING_ENABLED:
       try:
-          customer_id = await billing.create_customer(user)
-          user.stripe_customer_id = customer_id
-          if settings.BILLING_SIGNUP_BONUS_MICROS > 0:
-              await billing.grant(
-                  user_id=user.id,
-                  amount_micros=settings.BILLING_SIGNUP_BONUS_MICROS,
-                  reason=billing.Reason.SIGNUP_BONUS,
-                  db=db,
-              )
+          async with db.begin_nested():
+              customer_id = await billing.create_customer(user)
+              user.stripe_customer_id = customer_id
+              if settings.BILLING_SIGNUP_BONUS_MICROS > 0:
+                  await billing.grant(
+                      user_id=user.id,
+                      amount_micros=settings.BILLING_SIGNUP_BONUS_MICROS,
+                      reason=billing.Reason.SIGNUP_BONUS,
+                      db=db,
+                  )
       except Exception:
           logger.exception("billing_register_hook_failed", extra={"user_id": user.id})
-          # best-effort: register succeeds without Stripe linkage; a later topup/subscribe lazy-creates
+          # best-effort: register succeeds without Stripe linkage; future topup/subscribe lazy-creates the Customer.
   ```
-- In `verify_email`, after `user.verified_at = now` and before returning:
+- **Verify-email hook** — slot right after `user.verified_at = datetime.now(...)` at line 545, before the return. Same savepoint pattern:
   ```python
   if settings.BILLING_ENABLED and settings.BILLING_VERIFY_BONUS_MICROS > 0:
       try:
-          await billing.grant(
-              user_id=user.id,
-              amount_micros=settings.BILLING_VERIFY_BONUS_MICROS,
-              reason=billing.Reason.VERIFY_BONUS,
-              db=db,
-          )
+          async with db.begin_nested():
+              await billing.grant(
+                  user_id=user.id,
+                  amount_micros=settings.BILLING_VERIFY_BONUS_MICROS,
+                  reason=billing.Reason.VERIFY_BONUS,
+                  db=db,
+              )
       except Exception:
           logger.exception("billing_verify_hook_failed", extra={"user_id": user.id})
   ```
-- Both integrations log-and-continue on failure; they never break the auth flow. Billing issues on a Stripe outage should not block registration or email verification.
-- When `BILLING_ENABLED=False` (default), both paths are no-ops and no Stripe SDK imports execute at register time.
+- Both integrations log-and-continue on failure; they never break the auth flow. A Stripe outage cannot block registration or email verification.
+- When `BILLING_ENABLED=False` (default), both conditionals short-circuit and the `billing` module's Stripe-touching paths are never invoked. Import the module at the top of the file unconditionally (it's lightweight; lazy-import would complicate typing without real benefit).
 
 **9. Chassis-contract update (`doc/operations/chassis-contract.md`):**
 - Add two new `## Invariant:` sections, following the existing two entries' structure (required? / purpose / error message / enforcement location / how to satisfy):
@@ -141,7 +154,15 @@ Before starting, read `doc/systems/payments.md` end-to-end. Every chassis contra
 **10. Backend API reference (`doc/reference/backend-api.md`):**
 - Add the Billing section (already listed in the file but as a Stripe-placeholder). Document `POST /billing/webhook`: Stripe signature auth, 200 on success, 400 on invalid signature, idempotent.
 
-**11. Tests (`backend/tests/test_billing_foundation.py`):**
+**11. Tests — two files:**
+
+**`backend/tests/test_settings_validator.py`** (extend existing): add two new test classes matching the existing `TestCorsOriginsValidator` / `TestCookieDomainValidator` pattern (kwargs-based Settings construction, ValidationError assertion):
+- `TestStripeSecretValidator` — covers the `validate_stripe_secret_key` branches.
+- `TestStripeWebhookSecretValidator` — covers `validate_stripe_webhook_secret`.
+
+Map the Settings-level assertions from the list below into these classes. The remaining (non-Settings) tests go in the new file below.
+
+**`backend/tests/test_billing_foundation.py`** (new file):
 - **Balance / ledger primitives:**
   - `test_get_balance_zero_for_new_user` — fresh user → `get_balance_micros` returns 0.
   - `test_grant_increases_balance` — grant 1_000_000 → balance 1_000_000.
