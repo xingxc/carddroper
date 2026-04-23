@@ -1,7 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import type { ReactNode } from "react";
+import { useEffect, type ReactNode } from "react";
+import { useRouter } from "next/navigation";
 import { useAuth } from "@/context/auth";
 import { LogoutButton } from "@/components/auth/LogoutButton";
 import { brand } from "@/config/brand";
@@ -28,6 +29,15 @@ function AppHeader() {
 }
 
 export default function AppLayout({ children }: { children: ReactNode }) {
+  const router = useRouter();
+  const { isLoading, isAuthenticated } = useAuth();
+
+  useEffect(() => {
+    if (!isLoading && !isAuthenticated) {
+      router.replace("/login");
+    }
+  }, [isLoading, isAuthenticated, router]);
+
   return (
     <>
       <AppHeader />
