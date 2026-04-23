@@ -80,6 +80,31 @@ function getRefreshPromise(): Promise<boolean> {
 }
 
 // ---------------------------------------------------------------------------
+// Logout cookie cleanup deduplication — a single Promise<void> shared across
+// all concurrent callers so we fire POST /auth/logout exactly once per ghost
+// session cycle. Direct fetch() (not apiFetch) to bypass the interceptor.
+// ---------------------------------------------------------------------------
+let logoutCleanupPromise: Promise<void> | null = null;
+
+async function attemptLogoutCleanup(): Promise<void> {
+  if (!logoutCleanupPromise) {
+    logoutCleanupPromise = (async () => {
+      try {
+        await fetch(`${API_BASE_URL}/auth/logout`, {
+          method: "POST",
+          credentials: "include",
+        });
+      } catch {
+        // Best-effort — if logout fails, fall through to the 401 throw.
+      }
+    })().finally(() => {
+      logoutCleanupPromise = null;
+    });
+  }
+  return logoutCleanupPromise;
+}
+
+// ---------------------------------------------------------------------------
 // Paths that must never trigger a silent-refresh attempt on 401.
 // /auth/resend-verification is intentionally NOT on this list — it requires
 // an auth cookie, so a 401 there should trigger refresh.
@@ -144,52 +169,56 @@ export async function apiFetch<T>(
   }
 
   // Silent-refresh interceptor -----------------------------------------------
-  if (
-    response.status === 401 &&
-    !isRefreshExempt(path) &&
-    hasSession()
-  ) {
-    const refreshed = await getRefreshPromise();
+  if (response.status === 401 && !isRefreshExempt(path)) {
+    if (hasSession()) {
+      const refreshed = await getRefreshPromise();
 
-    if (refreshed) {
-      // Retry original request with the freshly-minted access_token cookie.
-      let retryResponse: Response;
-      try {
-        retryResponse = await fetch(url, {
-          ...init,
-          headers,
-          credentials: "include",
-        });
-      } catch (err) {
-        if (err instanceof TypeError) {
-          throw new ApiError(
-            0,
-            "NETWORK_ERROR",
-            "Network error — check your connection."
-          );
-        }
-        throw err;
-      }
-
-      if (!retryResponse.ok) {
-        let code = "UNKNOWN";
-        let message = retryResponse.statusText;
+      if (refreshed) {
+        // Retry original request with the freshly-minted access_token cookie.
+        let retryResponse: Response;
         try {
-          const body = (await retryResponse.json()) as ApiErrorBody;
-          code = body.error.code;
-          message = body.error.message;
-        } catch {
-          // non-JSON body — keep defaults
+          retryResponse = await fetch(url, {
+            ...init,
+            headers,
+            credentials: "include",
+          });
+        } catch (err) {
+          if (err instanceof TypeError) {
+            throw new ApiError(
+              0,
+              "NETWORK_ERROR",
+              "Network error — check your connection."
+            );
+          }
+          throw err;
         }
-        throw new ApiError(retryResponse.status, code, message);
+
+        if (!retryResponse.ok) {
+          let code = "UNKNOWN";
+          let message = retryResponse.statusText;
+          try {
+            const body = (await retryResponse.json()) as ApiErrorBody;
+            code = body.error.code;
+            message = body.error.message;
+          } catch {
+            // non-JSON body — keep defaults
+          }
+          throw new ApiError(retryResponse.status, code, message);
+        }
+
+        if (retryResponse.status === 204) return undefined as T;
+        return retryResponse.json() as Promise<T>;
       }
 
-      if (retryResponse.status === 204) return undefined as T;
-      return retryResponse.json() as Promise<T>;
+      // Refresh failed — clear the session signal.
+      markLoggedOut();
     }
-
-    // Refresh failed — clear the session signal so future requests don't retry.
-    markLoggedOut();
+    // Refresh failed OR we had no session signal to refresh against. In
+    // both cases server has already rejected these cookies; ask it to
+    // clear them client-side so the proxy stops bouncing /login → /app
+    // on ghost state. Awaited so cookies are gone before the throw below,
+    // letting (app)/layout's auto-redirect land on /login cleanly.
+    await attemptLogoutCleanup();
     // Fall through to throw the original 401 below.
   }
 
