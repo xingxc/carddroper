@@ -79,7 +79,7 @@ async def test_wrong_audience_returns_401(client):
     r = await client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
     assert r.status_code == 401
     err = r.json()["error"]
-    assert err["code"] == "UNAUTHORIZED"
+    assert err["code"] == "INVALID_TOKEN"
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +92,7 @@ async def test_wrong_issuer_returns_401(client):
     r = await client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
     assert r.status_code == 401
     err = r.json()["error"]
-    assert err["code"] == "UNAUTHORIZED"
+    assert err["code"] == "INVALID_TOKEN"
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +112,7 @@ async def test_missing_aud_returns_401(client):
     r = await client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
     assert r.status_code == 401
     err = r.json()["error"]
-    assert err["code"] == "UNAUTHORIZED"
+    assert err["code"] == "INVALID_TOKEN"
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +131,7 @@ async def test_missing_iss_returns_401(client):
     r = await client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
     assert r.status_code == 401
     err = r.json()["error"]
-    assert err["code"] == "UNAUTHORIZED"
+    assert err["code"] == "INVALID_TOKEN"
 
 
 # ---------------------------------------------------------------------------

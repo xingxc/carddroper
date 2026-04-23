@@ -182,3 +182,27 @@ Exact schema is defined in the first Alembic migration; this block is documentat
 - Cookies: Secure + HttpOnly + SameSite=Lax. CSRF is mitigated by SameSite for state-changing endpoints; we can add a double-submit token later if the threat model expands.
 - Verification email tokens are short-lived (24h) and single-use (gated by `verified_at`).
 - Reset tokens are single-use (gated by `token_version`) and 15-minute TTL.
+
+## API error codes
+
+Auth-chain 401 responses use three distinct error codes so clients can
+react appropriately without second-guessing the cookie state:
+
+- **`AUTHENTICATION_REQUIRED`** — no auth credentials were sent. The client
+  should treat this as "not logged in" and prompt login without attempting
+  any cookie cleanup (there's nothing to clean).
+- **`INVALID_TOKEN`** — an access token was sent but rejected (bad signature,
+  expired, `tv` mismatch after password reset / email change). The client
+  should clear stale cookies via `POST /auth/logout` and prompt re-login.
+  This covers the "ghost session" case where a new tab has stale cookies
+  from a previous session but no in-memory session signal.
+- **`UNAUTHORIZED`** — domain-level auth failure unrelated to cookie state:
+  wrong login credentials, wrong current password on change-password or
+  change-email, invalid reset/verify/confirm tokens on the public-token
+  flows, refresh endpoint failures. Clients should surface a form-level
+  error, not attempt cleanup.
+
+The frontend `apiFetch` interceptor in `lib/api.ts` uses these codes to
+decide whether to fire `attemptLogoutCleanup()` on a 401, avoiding wasted
+round-trips on anonymous page loads and post-logout reloads while
+preserving the ghost-session correctness guarantee from 0016.3.

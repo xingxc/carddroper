@@ -437,6 +437,45 @@ async def test_register_succeeds_when_email_send_raises(client, monkeypatch):
     assert body["user"]["email"] == "besteffort@example.com"
 
 
+async def test_me_anonymous_returns_authentication_required(client):
+    """GET /auth/me with no credentials returns 401 AUTHENTICATION_REQUIRED."""
+    r = await client.get("/auth/me")
+    assert r.status_code == 401
+    assert r.json()["error"]["code"] == "AUTHENTICATION_REQUIRED"
+
+
+async def test_me_invalid_token_returns_invalid_token(client):
+    """GET /auth/me with a syntactically-invalid Bearer token returns 401 INVALID_TOKEN."""
+    r = await client.get("/auth/me", headers={"Authorization": "Bearer garbage.token.data"})
+    assert r.status_code == 401
+    assert r.json()["error"]["code"] == "INVALID_TOKEN"
+
+
+async def test_me_tv_mismatch_returns_invalid_token(client):
+    """GET /auth/me with a stale token (token_version bumped in DB) returns 401 INVALID_TOKEN."""
+    from sqlalchemy import update
+
+    from app.database import engine
+    from app.models.user import User
+
+    reg = await client.post(
+        "/auth/register",
+        json={"email": "tvmismatch@example.com", "password": "verylongsecret"},
+    )
+    assert reg.status_code == 200
+    access = reg.json()["access_token"]
+    user_id = reg.json()["user"]["id"]
+
+    # Bump token_version so the minted token's tv claim no longer matches.
+    async with engine.begin() as conn:
+        await conn.execute(update(User).where(User.id == user_id).values(token_version=99))
+
+    client.cookies.clear()
+    r = await client.get("/auth/me", headers={"Authorization": f"Bearer {access}"})
+    assert r.status_code == 401
+    assert r.json()["error"]["code"] == "INVALID_TOKEN"
+
+
 async def test_me_expires_in_decreases_over_time(client):
     """expires_in on /auth/me decreases between two sequential calls (time-decreasing TTL)."""
     import asyncio

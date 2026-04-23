@@ -42,6 +42,14 @@ def unauthorized(message: str = "Authentication required.") -> AppError:
     return AppError(code="UNAUTHORIZED", message=message, status_code=401)
 
 
+def missing_auth(message: str = "Authentication required.") -> AppError:
+    return AppError(code="AUTHENTICATION_REQUIRED", message=message, status_code=401)
+
+
+def invalid_token(message: str = "Invalid or expired token.") -> AppError:
+    return AppError(code="INVALID_TOKEN", message=message, status_code=401)
+
+
 def forbidden(message: str = "You do not have permission to perform this action.") -> AppError:
     return AppError(code="FORBIDDEN", message=message, status_code=403)
 

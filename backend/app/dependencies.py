@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import get_db
-from app.errors import forbidden, unauthorized
+from app.errors import forbidden, invalid_token, missing_auth
 from app.logging import get_logger
 from app.models.user import User
 
@@ -97,11 +97,11 @@ async def get_current_user(
     user_id, payload = _authenticate(request)
     if not user_id:
         if _extract_token(request):
-            raise unauthorized("Invalid or expired token.")
-        raise unauthorized("Authentication required.")
+            raise invalid_token("Invalid or expired token.")
+        raise missing_auth()
     user = await _load_user(user_id, payload, db)
     if not user:
-        raise unauthorized("Session invalidated. Please log in again.")
+        raise invalid_token("Session invalidated. Please log in again.")
     request.state.user_id = user.id
     return user
 

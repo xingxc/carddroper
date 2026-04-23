@@ -174,6 +174,18 @@ export async function apiFetch<T>(
     throw err;
   }
 
+  // Parse the error body once (if present), up-front. Used by both the
+  // 401 interceptor's cleanup gate and the final ApiError throw.
+  let parsedError: { code?: string; message?: string } | undefined;
+  if (!response.ok) {
+    try {
+      const body = (await response.clone().json()) as ApiErrorBody;
+      parsedError = { code: body.error.code, message: body.error.message };
+    } catch {
+      // non-JSON body — parsedError stays undefined
+    }
+  }
+
   // Silent-refresh interceptor -----------------------------------------------
   if (response.status === 401 && !isRefreshExempt(path)) {
     if (hasSession()) {
@@ -216,30 +228,23 @@ export async function apiFetch<T>(
         return retryResponse.json() as Promise<T>;
       }
 
-      // Refresh failed — clear the session signal.
+      // Refresh failed — clear the session signal. Cookies were definitely
+      // present when hasSession was true, so we must clean them up.
       markLoggedOut();
+      await attemptLogoutCleanup();
+    } else if (parsedError?.code !== "AUTHENTICATION_REQUIRED") {
+      // No session signal. Backend's code tells us whether a token was present.
+      // - INVALID_TOKEN → stale cookies need cleanup (ghost-session Case 5).
+      // - Unknown / unparseable → defensive cleanup.
+      // - AUTHENTICATION_REQUIRED → no token was sent; nothing to clean.
+      await attemptLogoutCleanup();
     }
-    // Refresh failed OR we had no session signal to refresh against. In
-    // both cases server has already rejected these cookies; ask it to
-    // clear them client-side so the proxy stops bouncing /login → /app
-    // on ghost state. Awaited so cookies are gone before the throw below,
-    // letting (app)/layout's auto-redirect land on /login cleanly.
-    await attemptLogoutCleanup();
     // Fall through to throw the original 401 below.
   }
 
   if (!response.ok) {
-    let code = "UNKNOWN";
-    let message = response.statusText;
-
-    try {
-      const body = (await response.json()) as ApiErrorBody;
-      code = body.error.code;
-      message = body.error.message;
-    } catch {
-      // body was not valid JSON — keep the defaults above
-    }
-
+    const code = parsedError?.code ?? "UNKNOWN";
+    const message = parsedError?.message ?? response.statusText;
     throw new ApiError(response.status, code, message);
   }
 
