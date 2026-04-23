@@ -462,7 +462,15 @@ async def reset_password(body: ResetPasswordRequest, db: AsyncSession = Depends(
     user.token_version += 1
     await revoke_all_user_tokens(user.id, db)
 
-    return {"message": "Password reset successfully. Please log in."}
+    # Server-side invalidation happened above. If the caller happened to have
+    # an active session (edge case: reset from a device where the user was
+    # still logged in), clear the dead cookies so the proxy doesn't redirect
+    # /login → /app based on stale cookie presence. Mirrors the logout
+    # pattern; contrast with verify-email (0015.8) which removed its
+    # token_version bump entirely.
+    response = JSONResponse(content={"message": "Password reset successfully. Please log in."})
+    _clear_auth_cookies(response)
+    return response
 
 
 # ---------------------------------------------------------------------------

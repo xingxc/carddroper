@@ -1,11 +1,11 @@
 import { Suspense } from "react";
-import { LoginBody } from "./LoginBody";
+import { ResetPasswordBody } from "./ResetPasswordBody";
 
 /**
  * Shell page — wraps the client component that reads `useSearchParams()` in a
  * Suspense boundary, which Next.js requires for all `useSearchParams` callers.
  */
-export default function LoginPage() {
+export default function ResetPasswordPage() {
   return (
     <Suspense
       fallback={
@@ -34,7 +34,7 @@ export default function LoginPage() {
         </div>
       }
     >
-      <LoginBody />
+      <ResetPasswordBody />
     </Suspense>
   );
 }

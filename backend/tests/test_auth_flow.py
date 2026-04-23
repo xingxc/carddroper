@@ -142,6 +142,58 @@ async def test_password_reset_flow(client):
     assert r3.status_code == 401
 
 
+async def test_reset_password_clears_cookies(client, db_session):
+    from sqlalchemy import select
+
+    from app.models.user import User
+    from app.services.auth_service import create_reset_token
+
+    # Register a user and capture initial state.
+    reg = await client.post(
+        "/auth/register",
+        json={"email": "rpc@example.com", "password": "verylongsecret"},
+    )
+    assert reg.status_code == 200
+    user_id = reg.json()["user"]["id"]
+
+    # Fetch user row to capture initial token_version and password_hash.
+    result = await db_session.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one()
+    initial_tv = user.token_version
+    initial_hash = user.password_hash
+
+    # Mint a reset token using the current token_version.
+    token = create_reset_token(user_id, initial_tv)
+
+    # POST /auth/reset-password with a fresh password satisfying policy.
+    r = await client.post(
+        "/auth/reset-password",
+        json={"token": token, "new_password": "FreshPasswordTest1234"},
+    )
+    assert r.status_code == 200
+    assert r.json() == {"message": "Password reset successfully. Please log in."}
+
+    # Assert Set-Cookie clearing headers are present for both cookies.
+    set_cookie_headers = r.headers.get_list("set-cookie")
+    access_clear = next(
+        (h for h in set_cookie_headers if "access_token" in h and "Max-Age=0" in h), None
+    )
+    refresh_clear = next(
+        (h for h in set_cookie_headers if "refresh_token" in h and "Max-Age=0" in h), None
+    )
+    assert access_clear is not None, (
+        f"Expected access_token clearing cookie; got: {set_cookie_headers}"
+    )
+    assert refresh_clear is not None, (
+        f"Expected refresh_token clearing cookie; got: {set_cookie_headers}"
+    )
+
+    # Refresh the user row and assert token_version incremented and password changed.
+    await db_session.refresh(user)
+    assert user.token_version == initial_tv + 1
+    assert user.password_hash != initial_hash
+
+
 async def test_email_change_flow(client):
     from app.services.auth_service import create_email_change_token
 
