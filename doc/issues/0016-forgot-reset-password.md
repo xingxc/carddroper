@@ -217,4 +217,4 @@ Orchestrator (on close):
 
 ## Resolution
 
-*(filled in by orchestrator on close)*
+Landed on main (2026-04-22, commit `75e55ae`). Forgot + reset pages shipped with the reset-password ghost-session fix — endpoint returns `JSONResponse` that clears auth cookies on success. Phase 2 staging cross-device walkthrough surfaced two follow-ups: (a) Cloud Run GFE rate-limit IP resolution → 0016.1 (`b12e1d0`); (b) victim-device stale-cookie ghost state after cross-device reset → 0016.2 + 0016.3 (`6d9ebbe`, `884a060`). The session-lifecycle work continued through 0016.4–0016.8 — see individual tickets.
