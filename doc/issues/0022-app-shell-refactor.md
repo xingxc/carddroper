@@ -27,7 +27,7 @@ Decisions locked in during the 2026-04-23 planning session:
 1. **Canva/Stripe left-rail pattern.** Fixed-width sidebar, ~64-72px. Main content is flex-1 with its own padding. Sidebar is `position: fixed` (Stripe convention) so it stays visible during page scroll.
 
 2. **Rail content for 0022:**
-   - **Top:** Brand mark — `{brand.name[0]}` letter in a styled square. Links to `/app`. Replaces the text "Carddroper" from the old top nav. Projects substitute their own logo/mark by editing a single component.
+   - **Top:** Brand mark — `{brand.name[0]}` letter in a styled square, wrapped in a `Link` to `/app`. Replaces the text "Carddroper" from the old top nav. **Behavior change from current AppHeader** — the existing AppHeader's brand link points to `/` (marketing home); the new BrandMark deliberately points to `/app` (authed home) per Stripe / Notion / Linear convention. `aria-label="Go to app home"` on the `Link`. Projects substitute their own logo/mark by editing a single component.
    - **Middle:** Empty (flex spacer). Future features add icons here (0023+ tickets).
    - **Bottom:** Profile avatar — `{user.email[0].toUpperCase()}` letter in a styled circle. Click opens the popover. Fallback to `?` if email is somehow missing.
 
@@ -180,7 +180,50 @@ Read `doc/issues/0022-app-shell-refactor.md` end-to-end first. The Design decisi
 
 **4. Touch — `frontend/app/(app)/app/page.tsx`:**
 
-- Current padding `p-8` is redundant now that `<main>` wraps with `px-6 py-4`. Remove the `p-8` on the outer div (or change to a much smaller value if visual polish requires it). Otherwise leave the page's "You're logged in as ..." content untouched.
+Current state (verified 2026-04-23):
+```tsx
+"use client";
+import { useAuth } from "@/context/auth";
+import { LogoutButton } from "@/components/auth/LogoutButton";
+
+export default function AppPage() {
+  const { user } = useAuth();
+  return (
+    <div className="p-8">
+      <p className="text-lg">
+        You&apos;re logged in as{" "}
+        <span className="font-medium">{user?.email}</span>.
+      </p>
+      <LogoutButton className="mt-4 text-sm text-red-600 hover:text-red-800 underline-offset-2 hover:underline" />
+    </div>
+  );
+}
+```
+
+Required changes:
+- **Remove the `<LogoutButton ... />` usage** — redundant with `ProfileMenu`'s Logout action in the new sidebar. Keeping it would show two logout buttons.
+- **Remove the `import { LogoutButton }` line** — no longer used after the above removal.
+- **Remove `className="p-8"`** from the outer div — `<main>` now supplies `px-6 py-4` at the layout level. An unpadded outer div is fine (wrap in a fragment if preferred).
+
+Expected resulting file:
+```tsx
+"use client";
+import { useAuth } from "@/context/auth";
+
+export default function AppPage() {
+  const { user } = useAuth();
+  return (
+    <div>
+      <p className="text-lg">
+        You&apos;re logged in as{" "}
+        <span className="font-medium">{user?.email}</span>.
+      </p>
+    </div>
+  );
+}
+```
+
+No other /app/* pages to touch (none exist yet).
 
 **5. No other files touched.**
 
