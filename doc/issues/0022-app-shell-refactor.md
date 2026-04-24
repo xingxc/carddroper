@@ -27,9 +27,9 @@ Decisions locked in during the 2026-04-23 planning session:
 1. **Canva/Stripe left-rail pattern.** Fixed-width sidebar, ~64-72px. Main content is flex-1 with its own padding. Sidebar is `position: fixed` (Stripe convention) so it stays visible during page scroll.
 
 2. **Rail content for 0022:**
-   - **Top:** Brand mark — `{brand.name[0]}` letter in a styled square, wrapped in a `Link` to `/app`. Replaces the text "Carddroper" from the old top nav. **Behavior change from current AppHeader** — the existing AppHeader's brand link points to `/` (marketing home); the new BrandMark deliberately points to `/app` (authed home) per Stripe / Notion / Linear convention. `aria-label="Go to app home"` on the `Link`. Projects substitute their own logo/mark by editing a single component.
-   - **Middle:** Empty (flex spacer). Future features add icons here (0023+ tickets).
+   - **Top:** Empty `flex-1` slot — placeholder where future feature icons land (0023+ tickets).
    - **Bottom:** Profile avatar — `{user.email[0].toUpperCase()}` letter in a styled circle. Click opens the popover. Fallback to `?` if email is somehow missing.
+   - **No brand mark.** Originally planned a `{brand.name[0]}` letter-in-square at the top that linked to `/app`, but removed during Phase 1 verification on 2026-04-23: (a) it visually clashes with the hamburger at the top-left when the drawer opens on narrow screens; (b) it's redundant for users already in the authed app — marketing identity and brand marks belong to marketing surfaces, not the authed chrome. Future tickets can reintroduce a brand/home affordance if a product-level reason emerges (e.g., multi-workspace switching). For chassis minimum, removed.
 
 3. **Profile popover contents (flat, no nested submenus):**
    ```
