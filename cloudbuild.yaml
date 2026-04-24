@@ -75,6 +75,8 @@ steps:
       - build
       - --build-arg
       - NEXT_PUBLIC_API_BASE_URL=https://api.staging.carddroper.com
+      - --build-arg
+      - NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY=$_STRIPE_PUBLISHABLE_KEY
       - -t
       - us-west1-docker.pkg.dev/$PROJECT_ID/carddroper-repo/frontend:$SHORT_SHA
       - ./frontend

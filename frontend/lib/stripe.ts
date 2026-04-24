@@ -1,0 +1,19 @@
+import { loadStripe, type Stripe } from "@stripe/stripe-js";
+
+let stripePromise: Promise<Stripe | null> | null = null;
+
+export function getStripe(): Promise<Stripe | null> {
+  if (!stripePromise) {
+    const key = process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY;
+    if (!key) {
+      throw new Error(
+        "NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY is not set. " +
+          "Billing is enabled but the frontend can't initialize Stripe Elements. " +
+          "Set it in frontend/.env.local for local dev, or configure the Cloud Build " +
+          "substitution variable _STRIPE_PUBLISHABLE_KEY for staging/prod.",
+      );
+    }
+    stripePromise = loadStripe(key);
+  }
+  return stripePromise;
+}

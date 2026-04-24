@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import Link from "next/link";
 import { useAuth } from "@/context/auth";
 import { LogoutButton } from "@/components/auth/LogoutButton";
 
@@ -68,6 +69,15 @@ export function ProfileMenu() {
           <div className="px-4 py-1 text-xs font-semibold uppercase text-gray-500">
             Settings
           </div>
+
+          <Link
+            href="/app/billing"
+            role="menuitem"
+            onClick={() => setOpen(false)}
+            className="block px-4 py-2 text-sm text-gray-700 hover:bg-gray-100"
+          >
+            Billing
+          </Link>
 
           <hr className="my-1 border-gray-200" />
 
