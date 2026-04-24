@@ -33,7 +33,13 @@ Each candidate is a hypothesis; the audit confirms or rejects based on actual ri
 
 - **Pydantic-settings `extra="forbid"`.** Current `backend/app/config.py:16` sets `extra="ignore"`, so unknown env vars in `.env` or the process environment are silently dropped. A real typo was found in local `backend/.env` during 0016 Phase 2 setup: `FRONTEND_URL=...` silently ignored (correct field name is `FRONTEND_BASE_URL`), the app fell back to its default, no warning. Switch to `extra="forbid"` so `Settings()` construction raises loudly on unknown fields — same fail-loud posture as the CORS and cookie-domain validators. Before flipping: verify all env vars set by `cloudbuild.yaml` (staging + any future prod deploy) and by Cloud Run Secret Manager bindings correspond 1:1 with declared `Settings` fields (current staging appears clean — `SENDGRID_SANDBOX`, `FROM_EMAIL`, `FROM_NAME`, `FRONTEND_BASE_URL`, `CORS_ORIGINS`, `COOKIE_DOMAIN`, all the `SENDGRID_TEMPLATE_*` secrets, `DATABASE_URL`, `JWT_SECRET`, `SENDGRID_API_KEY` are all declared). If the flip causes a new invariant violation, pause and fix the env surface before landing. Contract consequence: adding "every env var the chassis reads must be a declared field on `Settings`" is a new invariant — gets a `chassis-contract.md` entry when 0018 lands this change.
 
-- **Test-suite env-isolation discipline** — every test that depends on a `Settings` field must explicitly `patch.object(settings, ...)` for that field; tests must never rely on `.env` defaults. Scan `backend/tests/` for any remaining tests that assume chassis defaults; add explicit patches. Origin: 0023.1 (`test_register_does_not_create_customer_when_billing_disabled` + `test_webhook_not_mounted_when_billing_disabled` both failed when `.env` had `BILLING_ENABLED=true` because they relied on the default).
+- **Test-suite env-isolation discipline** — tests must never rely on `.env` defaults. Two patterns apply depending on how the tested code reads the setting:
+
+  - **Runtime-path tests** (the tested code re-reads `settings.X` on each request — e.g., the register handler reading `settings.BILLING_ENABLED` inside its body): explicitly `patch.object(settings, "X", ...)` in the test scope. Effective because the runtime code re-reads settings per request.
+
+  - **Feature-gated tests** (the tested code made its decision at module-import time — e.g., `main.py` mounting routes inside `if settings.BILLING_ENABLED`): use `pytestmark = pytest.mark.skipif(not settings.X, reason="...")` at module level if the whole file is gated, or `@pytest.mark.skipif(...)` per test for mixed files. Patching settings mid-test is useless here because routing is baked in.
+
+  Scan `backend/tests/` for any tests violating either pattern. Origin: 0023.1 (`test_register_does_not_create_customer_when_billing_disabled` + `test_webhook_not_mounted_when_billing_disabled` were Kind-1; `test_billing_topup.py` entirely Kind-2).
 
 ## Approach
 

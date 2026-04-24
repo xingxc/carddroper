@@ -73,4 +73,4 @@ The Verification section exists because "tsc passes" and "lint passes" are neces
 | 0021 | Stripe foundation (chassis) — balance ledger, billing primitives, webhook skeleton | resolved | medium |
 | 0022 | app-shell refactor (chassis) — left-rail sidebar + profile popover menu | resolved | medium |
 | 0023 | PAYG topup (chassis) — /billing/topup + /billing/balance + PaymentElement TopupForm | open | medium |
-| 0023.1 | test isolation fixes — remove .env coupling from two billing tests | open | low |
+| 0023.1 | test isolation fixes — Kind-1 patch + Kind-2 skipif for billing tests | resolved | low |

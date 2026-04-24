@@ -16,9 +16,15 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.database import engine
 from app.models import BalanceLedger, User
 from app.models.stripe_event import StripeEvent
+
+pytestmark = pytest.mark.skipif(
+    not settings.BILLING_ENABLED,
+    reason="test_billing_topup requires BILLING_ENABLED=true — feature-gated at app-init time",
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
