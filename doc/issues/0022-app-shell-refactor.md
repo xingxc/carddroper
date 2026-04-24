@@ -1,7 +1,7 @@
 ---
 id: 0022
 title: app-shell refactor (chassis) — left-rail sidebar + profile popover menu
-status: open
+status: resolved
 priority: medium (pure UI chassis primitive; unblocks 0023's billing link integration; no user-visible functional change beyond chrome reshape)
 found_by: 0022/0023 planning session on 2026-04-23 — reshaped the original "add Billing link to AppHeader" plan into a Canva/Stripe-style left-rail app shell. Split from the original combined-scope ticket for reliability reasons: layout primitive must land on a stable substrate before billing features consume it.
 ---
@@ -502,4 +502,18 @@ Orchestrator (on close):
 
 ## Resolution
 
-*(filled in by orchestrator after user confirms Phase 1 visual + regression checks + Phase 2 staging pass)*
+Landed across four commits on 2026-04-23, all on `main`:
+
+| Commit | What |
+|---|---|
+| `ddd920b` | Phase 0a — base shell: `AppSidebar`, `ProfileMenu`, refactored `(app)/layout.tsx`, trimmed `/app/page.tsx`. 0016.2 + 0016.5 + 0016.7 behaviors preserved verbatim. |
+| `6bf4b6a` | Phase 0b — Stripe-style responsive drawer: `md` breakpoint gates sidebar visibility; hamburger button + dimmed backdrop below `md`; Escape-closes; body scroll lock; z-stratum discipline (Hamburger z-40, Sidebar/popover z-30, Backdrop z-20, LoadingScreen z-50 untouched). |
+| `6f965d9` | Phase 1 refinement — removed BrandMark. Flagged during Phase 1 visual verification: clashed with hamburger in the top-left on narrow when drawer was open, and redundant in authed chrome where users already know they're in the app. |
+
+Phase 1 user-verified all 16 steps locally (wide rail + narrow drawer + hamburger + backdrop + Escape + profile popover + body scroll lock + resize transitions + 0016.2 redirect regression + 0016.5 LoadingScreen regression + marketing layout untouched). All green.
+
+**Pushed to main; Cloud Build redeploy in progress.** Phase 2 staging verification is the manual browser spot-check — no new smoke scripts needed since the ticket changed zero backend surface. Existing smoke battery (`smoke_healthz`, `smoke_auth`, `smoke_cors`, `smoke_verify_email`) should pass unchanged and acts as the sanity check that no backend regression leaked through.
+
+**Chassis outcomes:** third layout-primitive subsystem shipped. Projects adopting this chassis now inherit: two-column app-shell pattern, sidebar middle-slot for feature icons, profile popover with extensible Settings section, responsive drawer behavior, Escape+backdrop+body-scroll-lock primitives. Zero project-specific opinions baked in. `Billing` as the first Settings child lands with 0023 — one-line insertion.
+
+**Deferred to a dedicated a11y ticket:** focus trap inside drawer, `inert` on off-screen sidebar for keyboard tab discipline, arrow-key navigation within menu, hamburger→X icon swap. Documented as known gaps; not chassis-blocking.
