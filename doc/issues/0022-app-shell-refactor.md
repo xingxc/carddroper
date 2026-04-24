@@ -69,7 +69,25 @@ Decisions locked in during the 2026-04-23 planning session:
 
 10. **No sidebar collapse toggle in 0022.** Rail is already minimal (2 rendered elements: brand + profile, with a spacer). Collapse is meaningful when there are 5+ rail items competing for space. Revisit in a future ticket once the rail has grown.
 
-11. **No mobile responsive work in 0022.** Narrow desktop (~1024px+) is the target. On narrow mobile, the 64px rail still renders but the popover may overflow awkwardly. Mobile hamburger pattern lands in a dedicated ticket when we have real mobile UX requirements.
+11. **Responsive behavior — Stripe-style drawer on narrow screens.** Breakpoint is Tailwind `md` (768px):
+    - **≥ 768px:** sidebar visible (fixed 64px rail), hamburger hidden, main has `ml-16`.
+    - **< 768px:** sidebar hidden by default (slid out via `-translate-x-full`), hamburger visible top-left, main has `ml-0`.
+    - Clicking the hamburger slides the sidebar in as a drawer (`translate-x-0`) + dimmed backdrop overlays the rest of the page.
+    - Clicking the backdrop, pressing `Escape`, or clicking any future nav item inside the drawer closes it.
+    - Body scroll lock engaged while drawer is open on narrow (prevents content scroll underneath).
+    - Animation: `transition-transform duration-200 ease-in-out` on sidebar.
+    - z-layer order (all in root stacking context):
+      - LoadingScreen `z-50` (unchanged)
+      - Hamburger `z-40` (above drawer so users can still trigger close)
+      - Sidebar (drawer) `z-30` (raised from the base `z-20` to sit above backdrop)
+      - ProfileMenu popover `z-30` (same stratum; DOM order keeps it on top of sidebar)
+      - Backdrop `z-20` (behind drawer, dims page on narrow only)
+    - Deferred to a dedicated a11y pass:
+      - Focus trap inside drawer.
+      - `inert` / `aria-hidden` on the off-screen sidebar (tabbing through page on narrow could currently land on invisible sidebar buttons — known minor a11y gap).
+      - Arrow-key navigation within the drawer.
+    - Not swapping hamburger icon to X on open; hamburger stays constant (Stripe convention). Close via backdrop/Escape.
+    - Known visual edge: the popover (w-64 = 256px) anchored at `left-20` overflows below ~336px viewport widths. Rare screens; accepted limitation for 0022. Revisit during mobile polish.
 
 12. **`AppHeader` function is deleted.** The inline `AppHeader` function in `(app)/layout.tsx` (currently renders the top nav) goes away entirely. Its responsibilities split across `AppSidebar` (brand mark) and `ProfileMenu` (user email + Logout). No references remain to `AppHeader` after the refactor.
 
@@ -94,11 +112,15 @@ Decisions locked in during the 2026-04-23 planning session:
 
 ## Acceptance
 
-### Phase 0 — frontend (frontend-builder)
+### Phase 0a — frontend (frontend-builder) — base shell — COMPLETE (commit `ddd920b`, 2026-04-23)
 
-Read `doc/issues/0022-app-shell-refactor.md` end-to-end first. The Design decisions section is authoritative; follow it verbatim.
+Landed: AppSidebar + ProfileMenu + refactored `(app)/layout.tsx` + trimmed `/app/page.tsx`. All preservation clauses honored; lint/tsc/build clean. Awaiting Phase 0b responsive expansion + Phase 1 manual verification.
 
-**Repository root:** /Users/johnxing/mini/postapp. Work on the current branch (main or dev — match the user's pattern). Do NOT touch `backend/`.
+### Phase 0b — frontend (frontend-builder) — responsive expansion
+
+Builds on Phase 0a. The existing AppSidebar + ProfileMenu components stay; we add responsive behavior around them. Read Design decision #11 above for the full shape.
+
+**Repository root:** /Users/johnxing/mini/postapp. Work on `main`. Do NOT touch `backend/`.
 
 **1. New component — `frontend/components/app-shell/AppSidebar.tsx` (client component):**
 
@@ -231,16 +253,154 @@ No other /app/* pages to touch (none exist yet).
 - Do NOT add dependencies to `package.json`.
 - Do NOT add environment variables.
 
+---
+
+### Phase 0b — responsive expansion (pending)
+
+Layered additions on top of the Phase 0a shell. Four concrete changes.
+
+**1. Modify `frontend/components/app-shell/AppSidebar.tsx` — accept drawer state:**
+
+- Add prop: `{ drawerOpen: boolean }` on the component signature.
+- Update the `<aside>` className:
+  - Existing classes: `fixed inset-y-0 left-0 w-16 z-20 flex flex-col items-center justify-between py-4 bg-gray-50 border-r border-gray-200`
+  - Change `z-20` → `z-30` (sidebar sits above backdrop when in drawer mode).
+  - Append transition classes: `transition-transform duration-200 ease-in-out`
+  - Append responsive transform: `md:translate-x-0` (always visible at md+).
+  - Append conditional transform: `drawerOpen ? "translate-x-0" : "-translate-x-full"` (drawer behavior below md).
+  - Add `id="app-sidebar"` for the hamburger's `aria-controls`.
+
+Full class expression (template string OK; no utility needed):
+```tsx
+className={`fixed inset-y-0 left-0 w-16 z-30 flex flex-col items-center justify-between py-4 bg-gray-50 border-r border-gray-200 transition-transform duration-200 ease-in-out md:translate-x-0 ${drawerOpen ? "translate-x-0" : "-translate-x-full"}`}
+```
+
+**2. Refactor `frontend/app/(app)/layout.tsx` — drawer state + hamburger + backdrop:**
+
+Preserve the 0016.2 useEffect and 0016.5 early-return exactly as they are. Add drawer state alongside them. Rendered structure after refactor:
+
+```tsx
+"use client";
+
+import { useEffect, useState, type ReactNode } from "react";
+import { useRouter } from "next/navigation";
+import { useAuth } from "@/context/auth";
+import { LoadingScreen } from "@/components/loading/LoadingScreen";
+import { AppSidebar } from "@/components/app-shell/AppSidebar";
+
+export default function AppLayout({ children }: { children: ReactNode }) {
+  const router = useRouter();
+  const { isLoading, isAuthenticated } = useAuth();
+  const [drawerOpen, setDrawerOpen] = useState(false);
+
+  // 0016.2 redirect — preserved verbatim.
+  useEffect(() => {
+    if (!isLoading && !isAuthenticated) router.replace("/login");
+  }, [isLoading, isAuthenticated, router]);
+
+  // Escape closes the drawer.
+  useEffect(() => {
+    if (!drawerOpen) return;
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setDrawerOpen(false);
+    };
+    document.addEventListener("keydown", handler);
+    return () => document.removeEventListener("keydown", handler);
+  }, [drawerOpen]);
+
+  // Body scroll lock while drawer is open on narrow screens.
+  // The md: breakpoint in CSS handles wide-screen no-op; this guard just ensures
+  // we don't leave the body locked after a resize-to-wide while drawer was open.
+  useEffect(() => {
+    if (!drawerOpen) return;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = prev;
+    };
+  }, [drawerOpen]);
+
+  // 0016.5 pre-decision blur — preserved verbatim.
+  if (isLoading || !isAuthenticated) return <LoadingScreen />;
+
+  return (
+    <div className="min-h-screen">
+      {/* Hamburger — only visible below md */}
+      <button
+        type="button"
+        onClick={() => setDrawerOpen(true)}
+        aria-label="Open navigation"
+        aria-expanded={drawerOpen}
+        aria-controls="app-sidebar"
+        className="md:hidden fixed top-3 left-3 z-40 inline-flex items-center justify-center w-10 h-10 rounded-md text-gray-700 hover:bg-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
+      >
+        <svg
+          width="24"
+          height="24"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden="true"
+        >
+          <line x1="3" y1="6" x2="21" y2="6" />
+          <line x1="3" y1="12" x2="21" y2="12" />
+          <line x1="3" y1="18" x2="21" y2="18" />
+        </svg>
+      </button>
+
+      {/* Backdrop — only visible below md, only when drawerOpen */}
+      {drawerOpen && (
+        <div
+          className="md:hidden fixed inset-0 z-20 bg-black/40"
+          onClick={() => setDrawerOpen(false)}
+          aria-hidden="true"
+        />
+      )}
+
+      <AppSidebar drawerOpen={drawerOpen} />
+
+      <main className="px-6 py-4 pt-16 md:pt-4 md:ml-16">{children}</main>
+    </div>
+  );
+}
+```
+
+Key details:
+- `drawerOpen` defaults to `false`. On wide screens this is a no-op (sidebar always visible via `md:translate-x-0`). On narrow screens, initial state = drawer closed.
+- `main`'s `pt-16 md:pt-4` gives the hamburger button breathing room on narrow without wasting vertical space on wide.
+- `main`'s `md:ml-16` compensates for the fixed sidebar on wide; `ml-0` (implicit) on narrow because the sidebar is off-screen in the default closed state.
+- Hamburger SVG is inline (hand-rolled; no icon library per Phase 0a decision).
+
+**3. No changes to `ProfileMenu.tsx`.**
+
+The popover at `fixed bottom-4 left-20 z-30` works correctly whether the sidebar is in static-wide mode or slid-in drawer mode — in both cases the sidebar occupies `left-0 .. left-16`, and the popover sits just to the right at `left-20` with the same z-stratum as the sidebar (DOM order keeps the popover rendered after, visible on top).
+
+**4. No changes to `(app)/app/page.tsx`, `(marketing)/layout.tsx`, `(auth)/layout.tsx`, `LogoutButton.tsx`, any other file.**
+
+### Phase 0b — do NOT introduce
+
+- Focus trap, `inert` on off-screen sidebar, arrow-key menu navigation — deferred to dedicated a11y ticket.
+- Hamburger → X icon swap — hamburger stays constant.
+- `<AppShell>` wrapper abstraction — premature; state lives in layout.tsx.
+- Drawer state context provider — no multi-component consumer need.
+- Custom media-query hook (`useMediaQuery` etc.) — the entire responsive split is handled by Tailwind's `md:` variants; JS doesn't need to know the current breakpoint.
+- `package.json` changes.
+- Environment variable changes.
+
 ### Phase 1 — user manual verification
 
-**Base (required before merge):**
+**Wide desktop (required before merge):**
 
 1. `docker-compose up -d --build frontend`
 2. Navigate to `http://localhost:3000/login`. Sign in with an existing user.
-3. Land on `/app`. Verify visually:
+3. Land on `/app`. Browser window wide (≥768px). Verify visually:
    - Left rail, ~64px wide, gray background.
    - Top of rail: brand mark (single letter `C` in a styled square).
    - Bottom of rail: profile avatar (user's email initial in a gray circle).
+   - No hamburger button anywhere.
    - Main content area starts immediately after the rail, no large empty gutter.
 4. Click the profile avatar. Popover appears anchored near the trigger.
    - First row: your email.
@@ -249,8 +409,24 @@ No other /app/* pages to touch (none exist yet).
 5. Press `Escape` → popover closes.
 6. Re-open popover (click profile). Click anywhere else on the page → popover closes.
 7. Re-open popover. Click `Logout`. Verify it still works: one intentional `POST /auth/logout`, hard reload, lands on `/`. (0016.7 behavior unchanged.)
-8. **Auth regressions:** in a separate incognito tab, directly visit `/app`. Verify redirect to `/login` within a beat (0016.2 effect still fires). Verify brief blurry screen rather than empty chrome (0016.5 LoadingScreen still renders).
-9. **Marketing not touched:** visit `/` (logged out). Top nav pattern still present, exactly as it was before.
+
+**Responsive drawer (required before merge):**
+
+8. Log in again. Slowly drag the browser window narrower. At/below 768px:
+   - Sidebar disappears (slides left off-screen).
+   - Hamburger button appears top-left.
+   - Main content reflows to start from the viewport left edge.
+9. Click the hamburger. Sidebar slides in from the left; page content behind it dims (backdrop).
+10. Click the backdrop (the dimmed area outside the drawer). Drawer slides out; hamburger reappears as the only control.
+11. Re-open drawer via hamburger. Press `Escape`. Drawer closes.
+12. Re-open drawer. Click the profile avatar inside the drawer. Popover appears to the right of the drawer with email + Settings + Logout as usual.
+13. With drawer open, try scrolling the background page. Scroll is locked.
+14. Drag the window back wide (≥768px) while drawer was open. The drawer state becomes invisible (sidebar becomes always-visible rail; backdrop hides). No jank.
+
+**Regression checks:**
+
+15. **Auth regressions:** in a separate incognito tab, directly visit `/app`. Verify redirect to `/login` within a beat (0016.2 effect still fires). Verify brief blurry screen rather than empty chrome (0016.5 LoadingScreen still renders).
+16. **Marketing not touched:** visit `/` (logged out). Top nav pattern still present, exactly as it was before.
 
 **Automated gates:**
 
