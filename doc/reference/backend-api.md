@@ -28,7 +28,9 @@ Responses for register, login, refresh, and me include `expires_in: int` (second
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| POST | `/billing/webhook` | Stripe signature (`stripe-signature` header) | Receive and process Stripe webhook events. Returns 200 on success (including idempotent replays of the same `event.id`). Returns 400 on invalid or missing signature. Idempotent: duplicate `event.id` requests return 200 without reprocessing. Only mounted when `BILLING_ENABLED=true`; returns 404 when disabled. |
+| POST | `/billing/webhook` | Stripe signature (`stripe-signature` header) | Receive and process Stripe webhook events. Dispatches to handlers registered via `EVENT_HANDLERS` registry; currently handles `payment_intent.succeeded`. Unregistered event types are logged and recorded in `stripe_events`; no error returned. Returns 200 on success (including idempotent replays of the same `event.id`). Returns 400 on invalid or missing signature. Only mounted when `BILLING_ENABLED=true`. |
+| POST | `/billing/topup` | access + verified; rate-limited (10/min per IP) | Create Stripe PaymentIntent for a PAYG topup. Request: `{amount_micros: int}` (must be in `[BILLING_TOPUP_MIN_MICROS, BILLING_TOPUP_MAX_MICROS]`). Response: `{client_secret: str, amount_micros: int}`. Lazily creates a Stripe Customer if the user has none. Idempotency key scoped to user + amount + minute window. |
+| GET  | `/billing/balance` | access (not verified-gated) | Return current balance. Response: `{balance_micros: int, formatted: str}`. Sums `balance_ledger` for the authenticated user. |
 | POST | `/billing/portal-session` | access + verified | Create Stripe Customer Portal session. |
 | GET  | `/billing/pricing` | none | Return available subscription tiers. |
 

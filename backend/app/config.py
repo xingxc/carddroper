@@ -110,6 +110,7 @@ class Settings(BaseSettings):
     VERIFY_EMAIL_RATE_LIMIT: str = "10/minute"
     CHANGE_EMAIL_RATE_LIMIT: str = "3/hour"
     CONFIRM_EMAIL_CHANGE_RATE_LIMIT: str = "10/minute"
+    TOPUP_RATE_LIMIT: str = "10/minute"
 
     # Per-account login lockout (independent of per-IP)
     LOCKOUT_THRESHOLD: int = 10
