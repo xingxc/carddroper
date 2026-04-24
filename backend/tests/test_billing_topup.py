@@ -6,6 +6,7 @@ Stripe API calls are mocked via monkeypatch / unittest.mock — no real Stripe c
 All tests use the autouse _reset_schema fixture from conftest.py.
 """
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -154,6 +155,45 @@ def _make_billing_test_app():
     test_app = FastAPI()
     test_app.include_router(billing_router)
     return test_app
+
+
+def _build_pi_succeeded_event(
+    event_id: str,
+    user_id: int,
+    amount_cents: int,
+) -> str:
+    """Alias for _build_pi_event with explicit parameter names matching ticket usage."""
+    return _build_pi_event(
+        event_id=event_id,
+        user_id=str(user_id),
+        amount=amount_cents,
+        event_type="payment_intent.succeeded",
+    )
+
+
+def _sign_event(payload: str) -> tuple[bytes, str]:
+    """Return (encoded payload, stripe-signature header) signed with the test webhook secret."""
+    encoded = payload.encode()
+    header = _make_stripe_header(encoded, _WEBHOOK_SECRET)
+    return encoded, header
+
+
+async def _make_verified_user(session, email: str) -> User:
+    """Create and persist a verified User row; returns the User ORM object."""
+    from datetime import datetime, timezone
+
+    from app.services.auth_service import hash_password
+
+    async with session.begin():
+        user = User(
+            email=email,
+            password_hash=hash_password("Password123!"),
+            full_name="Test User",
+            verified_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        )
+        session.add(user)
+        await session.flush()
+    return user
 
 
 # ---------------------------------------------------------------------------
@@ -782,3 +822,109 @@ async def test_webhook_unregistered_event_type_still_records():
         row = result.scalar_one_or_none()
     assert row is not None
     assert row.event_type == "customer.updated"
+
+
+@pytest.mark.asyncio
+async def test_webhook_concurrent_delivery_no_race():
+    """Two concurrent POSTs with the same event.id → both return 200, handler runs once."""
+    import httpx
+
+    from app.config import settings
+
+    # Set up: create a verified user (topup handler needs metadata.user_id)
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        user = await _make_verified_user(session, email="concurrent@example.com")
+        user_id = user.id
+
+    payload = _build_pi_succeeded_event(
+        event_id="evt_concurrent_001",
+        user_id=user_id,
+        amount_cents=2000,
+    )
+    encoded, sig_header = _sign_event(payload)
+
+    with patch.object(settings, "STRIPE_WEBHOOK_SECRET", _WEBHOOK_SECRET):
+        test_app = _make_billing_test_app()
+        transport = httpx.ASGITransport(app=test_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            # Fire two concurrent POSTs — asyncio.gather runs both before either completes
+            responses = await asyncio.gather(
+                c.post(
+                    "/billing/webhook",
+                    content=encoded,
+                    headers={"stripe-signature": sig_header, "content-type": "application/json"},
+                ),
+                c.post(
+                    "/billing/webhook",
+                    content=encoded,
+                    headers={"stripe-signature": sig_header, "content-type": "application/json"},
+                ),
+            )
+
+    # Both must succeed
+    assert all(r.status_code == 200 for r in responses), [r.status_code for r in responses]
+
+    # Exactly one stripe_events row
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        stripe_event_rows = (
+            await session.execute(select(StripeEvent).where(StripeEvent.id == "evt_concurrent_001"))
+        ).all()
+    assert len(stripe_event_rows) == 1
+
+    # Exactly one balance_ledger row tied to this stripe_event_id (handler ran once)
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        ledger_rows = (
+            await session.execute(
+                select(BalanceLedger).where(BalanceLedger.stripe_event_id == "evt_concurrent_001")
+            )
+        ).all()
+    assert len(ledger_rows) == 1
+    assert ledger_rows[0][0].amount_micros == 20_000_000  # 2000 cents * 10_000
+
+
+@pytest.mark.asyncio
+async def test_webhook_handler_failure_does_not_record_event(monkeypatch):
+    """Handler exception → transaction rolls back → no stripe_events row → Stripe will retry."""
+    import httpx
+
+    from app.billing.handlers import EVENT_HANDLERS
+    from app.config import settings
+
+    # Monkey-patch the topup handler to raise an unexpected exception.
+    async def _failing_handler(event, db):
+        raise RuntimeError("simulated handler bug")
+
+    monkeypatch.setitem(EVENT_HANDLERS, "payment_intent.succeeded", _failing_handler)
+
+    payload = _build_pi_succeeded_event(event_id="evt_fail_001", user_id=1, amount_cents=1000)
+    encoded, sig_header = _sign_event(payload)
+
+    with patch.object(settings, "STRIPE_WEBHOOK_SECRET", _WEBHOOK_SECRET):
+        test_app = _make_billing_test_app()
+        # raise_app_exceptions=False so httpx converts unhandled app errors → 500
+        # rather than propagating them as Python exceptions into the test.
+        transport = httpx.ASGITransport(app=test_app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            resp = await c.post(
+                "/billing/webhook",
+                content=encoded,
+                headers={"stripe-signature": sig_header, "content-type": "application/json"},
+            )
+
+    assert resp.status_code >= 500  # handler raised → uncaught → 5xx
+
+    # No stripe_events row — Stripe will retry the event later
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        rows = (
+            await session.execute(select(StripeEvent).where(StripeEvent.id == "evt_fail_001"))
+        ).all()
+    assert len(rows) == 0
+
+    # No balance_ledger row either
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        ledger_rows = (
+            await session.execute(
+                select(BalanceLedger).where(BalanceLedger.stripe_event_id == "evt_fail_001")
+            )
+        ).all()
+    assert len(ledger_rows) == 0

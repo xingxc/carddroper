@@ -14,7 +14,7 @@ import time
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.billing.handlers.topup  # noqa: F401 — registers payment_intent.succeeded handler
@@ -92,24 +92,35 @@ async def stripe_webhook(request: Request) -> Response:
 
     async with AsyncSessionLocal() as db:
         async with db.begin():
-            # Idempotency: return 200 immediately if already processed.
-            existing = await db.execute(select(StripeEvent).where(StripeEvent.id == event.id))
-            if existing.scalar_one_or_none() is not None:
+            # Atomic idempotency: try to claim this event_id by inserting it.
+            # If another concurrent request already inserted (race) or this is a
+            # plain duplicate retry, ON CONFLICT DO NOTHING returns rowcount=0
+            # and we short-circuit. Postgres serialises concurrent INSERT-with-
+            # conflict at the row-lock level, so exactly one transaction "owns"
+            # the event id and the handler runs exactly once.
+            stmt = (
+                pg_insert(StripeEvent)
+                .values(id=event.id, event_type=event.type)
+                .on_conflict_do_nothing(index_elements=["id"])
+            )
+            result = await db.execute(stmt)
+            if result.rowcount == 0:
                 logger.info(
                     "stripe_webhook_duplicate_event",
                     extra={"event_id": event.id, "event_type": event.type},
                 )
                 return Response(status_code=200)
 
-            # Dispatch to registered handler, or log unhandled type.
+            # We own this event id. Dispatch the registered handler, if any.
+            # The handler runs inside the same transaction as the stripe_events
+            # INSERT, so a handler exception rolls back BOTH the handler's
+            # writes (e.g., balance_ledger row in topup handler) AND the
+            # stripe_events row — Stripe will then retry the event cleanly.
             handler = EVENT_HANDLERS.get(event.type)
             if handler:
                 await handler(event, db)
             else:
                 logger.warning("Unhandled Stripe event type: %s", event.type)
-
-            # Record the event before returning 200.
-            db.add(StripeEvent(id=event.id, event_type=event.type))
 
     return Response(status_code=200)
 

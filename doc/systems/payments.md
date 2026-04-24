@@ -247,6 +247,8 @@ All handlers:
 3. Perform the side effect.
 4. Insert `stripe_events` row.
 
+**Idempotency mechanism — atomic INSERT … ON CONFLICT.** The chassis uses an atomic `INSERT INTO stripe_events … ON CONFLICT (id) DO NOTHING` (via SQLAlchemy's `pg_insert`) rather than a SELECT-then-INSERT check. Postgres serialises concurrent INSERTs on the same `id` at the row-lock level, so exactly one transaction "owns" the event id and the handler runs exactly once — even when Stripe delivers the same event id to two concurrent requests (duplicate delivery, retry-while-processing, or multiple webhook endpoint configs). A race-loser (rowcount=0) returns 200 without re-invoking the handler. If the handler raises an uncaught exception the entire transaction rolls back, including the `stripe_events` INSERT, so Stripe sees a 5xx and retries; the retry then gets rowcount=1 and runs the handler again. All future webhook handlers registered in `EVENT_HANDLERS` inherit this guarantee at the route level without any per-handler changes.
+
 ### 6. Past-due behavior
 
 On `invoice.payment_failed`:
