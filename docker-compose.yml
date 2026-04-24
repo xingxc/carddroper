@@ -2,11 +2,14 @@
 # Production uses Cloud Run + Cloud SQL; this file is dev-only.
 #
 # First-time setup:
-#   cp backend/.env.example backend/.env       # then set JWT_SECRET
-#   cp frontend/.env.example frontend/.env.local
+#   cp .env.example .env                        # root — docker-compose ${VAR} substitutions (e.g., STRIPE_PUBLISHABLE_KEY)
+#   cp backend/.env.example backend/.env        # backend container runtime — set JWT_SECRET + Stripe secret key + etc.
+#   cp frontend/.env.example frontend/.env.local  # frontend runtime — only used if running `npm run dev` outside docker-compose
 #   docker-compose build
 #   docker-compose up -d
 #   docker-compose exec backend alembic upgrade head
+#
+# See doc/operations/development.md §Env-var tiers for why the split is structural, not stylistic.
 #
 # Day-to-day:
 #   docker-compose up                          # start in foreground
