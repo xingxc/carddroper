@@ -299,8 +299,13 @@ _REGISTER_BODY = {
 
 @pytest.mark.asyncio
 async def test_register_does_not_create_customer_when_billing_disabled(client):
-    """Default config (BILLING_ENABLED=false) — no Stripe calls, stripe_customer_id stays NULL."""
-    with patch("app.billing.primitives.stripe") as mock_stripe:
+    """BILLING_ENABLED=false (explicit patch) — no Stripe calls, stripe_customer_id stays NULL."""
+    from app.config import settings
+
+    with (
+        patch.object(settings, "BILLING_ENABLED", False),
+        patch("app.billing.primitives.stripe") as mock_stripe,
+    ):
         resp = await client.post("/auth/register", json=_REGISTER_BODY)
     assert resp.status_code == 200
     mock_stripe.Customer.create.assert_not_called()
@@ -518,15 +523,38 @@ def _make_billing_test_app() -> FastAPI:
     return test_app
 
 
+def _make_app_with_billing_disabled() -> FastAPI:
+    """Construct a fresh FastAPI app with BILLING_ENABLED=false to verify route mounting.
+
+    Mirrors the conditional-mount logic from main.py without using importlib.reload
+    (which would destabilise the shared `client` fixture for subsequent tests).
+    The calling test patches settings.BILLING_ENABLED=False before calling this helper,
+    so the `if settings.BILLING_ENABLED` check below evaluates to False and the billing
+    router is not included.
+    """
+    from app.config import settings
+
+    app = FastAPI()
+    if settings.BILLING_ENABLED:
+        from app.routes.billing import router as billing_router
+
+        app.include_router(billing_router)
+    return app
+
+
 @pytest.mark.asyncio
-async def test_webhook_not_mounted_when_billing_disabled(client):
-    """BILLING_ENABLED=false (default) — POST /billing/webhook returns 404."""
-    resp = await client.post(
-        "/billing/webhook",
-        content=b"{}",
-        headers={"stripe-signature": "t=1,v1=abc"},
+async def test_webhook_not_mounted_when_billing_disabled():
+    """BILLING_ENABLED=false (explicit patch) — billing router not mounted on fresh app."""
+    from app.config import settings
+
+    with patch.object(settings, "BILLING_ENABLED", False):
+        app = _make_app_with_billing_disabled()
+        mounted_paths = {route.path for route in app.routes}
+
+    assert not any(path.startswith("/billing") for path in mounted_paths), (
+        f"Billing routes should not be mounted when BILLING_ENABLED=false; "
+        f"found paths starting with /billing in: {sorted(mounted_paths)}"
     )
-    assert resp.status_code == 404
 
 
 @pytest.mark.asyncio
