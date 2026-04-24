@@ -99,7 +99,7 @@ Read `doc/systems/payments.md` §Flows items 2 + 6 first. Every contract (reques
 
 **1. Dispatch registry (`backend/app/billing/handlers/`) — new directory:**
 
-- `__init__.py`:
+- `__init__.py` — defines the registry + decorator ONLY (no handler imports, no side effects; avoids circular-import risk when handler modules import `register`):
   ```python
   from typing import Awaitable, Callable
   import stripe
@@ -113,18 +113,18 @@ Read `doc/systems/payments.md` §Flows items 2 + 6 first. Every contract (reques
           EVENT_HANDLERS[event_type] = fn
           return fn
       return decorator
-
-  # Import handler modules to register their decorators.
-  from app.billing.handlers import topup  # noqa: F401, E402
   ```
 
 - `topup.py`:
+  - Top-line imports: `from app.billing.handlers import register`, `from app.billing.primitives import grant`, `from app.billing.reason import Reason`, `logger = logging.getLogger(__name__)`, `stripe` + `AsyncSession` types.
   - `@register("payment_intent.succeeded")` on `async def handle_payment_intent_succeeded(event, db)`.
-  - Extract `metadata.user_id`; log warning + return on missing/invalid.
+  - Extract `metadata.user_id` via `event.data.object.metadata.get("user_id")`; log warning + return on missing/invalid.
   - Extract `amount` (cents); log warning + return if missing/≤0.
   - Convert cents → micros (×10_000).
   - Call `await grant(user_id, amount_micros, Reason.TOPUP, db=db, stripe_event_id=event.id)`.
   - `stripe_events` idempotency (existing in routes/billing.py) prevents double-grant on webhook replay.
+
+- **Handler registration** — side-effect import lives in `routes/billing.py`, NOT in `handlers/__init__.py`. Placing it in `billing.py` keeps handler-registration co-located with where events are dispatched, and avoids partial-module-load issues that can bite when handler files import from `handlers/__init__.py` during its own load. Concrete line to add near the top of `routes/billing.py` (alongside the existing `from app.billing.handlers import EVENT_HANDLERS`): `import app.billing.handlers.topup  # noqa: F401 — registers payment_intent.succeeded`.
 
 **2. Webhook route dispatch (`backend/app/routes/billing.py`):**
 
@@ -151,7 +151,7 @@ Add a `POST /billing/topup` endpoint:
 - Request body: `TopupRequest { amount_micros: int }` (Pydantic).
 - Response: `TopupResponse { client_secret: str, amount_micros: int }`.
 - Dep: `Depends(require_verified)` (import from `app.dependencies`).
-- Rate limit: `@limiter.limit(settings.TOPUP_RATE_LIMIT)`.
+- Rate limit: `@limiter.limit(settings.TOPUP_RATE_LIMIT)`. Import the existing limiter instance: `from app.routes.auth import limiter`. **Known chassis coupling** — routes/billing importing from routes/auth. Acceptable for 0023 since the limiter is the only cross-route thing we need. Factor to `app/rate_limit.py` in a future chassis-cleanup ticket (candidate for 0018 audit).
 - Validation:
   - If `amount_micros < BILLING_TOPUP_MIN_MICROS` → `validation_error("Amount below minimum $<X.XX>.")`.
   - If `amount_micros > BILLING_TOPUP_MAX_MICROS` → `validation_error("Amount above maximum $<X.XX>.")`.
@@ -380,7 +380,17 @@ No project-specific copy; generic chassis language.
 
 **8. Add Billing link to ProfileMenu (`frontend/components/app-shell/ProfileMenu.tsx`):**
 
-Between the existing Settings section label and the divider-before-Logout, insert:
+Two edits to the file (verified current state 2026-04-23):
+
+**a. Add import at the top of the file (after existing imports on lines 3-5):**
+
+```tsx
+import Link from "next/link";
+```
+
+(ProfileMenu does not currently import Link — it's brand-new to this file.)
+
+**b. Insert the Billing link between the `Settings` label div (closes at line 70) and the `<hr ...>` before the Logout menuitem (line 72):**
 
 ```tsx
 <Link
@@ -393,7 +403,9 @@ Between the existing Settings section label and the divider-before-Logout, inser
 </Link>
 ```
 
-Don't forget `import Link from "next/link"` at the top. The `onClick={() => setOpen(false)}` closes the menu after navigation (common Stripe/Linear pattern — don't leave stale menu open).
+Post-edit menu DOM order: Email → hr → Settings label → **Billing** → hr → Logout. The `onClick={() => setOpen(false)}` closes the menu on navigation (Stripe/Linear convention — no stale popover lingering after route change).
+
+No other changes to ProfileMenu. The existing click-outside + Escape useEffects, the trigger button, and the Logout menuitem stay verbatim.
 
 **9. Tests — none automated** (no frontend test harness yet). Gates:
 
