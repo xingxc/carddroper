@@ -48,6 +48,7 @@ Each candidate is a hypothesis; the audit confirms or rejects based on actual ri
 3. For each must-be-valid-or-crash field, write a validator + contract entry in the same commit (per the coupling rule).
 4. Batch the additions into 1–3 commits depending on cohesion (e.g. "auth-side validators" commit, "email-side validators" commit).
 5. For any field audited and deliberately left un-validated, add a one-line comment in `config.py` explaining why (prevents future auditors from re-auditing the same ground).
+6. **Two-state test suite verification** (for the test-isolation discipline candidate): run `.venv/bin/pytest` under both `BILLING_ENABLED=true` and `BILLING_ENABLED=false` in `backend/.env`. Invariant: **zero failures** in either state. Any test that fails under either state without being properly isolated (either explicit `patch.object(settings, ...)` for runtime-path tests or `pytest.mark.skipif(...)` for feature-gated tests) is a chassis-discipline violation. See `doc/operations/testing.md §Test isolation from env state`. Extend this pattern to any other chassis feature flag introduced by the audit.
 
 ## Out of scope
 

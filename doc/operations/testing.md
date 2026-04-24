@@ -31,6 +31,74 @@ A chassis API-shape change (response envelope, error-code split, endpoint rename
 
 Origin: 0021 Phase 2 smoke battery on 2026-04-23 failed on `smoke_auth` + `smoke_verify_email` because ticket 0016.6's envelope change (`/auth/me` → `{user, expires_in}`) updated layers 1, 2, and 4 but missed layer 3. Retroactive fix landed in commit `59b0b04`. Future chassis-shape tickets must audit all four layers explicitly in their Acceptance section.
 
+### Test isolation from env state
+
+Tests must never rely on `.env` defaults. Any test whose behavior depends on a `Settings` value must explicitly control that value. Two patterns, selected by **how the tested code reads the setting**:
+
+#### Pattern 1 — Runtime-path tests (explicit patch)
+
+**When:** the tested code re-reads `settings.X` on each request (e.g., a FastAPI handler that checks `if settings.BILLING_ENABLED:` inside its body, or a dependency that evaluates per-request).
+
+**How:** `patch.object(settings, "X", ...)` inside the test scope.
+
+```python
+async def test_register_skips_billing_hook_when_disabled(client):
+    from app.config import settings
+    with patch.object(settings, "BILLING_ENABLED", False):
+        resp = await client.post("/auth/register", json={...})
+    # assertions — the register handler re-reads settings.BILLING_ENABLED
+    # per request, so the patch is effective for the duration of the call.
+```
+
+**Why this works:** the runtime code re-reads settings on every request. The patch is active for the duration of the `with` block, covering the request.
+
+#### Pattern 2 — Feature-gated tests (skipif)
+
+**When:** the tested code made its decision at module-import time (e.g., `main.py` conditionally mounting routes with `if settings.BILLING_ENABLED: app.include_router(...)`).
+
+**How:** `pytest.mark.skipif` — module-level `pytestmark` for file-wide gating, per-test decorator for mixed files.
+
+```python
+# at the top of test_billing_topup.py — gates every test in the file
+import pytest
+from app.config import settings
+
+pytestmark = pytest.mark.skipif(
+    not settings.BILLING_ENABLED,
+    reason="requires BILLING_ENABLED=true — feature-gated at app-init time",
+)
+```
+
+**Why patching doesn't work here:** routes are baked into the FastAPI app instance when `app.include_router(...)` runs — at module-import time, once. Patching `settings.X` mid-test can't retroactively add or remove a route. Skipif declares honestly that this test exercises a feature and is meaningless without it.
+
+#### How to decide which pattern
+
+Ask: **when does the code consult the setting?**
+
+- Per-request (inside a function body that runs per request, inside a dependency): **Pattern 1 (patch)**.
+- At app-init / module-import / decorator arguments / class-level defaults: **Pattern 2 (skipif)**.
+
+If unsure, check the actual call site. `settings.X` inside a function body → Pattern 1. `settings.X` at module top-level → Pattern 2. New test files for entirely feature-gated subsystems should start with a module-level `pytestmark` from the first line.
+
+#### Two-state verification
+
+A robust chassis passes the suite under **both** env states:
+
+```bash
+# With the feature flag enabled
+BILLING_ENABLED=true in .env  → pytest: full suite green, 0 skipped
+# With the feature flag disabled
+BILLING_ENABLED=false in .env → pytest: 0 failed, feature-gated tests skipped
+```
+
+The invariant is **zero failures** in either state. Skipped tests (with clear `reason=...`) are acceptable and expected under Pattern 2.
+
+This is a standard check for `doc/issues/0018-chassis-hardening-audit.md` sweeps — run the suite under both states and verify the invariant.
+
+#### Origin
+
+Pattern formalized in ticket 0023.1 during 0023 PAYG topup development (2026-04-23). A naive "force `BILLING_ENABLED=true` via session-scoped autouse fixture" pattern was considered and rejected: it lies about env state, requires global Stripe mocking, and has larger blast radius than declarative skipif. See `doc/issues/0023.1-test-isolation-fixes.md` for the full Kind-1 vs Kind-2 analysis.
+
 ---
 
 ## Local tier
