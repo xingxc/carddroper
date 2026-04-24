@@ -16,9 +16,12 @@ function BrandMark() {
   );
 }
 
-export function AppSidebar() {
+export function AppSidebar({ drawerOpen }: { drawerOpen: boolean }) {
   return (
-    <aside className="fixed inset-y-0 left-0 w-16 z-20 flex flex-col items-center justify-between py-4 bg-gray-50 border-r border-gray-200">
+    <aside
+      id="app-sidebar"
+      className={`fixed inset-y-0 left-0 w-16 z-30 flex flex-col items-center justify-between py-4 bg-gray-50 border-r border-gray-200 transition-transform duration-200 ease-in-out md:translate-x-0 ${drawerOpen ? "translate-x-0" : "-translate-x-full"}`}
+    >
       <BrandMark />
       {/* Middle spacer — future feature icons slot here */}
       <div className="flex-1" />
