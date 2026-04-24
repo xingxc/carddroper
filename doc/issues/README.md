@@ -74,3 +74,4 @@ The Verification section exists because "tsc passes" and "lint passes" are neces
 | 0022 | app-shell refactor (chassis) — left-rail sidebar + profile popover menu | resolved | medium |
 | 0023 | PAYG topup (chassis) — /billing/topup + /billing/balance + PaymentElement TopupForm | open | medium |
 | 0023.1 | test isolation fixes — Kind-1 patch + Kind-2 skipif for billing tests | resolved | low |
+| 0023.2 | webhook dedup concurrency — atomic INSERT … ON CONFLICT replaces SELECT-then-INSERT | open | medium |
