@@ -80,6 +80,15 @@ export function ProfileMenu() {
           </Link>
 
           <Link
+            href="/app/subscribe"
+            role="menuitem"
+            onClick={() => setOpen(false)}
+            className="block px-4 py-2 text-sm text-gray-700 hover:bg-gray-100"
+          >
+            Subscription
+          </Link>
+
+          <Link
             href="/app/change-email"
             role="menuitem"
             onClick={() => setOpen(false)}
