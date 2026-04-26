@@ -6,11 +6,13 @@ GET  /billing/balance      — Return current balance for the authenticated user
 POST /billing/setup-intent — Create Stripe SetupIntent for collecting a payment method.
 POST /billing/subscribe    — Create a Stripe Subscription for the authenticated user.
 GET  /billing/subscription — Return current subscription state for the authenticated user.
+GET  /billing/tiers        — Return enriched tier envelopes for the given lookup_keys (CSV).
 
 Note: do NOT add `from __future__ import annotations` — it breaks FastAPI's
 Pydantic body-type resolution at runtime.
 """
 
+import asyncio
 import logging
 import time
 from datetime import datetime, timezone
@@ -25,7 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.billing.handlers.subscription  # noqa: F401 — registers 5 subscription/invoice events
 import app.billing.handlers.topup  # noqa: F401 — registers payment_intent.succeeded handler
-from app.billing import create_customer, format_balance, get_balance_micros
+from app.billing import create_customer, format_balance, format_price, get_balance_micros
 from app.billing.handlers import EVENT_HANDLERS
 from app.billing.stripe_client import init_stripe, stripe
 from app.config import settings
@@ -85,6 +87,18 @@ class SubscriptionResponse(BaseModel):
     status: Optional[str] = None
     current_period_end: Optional[datetime] = None
     cancel_at_period_end: bool = False
+
+
+class TierEnvelope(BaseModel):
+    lookup_key: str
+    tier_name: str
+    description: Optional[str] = None
+    price_display: str
+    amount_cents: int
+    currency: str
+    interval: str
+    interval_count: int
+    grant_micros: int
 
 
 # ---------------------------------------------------------------------------
@@ -454,3 +468,108 @@ async def get_subscription(
         current_period_end=row.current_period_end,
         cancel_at_period_end=row.cancel_at_period_end,
     )
+
+
+@router.get("/tiers", response_model=list[TierEnvelope])
+async def list_tiers(
+    lookup_keys: str = "",
+    user=Depends(get_current_user),
+) -> list[TierEnvelope]:
+    """Return enriched tier envelopes for the requested Stripe Price lookup_keys.
+
+    lookup_keys: comma-separated list of Stripe Price lookup_keys.
+    Empty or absent param returns an empty list (chassis no-op for projects
+    that don't surface subscriptions).
+
+    Authed only (not verified-gated) — matches GET /billing/subscription.
+
+    For each Price returned by Stripe:
+    - If metadata.tier_name or metadata.grant_micros is missing, the tier is
+      skipped and a structured warning is logged.
+    - If the Price currency is not USD, a warning is logged; the tier is still
+      returned with a "$" prefix (chassis USD-only policy for v1).
+
+    Response preserves the input order of lookup_keys.
+    """
+    init_stripe()
+
+    keys = [k.strip() for k in lookup_keys.split(",") if k.strip()]
+    if not keys:
+        return []
+
+    prices_result = await asyncio.to_thread(
+        stripe.Price.list,
+        lookup_keys=keys,
+        active=True,
+        expand=["data.product"],
+        limit=100,
+    )
+
+    raw_prices = prices_result.data if hasattr(prices_result, "data") else []
+
+    envelopes: list[TierEnvelope] = []
+    for price in raw_prices:
+        metadata = getattr(price, "metadata", None) or {}
+
+        # Soft skip — missing required metadata makes this tier unsubscribable anyway.
+        try:
+            tier_name = metadata["tier_name"]
+        except KeyError:
+            logger.warning(
+                "tiers_skip_missing_metadata",
+                extra={"lookup_key": getattr(price, "lookup_key", None), "missing": "tier_name"},
+            )
+            continue
+
+        try:
+            grant_micros = int(metadata["grant_micros"])
+        except (KeyError, ValueError, TypeError) as exc:
+            logger.warning(
+                "tiers_skip_missing_metadata",
+                extra={"lookup_key": getattr(price, "lookup_key", None), "missing": str(exc)},
+            )
+            continue
+
+        currency = getattr(price, "currency", "usd") or "usd"
+        if currency.lower() != "usd":
+            logger.warning(
+                "tiers_non_usd_currency",
+                extra={"lookup_key": getattr(price, "lookup_key", None), "currency": currency},
+            )
+
+        recurring = getattr(price, "recurring", None) or {}
+        if hasattr(recurring, "get"):
+            interval = recurring.get("interval", "month")
+            interval_count = recurring.get("interval_count", 1)
+        else:
+            interval = getattr(recurring, "interval", "month")
+            interval_count = getattr(recurring, "interval_count", 1)
+
+        # Product description: Price.product is expanded to the full Product object.
+        product = getattr(price, "product", None)
+        description: Optional[str] = None
+        if product is not None:
+            description = getattr(product, "description", None) or None
+
+        envelopes.append(
+            TierEnvelope(
+                lookup_key=getattr(price, "lookup_key", ""),
+                tier_name=tier_name,
+                description=description,
+                price_display=format_price(
+                    getattr(price, "unit_amount", 0) or 0,
+                    currency,
+                    interval,
+                    interval_count,
+                ),
+                amount_cents=getattr(price, "unit_amount", 0) or 0,
+                currency=currency,
+                interval=interval,
+                interval_count=interval_count,
+                grant_micros=grant_micros,
+            )
+        )
+
+    # Preserve input order — Stripe does not guarantee ordering.
+    by_key = {e.lookup_key: e for e in envelopes}
+    return [by_key[k] for k in keys if k in by_key]

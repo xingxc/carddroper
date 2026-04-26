@@ -152,6 +152,14 @@ Chassis does not hardcode tier count, prices, or grant amounts. A one-tier or
 ten-tier structure works identically. Adding/removing/renaming/repricing tiers
 is a Stripe Dashboard action, not a chassis migration.
 
+**Runtime resolution via `GET /billing/tiers`.** The chassis pulls `tier_name`,
+`grant_micros`, and `Product.description` at request time via `GET /billing/tiers`.
+Project layer supplies only a list of `lookup_keys`; the chassis calls
+`stripe.Price.list(lookup_keys=..., active=True, expand=["data.product"])` in a
+single round-trip and formats display strings via `format_price()`. Stripe
+Dashboard becomes the single source of truth for tier name, description, price,
+currency, interval, and grant amount — no code change required when prices change.
+
 **Monthly-only in v1.** The schema supports any interval (Stripe drives
 `current_period_start`/`end` from the Price's `recurring.interval`), but the
 chassis hasn't been exercised against annual/weekly intervals. Chassis code is
@@ -306,6 +314,14 @@ async def debit(
 
 def format_balance(micros: int) -> str:
     """Chassis display policy: '$1.23' or '$0.0034'."""
+
+def format_price(amount_cents: int, currency: str, interval: str, interval_count: int = 1) -> str:
+    """Format a Stripe Price as a human-readable display string.
+
+    Examples: '$9.99/month', '$10/month', '$99/year', '$15 every 3 months'.
+    Whole-dollar amounts render without decimals. interval_count > 1 uses 'every N <interval>s' form.
+    USD-only per chassis BILLING_CURRENCY for v1; non-USD logs warning and uses '$' prefix fallback.
+    """
 ```
 
 Projects **never write to `balance_ledger` directly** — always go through these
@@ -319,6 +335,7 @@ vocabulary, idempotency).
 - `POST /billing/topup` — returns Stripe `client_secret`. Verified user only.
 - `POST /billing/subscribe` — creates subscription. Verified user only. Rate-limited.
 - `GET /billing/subscription` — returns subscription state `{has_subscription, tier_key, tier_name, status, current_period_end, cancel_at_period_end}`. Authed (not verified-gated).
+- `GET /billing/tiers` — returns enriched `TierEnvelope[]` for a CSV `lookup_keys` query param. Calls `stripe.Price.list(lookup_keys=..., active=True, expand=["data.product"])` in one round-trip. Prices missing required metadata are silently skipped. Non-USD logs warning; `$` prefix used as fallback. Response order matches input order. Authed (not verified-gated).
 - `POST /billing/portal-session` — returns Stripe Customer Portal URL. Authed.
 - `POST /billing/webhook` — Stripe webhook handler. Signature-verified; no auth dep.
 
