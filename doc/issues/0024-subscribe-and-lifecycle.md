@@ -113,7 +113,7 @@ Read `doc/systems/payments.md §Subscription tier contract`, `§Flows items 4–
 
 **1. Alembic migration — `subscriptions` table:**
 
-Schema exactly per `payments.md §Data model`. Index on `user_id` (UNIQUE), `stripe_subscription_id` (UNIQUE).
+Schema per `payments.md §Data model` **plus a `tier_name VARCHAR(64) NOT NULL` column** (audit finding 2026-04-26: payments.md schema lacks `tier_name` but the chassis response shape needs it; chosen pragmatic fix is to store it on subscribe and sync on update, avoiding a Stripe API call on every `GET /billing/subscription`). Update `payments.md §Data model` in the same commit chain (per Phase 0a item 14). Index on `user_id` (UNIQUE), `stripe_subscription_id` (UNIQUE).
 
 **2. SQLAlchemy model — `backend/app/models/subscription.py`:**
 
@@ -124,8 +124,9 @@ class Subscription(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), unique=True, index=True)
     stripe_subscription_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     stripe_price_id: Mapped[str] = mapped_column(String(64))
-    tier_key: Mapped[str] = mapped_column(String(64))
-    status: Mapped[str] = mapped_column(String(32))  # trialing | active | past_due | cancelled | incomplete
+    tier_key: Mapped[str] = mapped_column(String(64))                      # Stripe Price.lookup_key
+    tier_name: Mapped[str] = mapped_column(String(64))                     # mirrored from Price.metadata.tier_name at subscribe + on update
+    status: Mapped[str] = mapped_column(String(32))                        # trialing | active | past_due | cancelled | incomplete
     grant_micros: Mapped[int] = mapped_column(BigInteger)
     current_period_start: Mapped[datetime | None]
     current_period_end: Mapped[datetime | None]
@@ -133,6 +134,8 @@ class Subscription(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 ```
+
+`handle_subscription_created` writes `tier_name`; `handle_subscription_updated` re-reads `metadata.tier_name` from the new Price (in case of plan change) and updates the row.
 
 **3. GrantReason enum extensions — `backend/app/billing/reason.py` (or wherever the enum lives):**
 
@@ -289,9 +292,10 @@ Expand the Billing section:
 
 **14. Update `doc/systems/payments.md`:**
 
-Two small additions in the same commit:
+Three small additions in the same commit:
 - Add `POST /billing/setup-intent` to the §Chassis-exposed HTTP endpoints list.
 - In §Reason vocabulary, document the v1 simplification for `subscription_reset` (just adds `+grant_micros` per renewal; doesn't yet zero remaining prior-period grant — described as a future hardening, similar to the cancel-at-period-end-vs-immediate distinction).
+- In §Data model, add a `tier_name VARCHAR(64) NOT NULL` column to the `subscriptions` schema (mirrors `Price.metadata.tier_name` at subscribe + on update; see Phase 0a item 1). Note inline that mirroring avoids a Stripe API call per `GET /billing/subscription`.
 
 **PAUSE-and-report conditions (Phase 0a):**
 
