@@ -96,6 +96,7 @@ steps:
       - carddroper-frontend
       - --image=us-west1-docker.pkg.dev/$PROJECT_ID/carddroper-repo/frontend:$SHORT_SHA
       - --region=us-west1
+      - --service-account=carddroper-frontend-runtime@carddroper-staging.iam.gserviceaccount.com
       - --min-instances=0
       - --max-instances=3
       - --allow-unauthenticated
