@@ -1,7 +1,7 @@
 ---
 id: 0018
 title: chassis-hardening audit — find missing validators, grow chassis-contract.md
-status: open (unblocked 2026-04-25)
+status: resolved
 priority: medium
 found_by: 0015.5 landing the first chassis contract entry (CORS) + Option C coupling rule in CLAUDE.md
 ---
@@ -112,4 +112,83 @@ When executed:
 
 ## Resolution
 
-*(filled in on close)*
+Landed 2026-04-25 across two commits (backend-builder dispatch). **15/15 candidates classified, none paused, working tree clean.**
+
+| Commit | What |
+|---|---|
+| `9fff122` | feat — 4 new validators (`validate_jwt_secret`, `validate_jwt_issuer_audience`, `validate_database_url`, `validate_sendgrid_production`); `extra="ignore"` → `extra="forbid"`; 6 new `chassis-contract.md` entries; 16 new validator tests across 5 test classes; `conftest.py` adds `SENDGRID_SANDBOX=true` so the new SendGrid validator doesn't trip during test boot. |
+| `0bec069` | docs — `development.md` gains "NEXT_PUBLIC_* four-file checklist" + "NEXT_PUBLIC_* runtime debugging" sections; `site-model.md` gains "Route-group URL convention" section. |
+
+**Candidate classification (15/15):**
+
+| Action | Count | Candidates |
+|---|---|---|
+| validator-added | 5 | `JWT_SECRET`, `JWT_ISSUER`/`JWT_AUDIENCE`, `DATABASE_URL`, `SENDGRID_API_KEY` (within `validate_sendgrid_production`), `SENDGRID_TEMPLATE_*` (same validator) |
+| `extra="forbid"` flip | 1 | every env var the chassis reads is a declared `Settings` field |
+| contract-entry-only (no code) | 1 | token-version-bump-and-cookie-clear pattern (classification table in chassis-contract.md) |
+| no-action-with-rationale | 3 | `FROM_EMAIL`/`FROM_NAME`, Cookie `secure` flag, rate-limit settings (inline comments in `config.py`) |
+| doc-added | 3 | NEXT_PUBLIC four-file invariant, route-group URL gotcha, `printenv` meaningless |
+| no-violations-found (sweep) | 1 | Test-suite Kind-1/Kind-2 |
+| deferred-to-user | 1 | GCP IAM (gcloud checklist below) |
+
+**Test sweep result (notable):** zero Kind-1/Kind-2 violations across all 10 backend test files (`test_auth_flow.py`, `test_billing_foundation.py`, `test_billing_topup.py`, `test_client_ip.py`, `test_exception_handler.py`, `test_jwt_claims.py`, `test_settings_validator.py`, `services/test_auth_service.py`, `services/test_email_service.py`). The discipline established in 0023.1 was already followed across the suite — this sweep simply confirmed and codified it.
+
+**Two-state pytest:**
+- `BILLING_ENABLED=true`: 126 passed in 28.02s
+- `BILLING_ENABLED=false`: 105 passed, 21 skipped (test_billing_topup.py module-level skipif), 0 failed in 19.62s
+
+**ruff:** `ruff check .` clean; `ruff format --check .` clean (one pre-existing format drift in `scripts/smoke_auth.py`, out of scope).
+
+**`extra="forbid"` env-var-surface check:** clean. All 17 env vars set by `cloudbuild.yaml` (10 secrets + 7 plain) match declared `Settings` fields exactly. No PAUSE.
+
+**Route-group URL audit:** all `(app)/*` pages already correctly placed at `(app)/app/<path>/page.tsx`. No misnamed pages, no frontend code changes needed, no PAUSE.
+
+**Surprising finding — change-email is partially implemented.** The token-version-bump grep found `POST /auth/confirm-email-change` at `auth.py:682` (classified "no session — reached via email link; session self-invalidates on next request via tv mismatch"). 0017 was never ticketed but the endpoint exists. The chassis-contract entry now classifies it correctly; if and when a formal change-email ticket lands, it adds rows for any missing endpoints (e.g., `PUT /auth/email`) by following the codified rule.
+
+**Deviations from §Approach (4, all justified):**
+
+1. **`SENDGRID_API_KEY` validator scope tightened.** Ticket said "required when `SENDGRID_SANDBOX=false`." Implementation requires sandbox=false **AND** key non-empty. Empty key with sandbox=false is the canonical local dev preview-link mode (per `.env.example`); requiring a key in all sandbox=false cases would break local dev.
+2. **`FROM_EMAIL`/`FROM_NAME` not validated.** Misconfiguration manifests as a SendGrid bounce (visible in delivery logs), not a silent failure. Inline rationale comment added to `config.py` instead.
+3. **`COOKIE_SECURE` not validated.** Default is `True` (the safe direction); flipping to `False` is a deliberate human choice, not a typo, and no startup check can distinguish "prod with secure=False" from "local dev with secure=False." Inline rationale comment added.
+4. **Local `backend/.env` flipped to `SENDGRID_SANDBOX=true`** because the user's local file has a real API key but no template IDs configured — would now fail the new validator. Local-only change (file is gitignored); `.env.example` already passes the validator (empty key → preview mode).
+
+## Follow-ups (deferred to user)
+
+**1. GCP IAM (default compute SA) — gcloud checklist** (per §Approach step 9):
+
+```bash
+PROJECT=carddroper-staging
+PROJECT_NUMBER=$(gcloud projects describe $PROJECT --format='value(projectNumber)')
+
+# Verify dependencies on the default compute SA
+gcloud run services list --project=$PROJECT \
+  --format='table(metadata.name,spec.template.spec.serviceAccountName)'
+gcloud functions list --project=$PROJECT 2>/dev/null || echo "No Cloud Functions"
+gcloud scheduler jobs list --project=$PROJECT 2>/dev/null || echo "No Scheduler jobs"
+gcloud run jobs list --project=$PROJECT 2>/dev/null || echo "No Cloud Run Jobs"
+
+# Option A — downgrade (least-privilege; SA still exists)
+gcloud projects remove-iam-policy-binding $PROJECT \
+  --member="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
+  --role="roles/editor"
+
+# Option B — delete (GCP recreates on demand)
+gcloud iam service-accounts delete \
+  ${PROJECT_NUMBER}-compute@developer.gserviceaccount.com --project=$PROJECT
+```
+
+**Caveat — frontend SA dependency.** The Cloud Run frontend deploy step in `cloudbuild.yaml` does NOT pass `--service-account`, so it defaults to the default compute SA. If choosing Option B (delete), first add `--service-account=carddroper-runtime@carddroper-staging.iam.gserviceaccount.com` (or a dedicated frontend SA) to step 7 of `cloudbuild.yaml` and redeploy. If choosing Option A (downgrade), the frontend may break on next deploy if the downgraded role lacks Cloud Run runtime permissions — verify `roles/viewer` is sufficient or assign an explicit runtime SA first.
+
+Apply the same audit to `carddroper-prod` when prod stands up (PLAN.md §10.7).
+
+**2. `scripts/smoke_auth.py` ruff format drift.** Pre-existing minor formatting issue surfaced during the audit's ruff check. Out of scope for 0018 but worth a 30-second cleanup commit when convenient.
+
+**3. Optional: retroactive 0017 ticket** documenting the existing `POST /auth/confirm-email-change` implementation (and any companion endpoints like `PUT /auth/email`) for completeness, since the chassis-contract entry now references the classification but no ticket file exists.
+
+## Chassis outcomes
+
+- **Boot-time fail-loud guarantees** for `JWT_SECRET`, `JWT_ISSUER`/`JWT_AUDIENCE`, `DATABASE_URL`, `SENDGRID_TEMPLATE_*` (when production-mode), and unknown env vars (`extra="forbid"`).
+- **Chassis-contract.md** is now the authoritative 1:1 mirror of every chassis invariant; the coupling rule from `CLAUDE.md` is fully enforced.
+- **Test discipline:** Kind-1 / Kind-2 isolation pattern is now the documented contract; future tests start from this discipline by default.
+- **Adopter onboarding:** the three NEXT_PUBLIC gotchas from 0023 rollout are codified in `development.md` so adopters don't lose 30 minutes per gotcha.
+- **Frontend chassis discipline:** the route-group URL convention is documented in `site-model.md` so future page additions don't repeat the `/app/billing` 404 mistake.
