@@ -7,13 +7,21 @@ from urllib.parse import urlparse
 from pydantic import SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Minimum JWT_SECRET length (chars). 32 bytes of entropy from secrets.token_urlsafe(48) gives
+# 64 chars; 32 chars is the absolute floor to prevent trivially-brute-forceable secrets.
+_JWT_SECRET_MIN_LEN = 32
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=True,
-        extra="ignore",
+        # extra="forbid" — every env var the chassis reads must be a declared
+        # field on Settings. Unknown variables raise at startup rather than
+        # being silently dropped. Prevents typo-silent-fallback bugs (e.g.
+        # FRONTEND_URL= being ignored because the real field is FRONTEND_BASE_URL).
+        extra="forbid",
     )
 
     # Database
@@ -21,14 +29,18 @@ class Settings(BaseSettings):
 
     # JWT
     JWT_SECRET: str
-    JWT_ALGORITHM: str = "HS256"
-    JWT_EXPIRATION_MINUTES: int = 15
-    REFRESH_TOKEN_DAYS: int = 7
+    JWT_ALGORITHM: str = (
+        "HS256"  # deliberately un-validated: safe default; alg is library-constrained
+    )
+    JWT_EXPIRATION_MINUTES: int = 15  # deliberately un-validated: purely product-tunable
+    REFRESH_TOKEN_DAYS: int = 7  # deliberately un-validated: purely product-tunable
     JWT_ISSUER: str = "carddroper"
     JWT_AUDIENCE: str = "carddroper-api"
 
     # Auth cookies
-    COOKIE_SECURE: bool = True
+    COOKIE_SECURE: bool = (
+        True  # deliberately un-validated: True is the safe default; False is valid for local dev
+    )
     COOKIE_DOMAIN: Optional[str] = None
 
     # CORS — CSV string, exposed as list via `cors_origins_list`
@@ -46,6 +58,71 @@ class Settings(BaseSettings):
     @property
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]
+
+    @model_validator(mode="after")
+    def validate_jwt_secret(self) -> "Settings":
+        """Refuse to construct when JWT_SECRET is empty or shorter than _JWT_SECRET_MIN_LEN.
+
+        A missing or trivially-short secret makes every JWT produced by this service
+        trivially forgeable. Failing loudly at startup surfaces the misconfiguration
+        before any user touches auth. Generate with:
+            python -c "import secrets; print(secrets.token_urlsafe(48))"
+        """
+        secret = self.JWT_SECRET
+        if not secret:
+            raise ValueError(
+                "JWT misconfiguration: JWT_SECRET is empty.\n"
+                "Set JWT_SECRET to a random string of at least 32 characters.\n"
+                'Generate with: python -c "import secrets; print(secrets.token_urlsafe(48))"'
+            )
+        if len(secret) < _JWT_SECRET_MIN_LEN:
+            raise ValueError(
+                f"JWT misconfiguration: JWT_SECRET is {len(secret)} characters; minimum is {_JWT_SECRET_MIN_LEN}.\n"
+                "A short secret makes JWTs trivially forgeable.\n"
+                'Generate with: python -c "import secrets; print(secrets.token_urlsafe(48))"'
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_jwt_issuer_audience(self) -> "Settings":
+        """Refuse to construct when JWT_ISSUER or JWT_AUDIENCE are empty strings.
+
+        Tokens minted without iss/aud are rejected by the decoder, but the error
+        only surfaces at the first authenticated request. Failing at startup is
+        cheaper and more informative.
+        """
+        if not self.JWT_ISSUER:
+            raise ValueError(
+                "JWT misconfiguration: JWT_ISSUER is empty.\n"
+                "Set JWT_ISSUER to a non-empty string (e.g. 'carddroper').\n"
+                "Tokens minted with an empty issuer will be rejected by the decoder."
+            )
+        if not self.JWT_AUDIENCE:
+            raise ValueError(
+                "JWT misconfiguration: JWT_AUDIENCE is empty.\n"
+                "Set JWT_AUDIENCE to a non-empty string (e.g. 'carddroper-api').\n"
+                "Tokens minted with an empty audience will be rejected by the decoder."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_database_url(self) -> "Settings":
+        """Refuse to construct when DATABASE_URL does not use the asyncpg driver prefix.
+
+        SQLAlchemy's async engine requires 'postgresql+asyncpg://'. A plain
+        'postgresql://' or 'postgres://' URL causes a 'Could not load backend'
+        error at first DB operation rather than at startup. Failing loudly at
+        startup is cheaper and provides a clearer error message.
+        """
+        url = self.DATABASE_URL
+        if not url.startswith("postgresql+asyncpg://"):
+            raise ValueError(
+                f"Database misconfiguration: DATABASE_URL must begin with 'postgresql+asyncpg://'.\n"
+                f"Got: {url[:40]}{'...' if len(url) > 40 else ''}\n"
+                "The async SQLAlchemy engine requires the asyncpg driver prefix.\n"
+                "Example: DATABASE_URL=postgresql+asyncpg://user:pass@host/dbname"
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_cors_origins(self) -> "Settings":
@@ -101,6 +178,8 @@ class Settings(BaseSettings):
         return self
 
     # Rate limits (slowapi strings, per-IP)
+    # Deliberately un-validated: these are purely product-tunable; safe defaults exist;
+    # no startup-time check can determine what "non-zero" means for slowapi strings.
     REGISTER_RATE_LIMIT: str = "3/minute"
     LOGIN_RATE_LIMIT: str = "5/minute"
     REFRESH_RATE_LIMIT: str = "10/minute"
@@ -113,15 +192,18 @@ class Settings(BaseSettings):
     TOPUP_RATE_LIMIT: str = "10/minute"
 
     # Per-account login lockout (independent of per-IP)
+    # Deliberately un-validated: purely product-tunable; all have safe non-zero defaults.
     LOCKOUT_THRESHOLD: int = 10
     LOCKOUT_WINDOW_MINUTES: int = 15
     LOCKOUT_DURATION_MINUTES: int = 15
 
     # Password policy
+    # Deliberately un-validated: purely product-tunable; safe defaults exist.
     PASSWORD_MIN_LENGTH: int = 10
     HIBP_ENABLED: bool = True
 
     # Token lifetimes
+    # Deliberately un-validated: purely product-tunable; safe defaults exist.
     PASSWORD_RESET_EXPIRY_MINUTES: int = 15
     EMAIL_VERIFY_EXPIRY_HOURS: int = 24
     EMAIL_CHANGE_EXPIRY_HOURS: int = 1
@@ -132,12 +214,12 @@ class Settings(BaseSettings):
 
     # Billing chassis
     BILLING_ENABLED: bool = False
-    BILLING_CURRENCY: Literal["usd"] = "usd"
-    BILLING_TOPUP_MIN_MICROS: int = 500_000
-    BILLING_TOPUP_MAX_MICROS: int = 500_000_000
-    STRIPE_TAX_ENABLED: bool = False
-    BILLING_SIGNUP_BONUS_MICROS: int = 0
-    BILLING_VERIFY_BONUS_MICROS: int = 0
+    BILLING_CURRENCY: Literal["usd"] = "usd"  # deliberately un-validated: only usd supported
+    BILLING_TOPUP_MIN_MICROS: int = 500_000  # deliberately un-validated: purely product-tunable
+    BILLING_TOPUP_MAX_MICROS: int = 500_000_000  # deliberately un-validated: purely product-tunable
+    STRIPE_TAX_ENABLED: bool = False  # deliberately un-validated: purely product-tunable
+    BILLING_SIGNUP_BONUS_MICROS: int = 0  # deliberately un-validated: purely product-tunable
+    BILLING_VERIFY_BONUS_MICROS: int = 0  # deliberately un-validated: purely product-tunable
 
     @model_validator(mode="after")
     def validate_stripe_secret_key(self) -> "Settings":
@@ -179,9 +261,57 @@ class Settings(BaseSettings):
     SENDGRID_TEMPLATE_CHANGE_EMAIL: str = ""
     SENDGRID_TEMPLATE_EMAIL_CHANGED: str = ""
     SENDGRID_TEMPLATE_CREDITS_PURCHASED: str = ""
-    FROM_EMAIL: str = "noreply@carddroper.com"
-    FROM_NAME: str = "Carddroper"
+    FROM_EMAIL: str = "noreply@carddroper.com"  # deliberately un-validated: has-a-safe-default; prod misconfiguration shows as SendGrid bounce, not a startup crash
+    FROM_NAME: str = "Carddroper"  # deliberately un-validated: has-a-safe-default
     FRONTEND_BASE_URL: str = "http://localhost:3000"
+
+    @model_validator(mode="after")
+    def validate_sendgrid_production(self) -> "Settings":
+        """Refuse to construct when SENDGRID_SANDBOX=False, an API key is set, but
+        any required template ID is missing.
+
+        Scope of this validator (three modes):
+
+        - SENDGRID_SANDBOX=True: skip entirely — sandbox mode, no real delivery.
+        - SENDGRID_SANDBOX=False, SENDGRID_API_KEY empty: dev-preview mode (intentional
+          local default). send_email() falls through to a stdout log instead of
+          sending. No validator error — empty key is the documented local dev setup.
+        - SENDGRID_SANDBOX=False, SENDGRID_API_KEY set, any template ID empty: ERROR.
+          The service would attempt real delivery and crash at the first send attempt
+          with ValueError("SENDGRID_TEMPLATE_X is not configured"). Failing at startup
+          is cheaper and clearer than a mid-request crash.
+        """
+        if self.SENDGRID_SANDBOX:
+            return self
+
+        api_key = self.SENDGRID_API_KEY.get_secret_value()
+        if not api_key:
+            # Dev-preview mode: no key → no real sends → no template check needed.
+            return self
+
+        missing_templates = []
+        template_fields = {
+            "SENDGRID_TEMPLATE_VERIFY_EMAIL": self.SENDGRID_TEMPLATE_VERIFY_EMAIL,
+            "SENDGRID_TEMPLATE_RESET_PASSWORD": self.SENDGRID_TEMPLATE_RESET_PASSWORD,
+            "SENDGRID_TEMPLATE_CHANGE_EMAIL": self.SENDGRID_TEMPLATE_CHANGE_EMAIL,
+            "SENDGRID_TEMPLATE_EMAIL_CHANGED": self.SENDGRID_TEMPLATE_EMAIL_CHANGED,
+            "SENDGRID_TEMPLATE_CREDITS_PURCHASED": self.SENDGRID_TEMPLATE_CREDITS_PURCHASED,
+        }
+        for field_name, value in template_fields.items():
+            if not value:
+                missing_templates.append(field_name)
+
+        if missing_templates:
+            raise ValueError(
+                "SendGrid misconfiguration: SENDGRID_SANDBOX=False and SENDGRID_API_KEY is "
+                f"set, but the following template IDs are not set: {', '.join(missing_templates)}.\n"
+                "Missing template IDs cause send_email() to raise ValueError at the first "
+                "email send attempt rather than at startup.\n"
+                "Set each template ID, clear SENDGRID_API_KEY for dev-preview mode, or set "
+                "SENDGRID_SANDBOX=True."
+            )
+
+        return self
 
 
 settings = Settings()

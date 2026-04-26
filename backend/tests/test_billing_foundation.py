@@ -39,6 +39,8 @@ _SETTINGS_BASE = {
     "JWT_SECRET": "a-secret-for-unit-tests-only-not-prod",
     "FRONTEND_BASE_URL": "http://localhost:3000",
     "CORS_ORIGINS": "http://localhost:3000",
+    # SENDGRID_SANDBOX=True prevents validate_sendgrid_production from firing in unit tests.
+    "SENDGRID_SANDBOX": True,
 }
 
 
