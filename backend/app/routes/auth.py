@@ -678,10 +678,12 @@ async def confirm_email_change(
     if conflict_check.scalar_one_or_none() is not None:
         raise conflict("An account with that email already exists.")
 
-    user.email = new_email
-    user.token_version += 1
-    await revoke_all_user_tokens(user.id, db)
-
+    # Send notification to old address BEFORE flipping users.email.
+    # Ordering is critical: if the email is flipped first and the send then
+    # fails, the original owner receives no notification and cannot detect a
+    # silent account takeover. Sending first ensures the canary fires even if
+    # the subsequent DB write succeeds. The send is best-effort (try/except)
+    # so an email delivery failure does not abort the confirm flow.
     try:
         await send_email(
             template=EmailTemplate.EMAIL_CHANGED,
@@ -695,5 +697,9 @@ async def confirm_email_change(
         )
     except Exception:
         logger.exception("email_changed_canary_send_failed", extra={"user_id": user.id})
+
+    user.email = new_email
+    user.token_version += 1
+    await revoke_all_user_tokens(user.id, db)
 
     return {"message": "Email changed. Please log in with your new email."}
