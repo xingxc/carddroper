@@ -126,7 +126,9 @@ def main() -> None:
         if returned_email.lower() != email.lower():
             _fail(f"/auth/me email mismatch: expected {email!r}, got {returned_email!r}")
         if not isinstance(me_body.get("expires_in"), int) or me_body["expires_in"] <= 0:
-            _fail(f"/auth/me envelope missing/invalid expires_in: got {me_body.get('expires_in')!r}")
+            _fail(
+                f"/auth/me envelope missing/invalid expires_in: got {me_body.get('expires_in')!r}"
+            )
 
         # ------------------------------------------------------------------
         # 4. POST /auth/refresh
