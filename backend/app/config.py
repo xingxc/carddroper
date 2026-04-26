@@ -229,6 +229,16 @@ class Settings(BaseSettings):
     # Adopters with credit-based SaaS (gift-card model) flip True; flat-fee SaaS leaves False.
     # See doc/systems/payments.md §Denomination for the two chassis modes.
 
+    BILLING_REQUIRE_VERIFIED: bool = False
+    # deliberately un-validated — chassis-tunable behavior toggle.
+    # When True, POST /billing/topup, /billing/subscribe, /billing/setup-intent
+    # require user.verified_at IS NOT NULL (returns 403 FORBIDDEN).
+    # When False (default), any authed user can transact — matches SaaS-industry
+    # default (Stripe, Shopify, most B2C SaaS). Receipts/notifications still go
+    # to the captured email; deliverability handled by send_email + SendGrid.
+    # Adopters with regulatory or anti-abuse posture flip True to restore the
+    # verified-gate. See doc/systems/payments.md §Verified-gate posture.
+
     @model_validator(mode="after")
     def validate_stripe_secret_key(self) -> "Settings":
         """Refuse to construct when BILLING_ENABLED=True but STRIPE_SECRET_KEY is unset.

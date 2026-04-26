@@ -212,7 +212,7 @@ async def test_topup_endpoint_requires_auth(client):
 
 @pytest.mark.asyncio
 async def test_topup_endpoint_requires_verified(client):
-    """Unverified user → 403 from require_verified."""
+    """Unverified user → 403 when BILLING_REQUIRE_VERIFIED=True (Kind-1 isolation)."""
     from app.config import settings
 
     mock_customer = MagicMock()
@@ -231,6 +231,7 @@ async def test_topup_endpoint_requires_verified(client):
 
     with (
         patch.object(settings, "BILLING_ENABLED", True),
+        patch.object(settings, "BILLING_REQUIRE_VERIFIED", True),
         patch("app.routes.billing.stripe") as mock_stripe,
     ):
         mock_stripe.PaymentIntent.create.return_value = mock_intent
@@ -241,6 +242,45 @@ async def test_topup_endpoint_requires_verified(client):
         )
 
     assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_topup_allows_unverified_user_when_flag_off(client):
+    """Unverified user + BILLING_REQUIRE_VERIFIED=False (default) → 200; chassis is permissive."""
+    from app.config import settings
+
+    mock_customer = MagicMock()
+    mock_customer.id = "cus_unverified_flagoff"
+    mock_intent = MagicMock()
+    mock_intent.client_secret = "pi_secret_flagoff"
+
+    with (
+        patch.object(settings, "BILLING_ENABLED", True),
+        patch("app.billing.primitives.stripe") as _mock_stripe,
+    ):
+        _mock_stripe.Customer.create.return_value = mock_customer
+        reg_resp = await _register_unverified(client, "topup_flagoff@example.com")
+
+    access_token = reg_resp.get("access_token")
+
+    with (
+        patch.object(settings, "BILLING_ENABLED", True),
+        patch.object(settings, "BILLING_REQUIRE_VERIFIED", False),
+        patch("app.routes.billing.stripe") as mock_stripe,
+        patch("app.billing.primitives.stripe") as mock_prim_stripe,
+    ):
+        mock_prim_stripe.Customer.create.return_value = mock_customer
+        mock_stripe.PaymentIntent.create.return_value = mock_intent
+        resp = await client.post(
+            "/billing/topup",
+            json={"amount_micros": 5_000_000},
+            headers=_auth_headers(access_token),
+        )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["client_secret"] == "pi_secret_flagoff"
+    assert body["amount_micros"] == 5_000_000
 
 
 @pytest.mark.asyncio

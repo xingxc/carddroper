@@ -112,6 +112,22 @@ def require_verified(user: User = Depends(get_current_user)) -> User:
     return user
 
 
+def require_billing_user(user: User = Depends(get_current_user)) -> User:
+    """Conditional verified-gate for billing endpoints.
+
+    - When BILLING_REQUIRE_VERIFIED=False (chassis default): any authed user
+      can call billing mutation endpoints. Permissive posture matches
+      industry-standard SaaS UX (let people pay without friction).
+    - When BILLING_REQUIRE_VERIFIED=True: unverified users get 403 FORBIDDEN —
+      restores the legacy chassis behavior for adopters with stricter posture
+      needs. Error format is identical to require_verified so existing frontend
+      error-mapping (TopupForm + SubscribeForm 403 handlers) continues to work.
+    """
+    if settings.BILLING_REQUIRE_VERIFIED and user.verified_at is None:
+        raise forbidden("Please verify your email before taking this action.")
+    return user
+
+
 def require_not_locked(user: User = Depends(get_current_user)) -> User:
     """Block unverified users past the 7-day grace window from most endpoints.
 

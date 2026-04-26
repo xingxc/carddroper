@@ -312,7 +312,7 @@ async def test_setup_intent_requires_auth(client):
 
 @pytest.mark.asyncio
 async def test_setup_intent_requires_verified(client):
-    """Unverified user → 403."""
+    """Unverified user → 403 when BILLING_REQUIRE_VERIFIED=True (Kind-1 isolation)."""
     mock_customer = MagicMock()
     mock_customer.id = "cus_unverified"
 
@@ -325,13 +325,51 @@ async def test_setup_intent_requires_verified(client):
 
     access_token = reg_resp.get("access_token")
 
-    with patch.object(settings, "BILLING_ENABLED", True):
+    with (
+        patch.object(settings, "BILLING_ENABLED", True),
+        patch.object(settings, "BILLING_REQUIRE_VERIFIED", True),
+    ):
         resp = await client.post(
             "/billing/setup-intent",
             headers=_auth_headers(access_token),
         )
 
     assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_setup_intent_allows_unverified_user_when_flag_off(client):
+    """Unverified user + BILLING_REQUIRE_VERIFIED=False (default) → 200; chassis is permissive."""
+    mock_customer = MagicMock()
+    mock_customer.id = "cus_si_unverified_flagoff"
+    mock_si = MagicMock()
+    mock_si.client_secret = "seti_secret_flagoff"
+
+    with (
+        patch.object(settings, "BILLING_ENABLED", True),
+        patch("app.billing.primitives.stripe") as mock_prim_stripe,
+    ):
+        mock_prim_stripe.Customer.create.return_value = mock_customer
+        reg_resp = await _register_unverified(client, "si_flagoff@example.com")
+
+    access_token = reg_resp.get("access_token")
+
+    with (
+        patch.object(settings, "BILLING_ENABLED", True),
+        patch.object(settings, "BILLING_REQUIRE_VERIFIED", False),
+        patch("app.routes.billing.stripe") as mock_stripe,
+        patch("app.billing.primitives.stripe") as mock_prim,
+    ):
+        mock_prim.Customer.create.return_value = mock_customer
+        mock_stripe.SetupIntent.create.return_value = mock_si
+        resp = await client.post(
+            "/billing/setup-intent",
+            headers=_auth_headers(access_token),
+        )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["client_secret"] == "seti_secret_flagoff"
 
 
 @pytest.mark.asyncio
@@ -422,7 +460,7 @@ async def test_setup_intent_lazy_creates_customer(client):
 
 @pytest.mark.asyncio
 async def test_subscribe_requires_verified(client):
-    """Unverified user → 403."""
+    """Unverified user → 403 when BILLING_REQUIRE_VERIFIED=True (Kind-1 isolation)."""
     mock_customer = MagicMock()
     mock_customer.id = "cus_sub_unverified"
 
@@ -435,7 +473,10 @@ async def test_subscribe_requires_verified(client):
 
     access_token = reg_resp.get("access_token")
 
-    with patch.object(settings, "BILLING_ENABLED", True):
+    with (
+        patch.object(settings, "BILLING_ENABLED", True),
+        patch.object(settings, "BILLING_REQUIRE_VERIFIED", True),
+    ):
         resp = await client.post(
             "/billing/subscribe",
             json={"price_lookup_key": "starter_monthly", "payment_method_id": "pm_test"},
@@ -443,6 +484,51 @@ async def test_subscribe_requires_verified(client):
         )
 
     assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_subscribe_allows_unverified_user_when_flag_off(client):
+    """Unverified user + BILLING_REQUIRE_VERIFIED=False (default) → 200; chassis is permissive."""
+    mock_customer = MagicMock()
+    mock_customer.id = "cus_sub_unverified_flagoff"
+
+    with (
+        patch.object(settings, "BILLING_ENABLED", True),
+        patch("app.billing.primitives.stripe") as mock_p,
+    ):
+        mock_p.Customer.create.return_value = mock_customer
+        reg_resp = await _register_unverified(client, "sub_flagoff_unverified@example.com")
+
+    access_token = reg_resp.get("access_token")
+
+    price = _mock_price()
+    mock_prices = MagicMock()
+    mock_prices.data = [price]
+    mock_prices.auto_paging_iter.return_value = iter([price])
+
+    mock_sub = _mock_subscription(sub_id="sub_flagoff_unverified_001", status="active")
+
+    with (
+        patch.object(settings, "BILLING_ENABLED", True),
+        patch.object(settings, "BILLING_REQUIRE_VERIFIED", False),
+        patch("app.routes.billing.stripe") as mock_stripe,
+        patch("app.billing.primitives.stripe") as mock_prim,
+    ):
+        mock_prim.Customer.create.return_value = mock_customer
+        mock_stripe.Price.list.return_value = mock_prices
+        mock_stripe.PaymentMethod.attach.return_value = MagicMock()
+        mock_stripe.Customer.modify.return_value = MagicMock()
+        mock_stripe.Subscription.create.return_value = mock_sub
+        resp = await client.post(
+            "/billing/subscribe",
+            json={"price_lookup_key": "starter_monthly", "payment_method_id": "pm_flagoff"},
+            headers=_auth_headers(access_token),
+        )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["subscription_id"] == "sub_flagoff_unverified_001"
+    assert body["status"] == "active"
 
 
 @pytest.mark.asyncio

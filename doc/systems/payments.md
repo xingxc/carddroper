@@ -190,7 +190,7 @@ Enabling billing later requires a backfill job (create Customers for existing us
 
 `POST /billing/topup { amount_micros }` →
 
-1. Require verified user.
+1. Verified-gate posture (see §Verified-gate posture): permissive by default (`BILLING_REQUIRE_VERIFIED=false`); set `BILLING_REQUIRE_VERIFIED=true` to restore the verified-only gate.
 2. Reject if `amount_micros` outside `[BILLING_TOPUP_MIN_MICROS, BILLING_TOPUP_MAX_MICROS]`.
 3. Create Stripe PaymentIntent for `amount_micros / 10_000` cents on the user's Customer.
 4. Return `{client_secret}` to frontend.
@@ -236,7 +236,7 @@ project-layer actions calling this primitive.
 
 `POST /billing/subscribe { price_lookup_key, payment_method_id }` →
 
-1. Require verified user.
+1. Verified-gate posture (see §Verified-gate posture): permissive by default (`BILLING_REQUIRE_VERIFIED=false`); set `BILLING_REQUIRE_VERIFIED=true` to restore the verified-only gate.
 2. Attach `payment_method_id` to the Customer, set as default.
 3. Resolve Stripe Price from `lookup_key`. Read `metadata.tier_name` (always required). Read `metadata.grant_micros` only when `BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=true` (422 if missing in that mode; ignored when false).
 4. Create Stripe Subscription with `automatic_tax.enabled=STRIPE_TAX_ENABLED`.
@@ -343,6 +343,16 @@ vocabulary, idempotency).
 - `GET /billing/tiers` — returns enriched `TierEnvelope[]` for a CSV `lookup_keys` query param. Calls `stripe.Price.list(lookup_keys=..., active=True, expand=["data.product"])` in one round-trip. Prices missing required metadata are silently skipped. Non-USD logs warning; `$` prefix used as fallback. Response order matches input order. Authed (not verified-gated).
 - `POST /billing/portal-session` — returns Stripe Customer Portal URL. Authed.
 - `POST /billing/webhook` — Stripe webhook handler. Signature-verified; no auth dep.
+
+## Verified-gate posture
+
+**Chassis default: permissive.** As of 0024.3, the three billing mutation endpoints — `POST /billing/topup`, `POST /billing/subscribe`, `POST /billing/setup-intent` — are **not** verified-gated by default. Any authed user can transact in the same session as signup. This matches the SaaS-industry default (Stripe, Shopify, most B2C SaaS) and reduces abandonment at the moment of highest intent.
+
+**Flag: `BILLING_REQUIRE_VERIFIED: bool = False`** (in `backend/app/config.py`). Setting this to `true` restores the verified-only gate on all three endpoints; unverified users receive `403 FORBIDDEN` with message `"Please verify your email before taking this action."` — the same error format produced by the chassis `require_verified` dep, so existing frontend error-mapping requires no change.
+
+**Scope:** the flag applies to the three billing mutation endpoints only. Read endpoints (`GET /billing/balance`, `GET /billing/subscription`, `GET /billing/tiers`) are authed-only and unaffected. The webhook endpoint is Stripe-signature-authenticated and unaffected. Other non-billing verified gates (if any are added in future) are unaffected.
+
+**Receipt-email deliverability:** when the flag is off, the user's email at Stripe checkout is the address captured at signup (`users.email`). If `verified_at IS NULL`, the address may bounce; bounces appear in the SendGrid Activity Feed and are recoverable by admin follow-up. Chargebacks route through Stripe's own dispute workflow; `verified_at` status does not affect chargeback handling.
 
 ## Optional lifecycle bonuses
 

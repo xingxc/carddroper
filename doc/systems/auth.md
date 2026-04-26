@@ -5,7 +5,7 @@
 1. Email + password signup, one user per email.
 2. Short-lived access tokens, longer-lived refresh tokens, secure against XSS and CSRF.
 3. Work identically for web (cookie-first) and mobile (Bearer-first, later).
-4. Email verification required before any paid action.
+4. Email verification before paid actions is chassis-tunable (default: permissive — any authed user can transact). See `BILLING_REQUIRE_VERIFIED` in `doc/systems/payments.md §Verified-gate posture` (0024.3).
 5. Password reset via email with a single-use signed token.
 6. Rate-limited everywhere to prevent abuse.
 
@@ -48,7 +48,7 @@ The token extraction helper reads the cookie first, then falls back to the Autho
 3. Backend decodes, checks `purpose=="verify"`, checks `user.verified_at is NULL`, sets `verified_at = now()`. The session is preserved — `verified_at` is a capability toggle (enabling paid actions post-soft-cap), not a security event. Reset-password and change-email remain session-invalidating (they bump `token_version` and revoke refresh tokens).
 4. A resend endpoint `POST /auth/resend-verification` issues a new token, rate-limited to 3/hour.
 
-**Enforcement:** a `require_verified` FastAPI dependency raises 403 on any endpoint that performs a paid action (credit purchase, subscription, send). Read-only account endpoints (`/auth/me`, `/profile`) remain accessible to unverified users so they can trigger the resend.
+**Enforcement:** a `require_verified` FastAPI dependency raises 403 on any endpoint that performs a paid action (credit purchase, subscription, send). As of 0024.3, billing endpoints use `require_billing_user` instead, which is chassis-tunable: permissive by default (`BILLING_REQUIRE_VERIFIED=false`); set `BILLING_REQUIRE_VERIFIED=true` to restore the verified-only gate. Read-only account endpoints (`/auth/me`, `/profile`) remain accessible to unverified users so they can trigger the resend.
 
 **UX:** after register, the frontend sends the user to `/verify-email-sent` which explains what's happening and provides a "resend" button. Until verified, paid actions in the UI are disabled with a "Please verify your email" banner.
 

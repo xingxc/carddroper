@@ -32,7 +32,7 @@ from app.billing.handlers import EVENT_HANDLERS
 from app.billing.stripe_client import init_stripe, stripe
 from app.config import settings
 from app.database import AsyncSessionLocal, get_db
-from app.dependencies import get_current_user, require_verified
+from app.dependencies import get_current_user, require_billing_user
 from app.errors import conflict, not_found, validation_error
 from app.models.stripe_event import StripeEvent
 from app.models.subscription import Subscription
@@ -177,12 +177,14 @@ async def stripe_webhook(request: Request) -> Response:
 async def topup(
     request: Request,
     body: TopupRequest,
-    user=Depends(require_verified),
+    user=Depends(require_billing_user),
     db: AsyncSession = Depends(get_db),
 ) -> TopupResponse:
     """Create a Stripe PaymentIntent for a PAYG topup.
 
-    Requires a verified user. Validates amount within configured bounds.
+    Uses require_billing_user dep: any authed user can topup by default
+    (BILLING_REQUIRE_VERIFIED=False). Set BILLING_REQUIRE_VERIFIED=True to
+    restore the verified-only gate. Validates amount within configured bounds.
     Lazily creates a Stripe Customer if the user has none. Returns a
     client_secret for the frontend to confirm via Stripe Elements.
     """
@@ -242,13 +244,15 @@ async def balance(
 @router.post("/setup-intent", response_model=SetupIntentResponse)
 async def setup_intent(
     request: Request,
-    user=Depends(require_verified),
+    user=Depends(require_billing_user),
     db: AsyncSession = Depends(get_db),
 ) -> SetupIntentResponse:
     """Create a Stripe SetupIntent for collecting a payment method.
 
-    Requires a verified user. Lazily creates a Stripe Customer if the user
-    has none. Returns a client_secret for the frontend to confirm via Stripe
+    Uses require_billing_user dep: any authed user can create a SetupIntent
+    by default (BILLING_REQUIRE_VERIFIED=False). Set BILLING_REQUIRE_VERIFIED=True
+    to restore the verified-only gate. Lazily creates a Stripe Customer if the
+    user has none. Returns a client_secret for the frontend to confirm via Stripe
     Elements.
 
     Idempotency: one SetupIntent per user per minute (minute-window key).
@@ -278,12 +282,14 @@ async def setup_intent(
 async def subscribe(
     request: Request,
     body: SubscribeRequest,
-    user=Depends(require_verified),
+    user=Depends(require_billing_user),
     db: AsyncSession = Depends(get_db),
 ) -> SubscribeResponse:
     """Create a Stripe Subscription for the authenticated user.
 
-    Requires a verified user. Rate-limited to SUBSCRIBE_RATE_LIMIT per IP.
+    Uses require_billing_user dep: any authed user can subscribe by default
+    (BILLING_REQUIRE_VERIFIED=False). Set BILLING_REQUIRE_VERIFIED=True to
+    restore the verified-only gate. Rate-limited to SUBSCRIBE_RATE_LIMIT per IP.
 
     Steps:
     1. Resolve Stripe Price by lookup_key; read tier metadata.
