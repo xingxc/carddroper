@@ -19,6 +19,12 @@ The immediate symptom was the verification email landing in spam on a Gmail inbo
 
 The fix is several small DNS records on Cloudflare plus a click-through in the SendGrid console. All user-owned — AI agents don't touch DNS or third-party consoles.
 
+### Chassis-reliability stake (updated 2026-04-25)
+
+This ticket is no longer just deliverability hygiene. Ticket 0017 (resolved 2026-04-25) landed the **change-email security canary**: a notification email to the OLD address ("your email was changed") that fires when an email change is confirmed. PLAN.md §6 #8 designates this as the silent-account-takeover detection mechanism — if an attacker briefly compromises an account and changes the email, the original owner's only signal is this notification.
+
+Without SPF/DKIM/DMARC, **the canary itself is spoofable**: an attacker could send a fake "your email was changed" notification (forged FROM `noreply@carddroper.com`) to confuse the original owner into thinking the change was legitimate. DMARC at `p=quarantine` or stronger is what hardens the canary against this spoofing class. 0019 is therefore a load-bearing dependency of 0017's security model, not just a "spam-folder" concern.
+
 ## Scope
 
 **In scope — set up full transactional email authentication on `carddroper.com`:**
@@ -48,6 +54,9 @@ The fix is several small DNS records on Cloudflare plus a click-through in the S
    - After this, SendGrid rewrites click-tracking URLs to use the custom domain instead of `sendgrid.net`, which Gmail rewards with better inbox placement.
 
 5. **Verification test:**
+
+   **Option A — register flow** (single template):
+
    - After all records are green in SendGrid console, trigger a fresh verify email against staging:
      - Register a new `smoke+deliverability-<date>@<your-personal-domain>` account via the `/register` page on `https://staging.carddroper.com` (or via `curl` against `https://api.staging.carddroper.com/auth/register`).
      - Receive the verify-email delivery in your inbox.
@@ -55,6 +64,18 @@ The fix is several small DNS records on Cloudflare plus a click-through in the S
      - Open the email → "Show original" (Gmail) or "View headers" (Outlook / Mail.app).
      - Confirm the headers carry: `SPF: pass (google.com: domain of ...)`; `DKIM: pass (Authentication-Results: ...)`; `DMARC: pass`.
      - Confirm the email lands in the **Primary inbox**, not Spam or Promotions.
+
+   **Option B — change-email flow** (recommended; exercises 2 templates + the security canary in one action; available since 0017.1 landed 2026-04-25):
+
+   - Log in to staging as an existing user.
+   - Profile menu → Change email → submit current password + a new email at a personal domain.
+   - **Inspect the verification email at the new address** (template `SENDGRID_TEMPLATE_CHANGE_EMAIL`) — DKIM/SPF/DMARC headers should all pass; should land in Primary inbox. Click the verification link.
+   - **Inspect the canary email at the OLD address** (template `SENDGRID_TEMPLATE_EMAIL_CHANGED`) — DKIM/SPF/DMARC headers should all pass; should land in Primary inbox. **This is the most important inspection** — the canary is the security mechanism this ticket protects.
+   - Both emails passing all three checks confirms that:
+     1. The chassis sends from the authenticated domain (SPF authorization works).
+     2. SendGrid signs both templates with valid DKIM keys (DKIM passes).
+     3. DMARC alignment between the From header and the SPF/DKIM domains succeeds (DMARC passes).
+     4. The security canary surface is no longer spoofable.
 
 **Out of scope:**
 
@@ -83,10 +104,24 @@ The fix is several small DNS records on Cloudflare plus a click-through in the S
 
 ## Ownership
 
-**User-owned.** AI agents don't access DNS, SendGrid console, or any third-party authentication surface. The orchestrator can help:
+**User-owned. No agent dispatch needed.** AI agents don't access DNS, SendGrid console, or any third-party authentication surface — this ticket is a runbook for the user to execute. The orchestrator's role:
+
 - Interpret "Show original" output if headers are confusing.
 - Suggest record values if something looks off.
-- Update this ticket with resolution details once the user confirms green.
+- Capture the resolution details (DNS records added, SendGrid green-check timestamp, header snippets) once the user confirms green.
+- Update `doc/operations/deployment.md` and `doc/operations/gcp-deployment-tutorial.md` with any new gotchas surfaced during execution.
+
+### `dmarc@<domain>` mailbox setup (recommended)
+
+The DMARC `rua=` address must receive mail or reports go to a black hole. Quickest path with Cloudflare:
+
+1. Cloudflare Dashboard → Email → **Email Routing** → Get Started.
+2. Verify a destination email address (your personal Gmail).
+3. Cloudflare auto-creates the required MX records.
+4. Create a route: `dmarc@carddroper.com` → forward to your verified destination.
+5. DMARC aggregate reports (XML) now land in your inbox. (For human-readable analysis, optionally upload to dmarcian, easyDMARC, or similar — free tiers exist. This step is deferred until the volume is worth automating.)
+
+Without this, `rua=mailto:dmarc@carddroper.com` is a black hole and you won't see whether legitimate mail is failing DMARC during the `p=none` ramp-up week.
 
 ## Report
 
