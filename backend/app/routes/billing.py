@@ -1,8 +1,11 @@
 """Billing routes.
 
-POST /billing/webhook — Stripe webhook receiver (signature-verified, idempotent).
-POST /billing/topup   — Create Stripe PaymentIntent for a PAYG topup.
-GET  /billing/balance — Return current balance for the authenticated user.
+POST /billing/webhook      — Stripe webhook receiver (signature-verified, idempotent).
+POST /billing/topup        — Create Stripe PaymentIntent for a PAYG topup.
+GET  /billing/balance      — Return current balance for the authenticated user.
+POST /billing/setup-intent — Create Stripe SetupIntent for collecting a payment method.
+POST /billing/subscribe    — Create a Stripe Subscription for the authenticated user.
+GET  /billing/subscription — Return current subscription state for the authenticated user.
 
 Note: do NOT add `from __future__ import annotations` — it breaks FastAPI's
 Pydantic body-type resolution at runtime.
@@ -10,13 +13,17 @@ Pydantic body-type resolution at runtime.
 
 import logging
 import time
+from datetime import datetime, timezone
+from typing import Optional
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import app.billing.handlers.subscription  # noqa: F401 — registers 5 subscription/invoice events
 import app.billing.handlers.topup  # noqa: F401 — registers payment_intent.succeeded handler
 from app.billing import create_customer, format_balance, get_balance_micros
 from app.billing.handlers import EVENT_HANDLERS
@@ -24,8 +31,9 @@ from app.billing.stripe_client import init_stripe, stripe
 from app.config import settings
 from app.database import AsyncSessionLocal, get_db
 from app.dependencies import get_current_user, require_verified
-from app.errors import validation_error
+from app.errors import conflict, not_found, validation_error
 from app.models.stripe_event import StripeEvent
+from app.models.subscription import Subscription
 from app.routes.auth import (
     limiter,
 )  # shared limiter instance (known chassis coupling — factor to app/rate_limit.py in 0018 audit)
@@ -52,6 +60,31 @@ class TopupResponse(BaseModel):
 class BalanceResponse(BaseModel):
     balance_micros: int
     formatted: str
+
+
+class SetupIntentResponse(BaseModel):
+    client_secret: str
+
+
+class SubscribeRequest(BaseModel):
+    price_lookup_key: str
+    payment_method_id: str
+
+
+class SubscribeResponse(BaseModel):
+    subscription_id: str
+    status: str
+    requires_action: bool
+    client_secret: Optional[str] = None
+
+
+class SubscriptionResponse(BaseModel):
+    has_subscription: bool
+    tier_key: Optional[str] = None
+    tier_name: Optional[str] = None
+    status: Optional[str] = None
+    current_period_end: Optional[datetime] = None
+    cancel_at_period_end: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -189,4 +222,235 @@ async def balance(
     return BalanceResponse(
         balance_micros=balance_micros,
         formatted=format_balance(balance_micros),
+    )
+
+
+@router.post("/setup-intent", response_model=SetupIntentResponse)
+async def setup_intent(
+    request: Request,
+    user=Depends(require_verified),
+    db: AsyncSession = Depends(get_db),
+) -> SetupIntentResponse:
+    """Create a Stripe SetupIntent for collecting a payment method.
+
+    Requires a verified user. Lazily creates a Stripe Customer if the user
+    has none. Returns a client_secret for the frontend to confirm via Stripe
+    Elements.
+
+    Idempotency: one SetupIntent per user per minute (minute-window key).
+    """
+    init_stripe()
+
+    # Lazy Customer creation.
+    if user.stripe_customer_id is None:
+        customer_id = await create_customer(user, db)
+        user.stripe_customer_id = customer_id
+        await db.flush()
+
+    idempotency_key = f"setup:{user.id}:{int(time.time() // 60)}"
+
+    si = stripe.SetupIntent.create(
+        customer=user.stripe_customer_id,
+        payment_method_types=["card"],
+        usage="off_session",
+        idempotency_key=idempotency_key,
+    )
+
+    return SetupIntentResponse(client_secret=si.client_secret)
+
+
+@router.post("/subscribe", response_model=SubscribeResponse)
+@limiter.limit(settings.SUBSCRIBE_RATE_LIMIT)
+async def subscribe(
+    request: Request,
+    body: SubscribeRequest,
+    user=Depends(require_verified),
+    db: AsyncSession = Depends(get_db),
+) -> SubscribeResponse:
+    """Create a Stripe Subscription for the authenticated user.
+
+    Requires a verified user. Rate-limited to SUBSCRIBE_RATE_LIMIT per IP.
+
+    Steps:
+    1. Resolve Stripe Price by lookup_key; read tier metadata.
+    2. Attach payment method + set as customer default.
+    3. Reject if user already has an active/trialing/past_due subscription (409).
+    4. Create Stripe Subscription.
+    5. Upsert subscriptions row. Balance grant deferred to webhook handler.
+    6. Return subscription state including requires_action flag for 3DS.
+    """
+    init_stripe()
+
+    # 1. Resolve Price by lookup_key.
+    prices_list = stripe.Price.list(
+        lookup_keys=[body.price_lookup_key],
+        expand=["data.product"],
+    )
+    if hasattr(prices_list, "auto_paging_iter"):
+        prices = list(prices_list.auto_paging_iter())
+    else:
+        prices = list(prices_list.data) if hasattr(prices_list, "data") else []
+    if not prices:
+        raise not_found(f"Price with lookup_key={body.price_lookup_key!r}")
+
+    price = prices[0]
+
+    # 2. Read required Price metadata.
+    metadata = getattr(price, "metadata", None) or {}
+    raw_grant = metadata.get("grant_micros") if hasattr(metadata, "get") else None
+    tier_name = metadata.get("tier_name") if hasattr(metadata, "get") else None
+
+    if not raw_grant:
+        raise validation_error(f"Price {body.price_lookup_key!r} is missing metadata.grant_micros")
+    if not tier_name:
+        raise validation_error(f"Price {body.price_lookup_key!r} is missing metadata.tier_name")
+
+    try:
+        grant_micros = int(raw_grant)
+    except (ValueError, TypeError):
+        raise validation_error(
+            f"Price {body.price_lookup_key!r} has invalid metadata.grant_micros={raw_grant!r}"
+        )
+
+    tier_key = getattr(price, "lookup_key", "") or body.price_lookup_key
+
+    # Lazy Customer creation.
+    if user.stripe_customer_id is None:
+        customer_id = await create_customer(user, db)
+        user.stripe_customer_id = customer_id
+        await db.flush()
+
+    # 3. Attach payment method + set as customer default.
+    stripe.PaymentMethod.attach(body.payment_method_id, customer=user.stripe_customer_id)
+    stripe.Customer.modify(
+        user.stripe_customer_id,
+        invoice_settings={"default_payment_method": body.payment_method_id},
+    )
+
+    # 4. Check for existing active subscription.
+    result = await db.execute(select(Subscription).where(Subscription.user_id == user.id))
+    existing = result.scalar_one_or_none()
+    if existing and existing.status in ("active", "trialing", "past_due"):
+        raise conflict(f"ALREADY_SUBSCRIBED: user already has a {existing.status!r} subscription")
+
+    # 5. Create Stripe Subscription.
+    kwargs = {
+        "customer": user.stripe_customer_id,
+        "items": [{"price": price.id}],
+        "default_payment_method": body.payment_method_id,
+        "metadata": {"user_id": str(user.id)},
+        "expand": ["latest_invoice.payment_intent"],
+    }
+    if settings.STRIPE_TAX_ENABLED:
+        kwargs["automatic_tax"] = {"enabled": True}
+
+    sub = stripe.Subscription.create(
+        **kwargs,
+        idempotency_key=f"subscribe:{user.id}:{body.price_lookup_key}",
+    )
+
+    sub_status = getattr(sub, "status", "incomplete") or "incomplete"
+    cancel_at_period_end = bool(getattr(sub, "cancel_at_period_end", False))
+
+    period_start = None
+    period_end = None
+    raw_start = getattr(sub, "current_period_start", None)
+    raw_end = getattr(sub, "current_period_end", None)
+    if raw_start:
+        period_start = datetime.fromtimestamp(raw_start, tz=timezone.utc).replace(tzinfo=None)
+    if raw_end:
+        period_end = datetime.fromtimestamp(raw_end, tz=timezone.utc).replace(tzinfo=None)
+
+    # 6. Upsert subscriptions row. Balance grant deferred to webhook (subscription.created).
+    upsert_stmt = (
+        pg_insert(Subscription)
+        .values(
+            user_id=user.id,
+            stripe_subscription_id=sub.id,
+            stripe_price_id=price.id,
+            tier_key=tier_key,
+            tier_name=tier_name,
+            status=sub_status,
+            grant_micros=grant_micros,
+            current_period_start=period_start,
+            current_period_end=period_end,
+            cancel_at_period_end=cancel_at_period_end,
+        )
+        .on_conflict_do_update(
+            index_elements=["user_id"],
+            set_={
+                "stripe_subscription_id": sub.id,
+                "stripe_price_id": price.id,
+                "tier_key": tier_key,
+                "tier_name": tier_name,
+                "status": sub_status,
+                "grant_micros": grant_micros,
+                "current_period_start": period_start,
+                "current_period_end": period_end,
+                "cancel_at_period_end": cancel_at_period_end,
+            },
+        )
+    )
+    await db.execute(upsert_stmt)
+
+    # 7. Determine if 3DS is required.
+    requires_action = sub_status == "incomplete"
+    client_secret = None
+    if requires_action:
+        try:
+            client_secret = sub.latest_invoice.payment_intent.client_secret
+        except AttributeError:
+            pass
+
+    logger.info(
+        "subscribe: created subscription",
+        extra={
+            "user_id": user.id,
+            "stripe_sub_id": sub.id,
+            "status": sub_status,
+            "tier_key": tier_key,
+            "requires_action": requires_action,
+        },
+    )
+
+    return SubscribeResponse(
+        subscription_id=sub.id,
+        status=sub_status,
+        requires_action=requires_action,
+        client_secret=client_secret,
+    )
+
+
+@router.get("/subscription", response_model=SubscriptionResponse)
+async def get_subscription(
+    user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> SubscriptionResponse:
+    """Return the current subscription state for the authenticated user.
+
+    Authed only — NOT verified-gated. Returns has_subscription=False when:
+    - No subscriptions row exists.
+    - Row exists but status='cancelled' (cancelled = no active subscription;
+      row is kept for audit).
+    """
+    result = await db.execute(select(Subscription).where(Subscription.user_id == user.id))
+    row = result.scalar_one_or_none()
+
+    if row is None or row.status == "cancelled":
+        return SubscriptionResponse(
+            has_subscription=False,
+            tier_key=None,
+            tier_name=None,
+            status=None,
+            current_period_end=None,
+            cancel_at_period_end=False,
+        )
+
+    return SubscriptionResponse(
+        has_subscription=True,
+        tier_key=row.tier_key,
+        tier_name=row.tier_name,
+        status=row.status,
+        current_period_end=row.current_period_end,
+        cancel_at_period_end=row.cancel_at_period_end,
     )
