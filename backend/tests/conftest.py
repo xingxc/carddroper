@@ -28,6 +28,8 @@ os.environ.setdefault("RESEND_VERIFICATION_RATE_LIMIT", "1000/hour")
 os.environ.setdefault("VERIFY_EMAIL_RATE_LIMIT", "1000/minute")
 os.environ.setdefault("CHANGE_EMAIL_RATE_LIMIT", "1000/hour")
 os.environ.setdefault("CONFIRM_EMAIL_CHANGE_RATE_LIMIT", "1000/minute")
+os.environ.setdefault("TOPUP_RATE_LIMIT", "1000/minute")
+os.environ.setdefault("SUBSCRIBE_RATE_LIMIT", "1000/minute")
 os.environ.setdefault("SENDGRID_API_KEY", "")
 os.environ.setdefault(
     "SENDGRID_SANDBOX", "true"

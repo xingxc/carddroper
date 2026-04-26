@@ -90,6 +90,7 @@ subscriptions (
     stripe_subscription_id  VARCHAR(64) UNIQUE NOT NULL,
     stripe_price_id         VARCHAR(64) NOT NULL,
     tier_key                VARCHAR(64) NOT NULL,   -- mirrors Stripe Price lookup_key
+    tier_name               VARCHAR(64) NOT NULL,   -- mirrors Price.metadata.tier_name at subscribe + on customer.subscription.updated; avoids a Stripe API call on every GET /billing/subscription
     status                  VARCHAR(32) NOT NULL,   -- trialing | active | past_due | cancelled | incomplete
     grant_micros            BIGINT NOT NULL,        -- per-period balance grant, mirrored from Price metadata at subscribe time
     current_period_start    TIMESTAMP,
@@ -131,7 +132,7 @@ by reason.
 |---|---|---|
 | `topup` | + | `payment_intent.succeeded` for a user-initiated purchase |
 | `subscription_grant` | + | `customer.subscription.created` (initial period grant) |
-| `subscription_reset` | ± | `invoice.paid` for subscription renewal (zero remaining prior-period grant + grant new period) |
+| `subscription_reset` | + | `invoice.paid` for subscription renewal (grants new period's `grant_micros`). **V1 simplification:** does not zero remaining prior-period balance; balance increases monotonically across renewals. Strict "zero prior-period remainder + grant new period" semantics are a future hardening (analogous to the cancel-at-period-end-vs-immediate distinction). |
 | `signup_bonus` | + | User registration (opt-in, off by default) |
 | `verify_bonus` | + | Email verification (opt-in, off by default) |
 | `debit` | − | Project-layer action via `billing.debit()` |
@@ -314,8 +315,10 @@ vocabulary, idempotency).
 ## Chassis-exposed HTTP endpoints
 
 - `GET /billing/balance` — returns `{balance_micros: int, formatted: str}`. Authed.
+- `POST /billing/setup-intent` — creates Stripe SetupIntent for collecting a payment method. Returns `{client_secret: str}`. Verified user only. Lazily creates Stripe Customer. Idempotency: one per user per minute.
 - `POST /billing/topup` — returns Stripe `client_secret`. Verified user only.
-- `POST /billing/subscribe` — creates subscription. Verified user only.
+- `POST /billing/subscribe` — creates subscription. Verified user only. Rate-limited.
+- `GET /billing/subscription` — returns subscription state `{has_subscription, tier_key, tier_name, status, current_period_end, cancel_at_period_end}`. Authed (not verified-gated).
 - `POST /billing/portal-session` — returns Stripe Customer Portal URL. Authed.
 - `POST /billing/webhook` — Stripe webhook handler. Signature-verified; no auth dep.
 
