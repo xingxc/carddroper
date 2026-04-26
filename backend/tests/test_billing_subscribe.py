@@ -482,7 +482,7 @@ async def test_subscribe_rejects_missing_lookup_key(client):
 
 @pytest.mark.asyncio
 async def test_subscribe_rejects_missing_grant_micros_metadata(client):
-    """Price found but metadata.grant_micros missing → 422."""
+    """Price found but metadata.grant_micros missing → 422 when grants are enabled."""
     mock_customer = MagicMock()
     mock_customer.id = "cus_sub_no_grant"
 
@@ -504,6 +504,7 @@ async def test_subscribe_rejects_missing_grant_micros_metadata(client):
 
     with (
         patch.object(settings, "BILLING_ENABLED", True),
+        patch.object(settings, "BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER", True),
         patch("app.routes.billing.stripe") as mock_stripe,
         patch("app.billing.primitives.stripe"),
     ):
@@ -880,7 +881,7 @@ async def test_get_subscription_returns_no_subscription_for_cancelled_row(client
 
 @pytest.mark.asyncio
 async def test_handle_subscription_created_grants_initial_period():
-    """Mock subscription.created event → subscriptions row upserted + subscription_grant ledger entry."""
+    """Mock subscription.created event → subscriptions row upserted + subscription_grant ledger entry (flag=True)."""
     from app.billing.handlers.subscription import handle_subscription_created
     from app.services.auth_service import hash_password
 
@@ -918,9 +919,10 @@ async def test_handle_subscription_created_grants_initial_period():
     event.id = "evt_sub_created_001"
     event.data.object = sub_obj
 
-    async with AsyncSession(engine, expire_on_commit=False) as session:
-        async with session.begin():
-            await handle_subscription_created(event, session)
+    with patch.object(settings, "BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER", True):
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            async with session.begin():
+                await handle_subscription_created(event, session)
 
     # subscriptions row upserted.
     async with AsyncSession(engine, expire_on_commit=False) as session:
@@ -1010,10 +1012,11 @@ async def test_handle_subscription_created_idempotent():
     event.id = "evt_sub_idem_001"
     event.data.object = sub_obj
 
-    # First run — handler runs normally.
-    async with AsyncSession(engine, expire_on_commit=False) as session:
-        async with session.begin():
-            await handle_subscription_created(event, session)
+    # First run — handler runs normally (flag=True so grant fires).
+    with patch.object(settings, "BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER", True):
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            async with session.begin():
+                await handle_subscription_created(event, session)
 
     # Second run — stripe_events prevents a second stripe_event_id insert on
     # balance_ledger (the UNIQUE constraint on stripe_event_id would fire). But
@@ -1251,9 +1254,10 @@ async def test_handle_invoice_paid_subscription_cycle_grants():
     event.id = "evt_inv_cycle_001"
     event.data.object = invoice_obj
 
-    async with AsyncSession(engine, expire_on_commit=False) as session:
-        async with session.begin():
-            await handle_invoice_paid(event, session)
+    with patch.object(settings, "BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER", True):
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            async with session.begin():
+                await handle_invoice_paid(event, session)
 
     # Ledger entry: subscription_reset of 10_000_000.
     async with AsyncSession(engine, expire_on_commit=False) as session:
@@ -1414,7 +1418,10 @@ async def test_webhook_dispatches_to_subscription_handlers():
         ),
     ]
 
-    with patch.object(settings, "STRIPE_WEBHOOK_SECRET", _WEBHOOK_SECRET):
+    with (
+        patch.object(settings, "STRIPE_WEBHOOK_SECRET", _WEBHOOK_SECRET),
+        patch.object(settings, "BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER", True),
+    ):
         test_app = _make_billing_test_app()
         transport = httpx.ASGITransport(app=test_app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
@@ -1434,3 +1441,279 @@ async def test_webhook_dispatches_to_subscription_handlers():
             row = result.scalar_one_or_none()
             assert row is not None, f"stripe_events row missing for {event_id}"
             assert row.event_type == event_type
+
+
+# ---------------------------------------------------------------------------
+# BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=False (OFF-state) tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_subscribe_does_not_require_grant_micros_when_grants_disabled(client):
+    """Flag=False, Price without grant_micros → subscribe succeeds (200); no ledger entry."""
+    mock_customer = MagicMock()
+    mock_customer.id = "cus_no_grant_flag_off"
+
+    with (
+        patch.object(settings, "BILLING_ENABLED", True),
+        patch.object(settings, "BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER", False),
+        patch("app.billing.primitives.stripe") as mock_p,
+    ):
+        mock_p.Customer.create.return_value = mock_customer
+        reg_resp, user_id = await _register_and_verify(client, "sub_flagoff_nogrant@example.com")
+
+    access_token = reg_resp.get("access_token")
+
+    # Price with NO grant_micros in metadata — only tier_name.
+    price = MagicMock()
+    price.id = "price_flagoff_001"
+    price.lookup_key = "starter_monthly"
+    price.metadata = {"tier_name": "Starter"}  # no grant_micros
+
+    mock_prices = MagicMock()
+    mock_prices.data = [price]
+    mock_prices.auto_paging_iter.return_value = iter([price])
+
+    mock_sub = _mock_subscription(sub_id="sub_flagoff_001", status="active")
+
+    with (
+        patch.object(settings, "BILLING_ENABLED", True),
+        patch.object(settings, "BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER", False),
+        patch("app.routes.billing.stripe") as mock_stripe,
+        patch("app.billing.primitives.stripe"),
+    ):
+        mock_stripe.Price.list.return_value = mock_prices
+        mock_stripe.PaymentMethod.attach.return_value = MagicMock()
+        mock_stripe.Customer.modify.return_value = MagicMock()
+        mock_stripe.Subscription.create.return_value = mock_sub
+        resp = await client.post(
+            "/billing/subscribe",
+            json={"price_lookup_key": "starter_monthly", "payment_method_id": "pm_flagoff"},
+            headers=_auth_headers(access_token),
+        )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["subscription_id"] == "sub_flagoff_001"
+    assert body["status"] == "active"
+
+    # Subscriptions row upserted.
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(select(Subscription).where(Subscription.user_id == user_id))
+        row = result.scalar_one()
+    assert row.stripe_subscription_id == "sub_flagoff_001"
+    assert row.status == "active"
+    assert row.tier_name == "Starter"
+    assert row.grant_micros == 0  # stored as 0 when flag is OFF
+
+    # No ledger entry.
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(
+            select(BalanceLedger).where(BalanceLedger.user_id == user_id)
+        )
+        entries = result.scalars().all()
+    assert len(entries) == 0
+
+
+@pytest.mark.asyncio
+async def test_handle_subscription_created_skips_grant_when_disabled():
+    """Flag=False → handler upserts subscriptions row but does NOT write to balance_ledger."""
+    from app.billing.handlers.subscription import handle_subscription_created
+    from app.services.auth_service import hash_password
+
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        async with session.begin():
+            user = User(
+                email="sub_created_flagoff@example.com",
+                password_hash=hash_password("Password123!"),
+                full_name="Sub Created Flag Off",
+                stripe_customer_id="cus_sub_flagoff",
+            )
+            session.add(user)
+            await session.flush()
+            user_id = user.id
+
+    price_mock = MagicMock()
+    price_mock.id = "price_flagoff_002"
+    price_mock.lookup_key = "starter_monthly"
+    price_mock.metadata = {"grant_micros": "10000000", "tier_name": "Starter"}
+
+    sub_item = MagicMock()
+    sub_item.price = price_mock
+
+    sub_obj = MagicMock()
+    sub_obj.id = "sub_created_flagoff_001"
+    sub_obj.status = "active"
+    sub_obj.cancel_at_period_end = False
+    sub_obj.current_period_start = _PERIOD_START_TS
+    sub_obj.current_period_end = _PERIOD_END_TS
+    sub_obj.metadata = {"user_id": str(user_id)}
+    sub_obj.items.data = [sub_item]
+
+    event = MagicMock()
+    event.id = "evt_sub_created_flagoff_001"
+    event.data.object = sub_obj
+
+    # Flag is OFF (default False — no patch needed, but be explicit for clarity).
+    with patch.object(settings, "BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER", False):
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            async with session.begin():
+                await handle_subscription_created(event, session)
+
+    # Subscriptions row was upserted.
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(select(Subscription).where(Subscription.user_id == user_id))
+        row = result.scalar_one_or_none()
+    assert row is not None
+    assert row.stripe_subscription_id == "sub_created_flagoff_001"
+    assert row.status == "active"
+    assert row.tier_name == "Starter"
+
+    # balance_ledger was NOT written.
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(
+            select(BalanceLedger).where(BalanceLedger.user_id == user_id)
+        )
+        entries = result.scalars().all()
+    assert len(entries) == 0
+
+
+@pytest.mark.asyncio
+async def test_handle_invoice_paid_subscription_cycle_skips_when_disabled():
+    """Flag=False, subscription_cycle invoice → period dates updated; NO ledger entry."""
+    from app.billing.handlers.subscription import handle_invoice_paid
+    from app.services.auth_service import hash_password
+
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        async with session.begin():
+            user = User(
+                email="inv_cycle_flagoff@example.com",
+                password_hash=hash_password("Password123!"),
+                full_name="Inv Cycle Flag Off",
+                stripe_customer_id="cus_cycle_flagoff",
+            )
+            session.add(user)
+            await session.flush()
+            user_id = user.id
+
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        await _create_subscription_row(
+            session, user_id, status="active", stripe_sub_id="sub_cycle_flagoff_001"
+        )
+
+    new_period_end = _PERIOD_END_TS + 86400 * 30
+
+    line_period = MagicMock()
+    line_period.start = _PERIOD_START_TS
+    line_period.end = new_period_end
+
+    line = MagicMock()
+    line.period = line_period
+
+    invoice_obj = MagicMock()
+    invoice_obj.billing_reason = "subscription_cycle"
+    invoice_obj.subscription = "sub_cycle_flagoff_001"
+    invoice_obj.lines.data = [line]
+
+    event = MagicMock()
+    event.id = "evt_inv_cycle_flagoff_001"
+    event.data.object = invoice_obj
+
+    with patch.object(settings, "BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER", False):
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            async with session.begin():
+                await handle_invoice_paid(event, session)
+
+    # balance_ledger was NOT written.
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(
+            select(BalanceLedger).where(BalanceLedger.user_id == user_id)
+        )
+        entries = result.scalars().all()
+    assert len(entries) == 0
+
+    # Period was still updated on the subscriptions row.
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(select(Subscription).where(Subscription.user_id == user_id))
+        row = result.scalar_one()
+    expected_end = datetime.fromtimestamp(new_period_end, tz=timezone.utc).replace(tzinfo=None)
+    assert row.current_period_end == expected_end
+
+
+@pytest.mark.asyncio
+async def test_handle_subscription_created_extracts_price_from_items_data():
+    """Bug-fix regression: realistic subscription event with items.data[0].price populated
+    → handler extracts price correctly and grants when flag=True.
+
+    Without the fix, the handler would log 'could not extract price from sub.items'
+    and return without granting when Stripe sends a real ListObject-shaped event.
+    With the fix, the handler traverses .data correctly and grants subscription_grant.
+    """
+    from app.billing.handlers.subscription import handle_subscription_created
+    from app.services.auth_service import hash_password
+
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        async with session.begin():
+            user = User(
+                email="sub_bugfix_regression@example.com",
+                password_hash=hash_password("Password123!"),
+                full_name="Sub Bugfix",
+                stripe_customer_id="cus_bugfix",
+            )
+            session.add(user)
+            await session.flush()
+            user_id = user.id
+
+    # Simulate the Stripe SDK's StripeObject shape: sub.items is a ListObject
+    # with a .data attribute containing subscription item objects, each with
+    # a .price attribute. This is the exact shape that was failing in production.
+    price_mock = MagicMock()
+    price_mock.id = "price_bugfix_001"
+    price_mock.lookup_key = "starter_monthly"
+    price_mock.metadata = {"grant_micros": "7500000", "tier_name": "Pro"}
+
+    sub_item_mock = MagicMock()
+    sub_item_mock.price = price_mock
+
+    # items_list simulates a Stripe ListObject: has .data attribute.
+    items_list = MagicMock()
+    items_list.data = [sub_item_mock]
+
+    sub_obj = MagicMock()
+    sub_obj.id = "sub_bugfix_001"
+    sub_obj.status = "active"
+    sub_obj.cancel_at_period_end = False
+    sub_obj.current_period_start = _PERIOD_START_TS
+    sub_obj.current_period_end = _PERIOD_END_TS
+    sub_obj.metadata = {"user_id": str(user_id)}
+    sub_obj.items = items_list  # items IS the ListObject, NOT items.data directly
+
+    event = MagicMock()
+    event.id = "evt_bugfix_regression_001"
+    event.data.object = sub_obj
+
+    with patch.object(settings, "BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER", True):
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            async with session.begin():
+                await handle_subscription_created(event, session)
+
+    # subscriptions row upserted with correct metadata from items.data[0].price.
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(select(Subscription).where(Subscription.user_id == user_id))
+        row = result.scalar_one_or_none()
+    assert row is not None
+    assert row.stripe_subscription_id == "sub_bugfix_001"
+    assert row.tier_name == "Pro"
+    assert row.tier_key == "starter_monthly"
+    assert row.grant_micros == 7_500_000
+
+    # Ledger entry was written — confirming the price extraction bug is fixed.
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(
+            select(BalanceLedger).where(BalanceLedger.user_id == user_id)
+        )
+        entries = result.scalars().all()
+    assert len(entries) == 1
+    assert entries[0].amount_micros == 7_500_000
+    assert entries[0].reason == "subscription_grant"
+    assert entries[0].stripe_event_id == "evt_bugfix_regression_001"

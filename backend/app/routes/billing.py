@@ -309,22 +309,33 @@ async def subscribe(
 
     price = prices[0]
 
-    # 2. Read required Price metadata.
+    # 2. Read Price metadata. grant_micros is required when grants are enabled;
+    # optional (unused) when BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=False.
+    # tier_name is always required (used for display in subscriptions.tier_name).
     metadata = getattr(price, "metadata", None) or {}
     raw_grant = metadata.get("grant_micros") if hasattr(metadata, "get") else None
     tier_name = metadata.get("tier_name") if hasattr(metadata, "get") else None
 
-    if not raw_grant:
-        raise validation_error(f"Price {body.price_lookup_key!r} is missing metadata.grant_micros")
     if not tier_name:
         raise validation_error(f"Price {body.price_lookup_key!r} is missing metadata.tier_name")
 
-    try:
-        grant_micros = int(raw_grant)
-    except (ValueError, TypeError):
-        raise validation_error(
-            f"Price {body.price_lookup_key!r} has invalid metadata.grant_micros={raw_grant!r}"
-        )
+    if settings.BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER:
+        if not raw_grant:
+            raise validation_error(
+                f"Price {body.price_lookup_key!r} is missing metadata.grant_micros"
+            )
+        try:
+            grant_micros = int(raw_grant)
+        except (ValueError, TypeError):
+            raise validation_error(
+                f"Price {body.price_lookup_key!r} has invalid metadata.grant_micros={raw_grant!r}"
+            )
+    else:
+        # Flag OFF: grant_micros is not needed; store 0 as placeholder in the row.
+        try:
+            grant_micros = int(raw_grant) if raw_grant else 0
+        except (ValueError, TypeError):
+            grant_micros = 0
 
     tier_key = getattr(price, "lookup_key", "") or body.price_lookup_key
 

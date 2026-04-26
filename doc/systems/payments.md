@@ -17,6 +17,11 @@ inherit this subsystem and wire their own actions on top of the debit primitive.
 
 ## Denomination — gift-card model (Model B)
 
+The chassis supports two subscription modes controlled by `BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER`:
+
+- **Credit-based mode (default for carddroper)** — `BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=true`. Subscription = balance grant. Each billing period grants `grant_micros` to `balance_ledger` via `subscription_grant` (initial) and `subscription_reset` (renewals). Adopters (like carddroper) who sell credits opt in by setting the flag true. Topups + subscription grants combine into a spendable USD balance — the gift-card model below.
+- **Flat-fee mode (chassis default)** — `BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=false`. Subscription = access tier only. `balance_ledger` is never written by subscription events. Adopters using Netflix/Slack-style "pay for access" leave the flag at its default. Topups still work; subscription events just don't add to balance.
+
 Users see a USD balance and spend USD. No abstract "credits." Gift-card mental
 model (Starbucks app, Amazon gift card): load money, see balance, spend down.
 
@@ -145,8 +150,8 @@ Projects define tiers in Stripe Dashboard. The chassis reads the Price
 metadata to learn what each tier grants. **Required per Price:**
 
 - `lookup_key` (Stripe top-level field, e.g., `"starter_monthly"`) — stable identifier the chassis cross-references.
-- `metadata.grant_micros` (string of int, e.g., `"5000000"`) — balance granted per billing period.
-- `metadata.tier_name` (e.g., `"Starter"`) — display name.
+- `metadata.grant_micros` (string of int, e.g., `"5000000"`) — balance granted per billing period. **Required when `BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=true`; optional (unused) when false.** Flat-fee adopters do not need to set this on their Stripe Prices.
+- `metadata.tier_name` (e.g., `"Starter"`) — display name. **Always required** (used in `subscriptions.tier_name` and `GET /billing/tiers` regardless of mode).
 
 Chassis does not hardcode tier count, prices, or grant amounts. A one-tier or
 ten-tier structure works identically. Adding/removing/renaming/repricing tiers
@@ -233,19 +238,19 @@ project-layer actions calling this primitive.
 
 1. Require verified user.
 2. Attach `payment_method_id` to the Customer, set as default.
-3. Resolve Stripe Price from `lookup_key`. Read `metadata.grant_micros` + `metadata.tier_name`.
+3. Resolve Stripe Price from `lookup_key`. Read `metadata.tier_name` (always required). Read `metadata.grant_micros` only when `BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=true` (422 if missing in that mode; ignored when false).
 4. Create Stripe Subscription with `automatic_tax.enabled=STRIPE_TAX_ENABLED`.
 5. Upsert `subscriptions` row (keyed on `user_id`; one active subscription per user in v1).
-6. Grant `subscription_grant`: `+grant_micros` ledger entry with `stripe_event_id` from `customer.subscription.created`.
+6. **When `BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=true`:** grant `subscription_grant`: `+grant_micros` ledger entry deferred to `customer.subscription.created` webhook. **When false:** subscription row is upserted; `balance_ledger` is not written.
 
 ### 5. Subscription lifecycle (webhooks)
 
 | Event | Action |
 |---|---|
-| `customer.subscription.created` | Upsert subscription row. Grant `subscription_grant`. |
-| `customer.subscription.updated` | Update `status`, `current_period_end`, `cancel_at_period_end`, `tier_key`, `grant_micros` (re-read from Price metadata). |
+| `customer.subscription.created` | Upsert subscription row. **When `BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=true`:** also grant `subscription_grant`. When false: row only, no ledger write. |
+| `customer.subscription.updated` | Update `status`, `current_period_end`, `cancel_at_period_end`, `tier_key`, `grant_micros` (re-read from Price metadata). No ledger write regardless of flag. |
 | `customer.subscription.deleted` | Mark `status='cancelled'`. Do NOT revoke already-granted balance. |
-| `invoice.paid` | If subscription renewal, post `subscription_reset` entries: zero remaining prior-period subscription grant, grant new period's `grant_micros`. |
+| `invoice.paid` | If subscription renewal: update period timestamps. **When `BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=true`:** also post `subscription_reset` entries. When false: timestamps updated only, no ledger write. |
 | `invoice.payment_failed` | Mark subscription `past_due`. Balance stays spendable. |
 | `payment_intent.succeeded` | Topup: grant `topup`. |
 | `charge.refunded` | Record `refund` ledger entry (negative). |

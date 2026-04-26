@@ -221,6 +221,13 @@ class Settings(BaseSettings):
     STRIPE_TAX_ENABLED: bool = False  # deliberately un-validated: purely product-tunable
     BILLING_SIGNUP_BONUS_MICROS: int = 0  # deliberately un-validated: purely product-tunable
     BILLING_VERIFY_BONUS_MICROS: int = 0  # deliberately un-validated: purely product-tunable
+    BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER: bool = False
+    # deliberately un-validated — chassis-tunable behavior toggle.
+    # When True, customer.subscription.created and invoice.paid (subscription_cycle)
+    # write subscription_grant / subscription_reset entries to balance_ledger.
+    # When False (default), subscriptions track state only — pure access-tier model.
+    # Adopters with credit-based SaaS (gift-card model) flip True; flat-fee SaaS leaves False.
+    # See doc/systems/payments.md §Denomination for the two chassis modes.
 
     @model_validator(mode="after")
     def validate_stripe_secret_key(self) -> "Settings":

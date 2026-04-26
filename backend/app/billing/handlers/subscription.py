@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.billing.handlers import register
 from app.billing.primitives import grant
 from app.billing.reason import Reason
+from app.config import settings
 from app.models.subscription import Subscription
 
 logger = logging.getLogger(__name__)
@@ -106,11 +107,13 @@ def _naive_utc_from_timestamp(ts: int | None) -> datetime | None:
 
 @register("customer.subscription.created")
 async def handle_subscription_created(event: stripe.Event, db: AsyncSession) -> None:
-    """Grant initial period balance when a Stripe Subscription is created.
+    """Upsert subscriptions row when a Stripe Subscription is created.
 
-    Extracts user_id from subscription metadata. Reads Price metadata for
-    grant_micros + tier_name. Upserts the subscriptions row. Grants a
-    subscription_grant ledger entry.
+    When BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=True, also extracts Price
+    metadata and grants a subscription_grant ledger entry.
+
+    When BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=False (default), only upserts
+    the subscriptions row — balance_ledger is not touched.
 
     Idempotency: the stripe_events INSERT at the route level prevents this
     handler from running twice for the same event.id.
@@ -123,28 +126,47 @@ async def handle_subscription_created(event: stripe.Event, db: AsyncSession) -> 
     if user_id is None:
         return
 
-    # The subscription object carries items[0].price — extract Price id and metadata.
+    grants_enabled = settings.BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER
+
+    # Extract Price from sub.items — Stripe's subscription.items is a ListObject
+    # ({data: [...], has_more, ...}). Access via .data first; fall back to dict-style
+    # access for resilience across Stripe SDK versions.
     try:
-        price_obj = sub.items.data[0].price
-    except (AttributeError, IndexError):
+        items_data = sub.items.data if hasattr(sub.items, "data") else sub["items"]["data"]
+        if not items_data:
+            raise IndexError("empty items.data")
+        price_obj = items_data[0].price if hasattr(items_data[0], "price") else items_data[0]["price"]
+    except (AttributeError, IndexError, KeyError, TypeError):
         logger.warning(
             "handle_subscription_created: could not extract price from sub.items",
             extra={"event_id": event.id, "sub_id": getattr(sub, "id", None)},
         )
         return
 
-    price_meta = _extract_price_metadata(price_obj, event.id)
-    if price_meta is None:
-        return
-    grant_micros, tier_name = price_meta
-
-    tier_key = getattr(price_obj, "lookup_key", None) or ""
-    stripe_price_id = getattr(price_obj, "id", "") or ""
+    tier_key = getattr(price_obj, "lookup_key", None) or (
+        price_obj.get("lookup_key") if hasattr(price_obj, "get") else None
+    ) or ""
+    stripe_price_id = getattr(price_obj, "id", None) or (
+        price_obj.get("id") if hasattr(price_obj, "get") else None
+    ) or ""
     stripe_sub_id = getattr(sub, "id", "") or ""
     status = getattr(sub, "status", "incomplete") or "incomplete"
     cancel_at_period_end = bool(getattr(sub, "cancel_at_period_end", False))
     period_start = _naive_utc_from_timestamp(getattr(sub, "current_period_start", None))
     period_end = _naive_utc_from_timestamp(getattr(sub, "current_period_end", None))
+
+    if grants_enabled:
+        price_meta = _extract_price_metadata(price_obj, event.id)
+        if price_meta is None:
+            return
+        grant_micros, tier_name = price_meta
+    else:
+        # Flag OFF: read tier_name for display; grant_micros defaults to 0 (unused).
+        price_meta_raw = getattr(price_obj, "metadata", None) or {}
+        tier_name = (
+            price_meta_raw.get("tier_name") if hasattr(price_meta_raw, "get") else None
+        ) or ""
+        grant_micros = 0
 
     # Upsert subscriptions row keyed on user_id (one subscription per user).
     stmt = (
@@ -177,6 +199,13 @@ async def handle_subscription_created(event: stripe.Event, db: AsyncSession) -> 
         )
     )
     await db.execute(stmt)
+
+    if not grants_enabled:
+        logger.info(
+            "handle_subscription_created: upserted row (grants disabled — BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=False)",
+            extra={"event_id": event.id, "user_id": user_id, "stripe_sub_id": stripe_sub_id},
+        )
+        return
 
     # Grant initial period balance.
     await grant(
@@ -227,11 +256,15 @@ async def handle_subscription_updated(event: stripe.Event, db: AsyncSession) -> 
         )
         return
 
-    # Re-read Price metadata (plan may have changed).
+    # Re-read Price metadata (plan may have changed). Use both attribute- and
+    # dict-style access for resilience across Stripe SDK versions / event shapes.
     try:
-        price_obj = sub.items.data[0].price
+        items_data = sub.items.data if hasattr(sub.items, "data") else sub["items"]["data"]
+        if not items_data:
+            raise IndexError("empty items.data")
+        price_obj = items_data[0].price if hasattr(items_data[0], "price") else items_data[0]["price"]
         price_meta = _extract_price_metadata(price_obj, event.id)
-    except (AttributeError, IndexError):
+    except (AttributeError, IndexError, KeyError, TypeError):
         price_obj = None
         price_meta = None
 
@@ -371,6 +404,13 @@ async def handle_invoice_paid(event: stripe.Event, db: AsyncSession) -> None:
             pass  # non-fatal; period update is best-effort
 
     db.add(row)
+
+    if not settings.BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER:
+        logger.info(
+            "handle_invoice_paid: updated period timestamps (grants disabled — BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=False)",
+            extra={"event_id": event.id, "user_id": row.user_id, "stripe_sub_id": stripe_sub_id},
+        )
+        return
 
     # Grant new period's balance.
     await grant(
