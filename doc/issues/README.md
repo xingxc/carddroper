@@ -70,7 +70,7 @@ The Verification section exists because "tsc passes" and "lint passes" are neces
 | 0017 | change-email retroactive audit — verify spec compliance + close any gaps | resolved | high |
 | 0017.1 | change-email frontend pages — request form + confirm landing + ProfileMenu link | resolved | medium |
 | 0018 | chassis-hardening audit — find missing validators, grow chassis-contract.md | resolved | medium |
-| 0019 | email deliverability — SendGrid Sender Authentication + SPF / DKIM / DMARC | open | high |
+| 0019 | email deliverability — SendGrid Sender Authentication + SPF / DKIM / DMARC | resolved | high |
 | 0020 | legal acceptance — ToS checkbox on /register + /legal/terms + /legal/privacy static pages | open | high |
 | 0021 | Stripe foundation (chassis) — balance ledger, billing primitives, webhook skeleton | resolved | medium |
 | 0022 | app-shell refactor (chassis) — left-rail sidebar + profile popover menu | resolved | medium |
