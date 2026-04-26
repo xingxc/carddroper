@@ -135,7 +135,9 @@ async def handle_subscription_created(event: stripe.Event, db: AsyncSession) -> 
         items_data = sub.items.data if hasattr(sub.items, "data") else sub["items"]["data"]
         if not items_data:
             raise IndexError("empty items.data")
-        price_obj = items_data[0].price if hasattr(items_data[0], "price") else items_data[0]["price"]
+        price_obj = (
+            items_data[0].price if hasattr(items_data[0], "price") else items_data[0]["price"]
+        )
     except (AttributeError, IndexError, KeyError, TypeError):
         logger.warning(
             "handle_subscription_created: could not extract price from sub.items",
@@ -143,12 +145,16 @@ async def handle_subscription_created(event: stripe.Event, db: AsyncSession) -> 
         )
         return
 
-    tier_key = getattr(price_obj, "lookup_key", None) or (
-        price_obj.get("lookup_key") if hasattr(price_obj, "get") else None
-    ) or ""
-    stripe_price_id = getattr(price_obj, "id", None) or (
-        price_obj.get("id") if hasattr(price_obj, "get") else None
-    ) or ""
+    tier_key = (
+        getattr(price_obj, "lookup_key", None)
+        or (price_obj.get("lookup_key") if hasattr(price_obj, "get") else None)
+        or ""
+    )
+    stripe_price_id = (
+        getattr(price_obj, "id", None)
+        or (price_obj.get("id") if hasattr(price_obj, "get") else None)
+        or ""
+    )
     stripe_sub_id = getattr(sub, "id", "") or ""
     status = getattr(sub, "status", "incomplete") or "incomplete"
     cancel_at_period_end = bool(getattr(sub, "cancel_at_period_end", False))
@@ -262,7 +268,9 @@ async def handle_subscription_updated(event: stripe.Event, db: AsyncSession) -> 
         items_data = sub.items.data if hasattr(sub.items, "data") else sub["items"]["data"]
         if not items_data:
             raise IndexError("empty items.data")
-        price_obj = items_data[0].price if hasattr(items_data[0], "price") else items_data[0]["price"]
+        price_obj = (
+            items_data[0].price if hasattr(items_data[0], "price") else items_data[0]["price"]
+        )
         price_meta = _extract_price_metadata(price_obj, event.id)
     except (AttributeError, IndexError, KeyError, TypeError):
         price_obj = None
