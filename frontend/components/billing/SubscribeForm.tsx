@@ -14,20 +14,14 @@ import {
   SUBSCRIPTION_QUERY_KEY,
   type SubscriptionResponse,
 } from "@/hooks/useSubscription";
+import { useTiers, type TierEnvelope } from "@/hooks/useTiers";
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
-export interface Tier {
-  lookup_key: string;
-  tier_name: string;
-  price_display: string; // e.g., "$9.99/month" — chassis doesn't compute; project supplies
-  description?: string;
-}
-
 export interface SubscribeFormProps {
-  tiers: Tier[];
+  lookupKeys: string[];
   onSuccess?: () => void;
 }
 
@@ -165,17 +159,18 @@ function InnerSubscribeForm({
 // SubscribeForm (outer component — owns all state)
 // ---------------------------------------------------------------------------
 
-export function SubscribeForm({ tiers, onSuccess }: SubscribeFormProps) {
+export function SubscribeForm({ lookupKeys, onSuccess }: SubscribeFormProps) {
   const [phase, setPhase] = useState<SubscribePhase>("select");
-  const [selectedTier, setSelectedTier] = useState<Tier | null>(null);
+  const [selectedTier, setSelectedTier] = useState<TierEnvelope | null>(null);
   const [clientSecret, setClientSecret] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const queryClient = useQueryClient();
+  const { data: tiers, isLoading: tiersLoading, isError: tiersError } = useTiers(lookupKeys);
 
   // ------------------------------------------------------------------
   // Phase A → Phase B: fetch setup-intent client_secret for selected tier
   // ------------------------------------------------------------------
-  async function handleSelectTier(tier: Tier) {
+  async function handleSelectTier(tier: TierEnvelope) {
     setSelectedTier(tier);
     setError(null);
     setPhase("fetching_secret");
@@ -385,7 +380,27 @@ export function SubscribeForm({ tiers, onSuccess }: SubscribeFormProps) {
   // Phase A — tier selection (phase is 'select' or 'fetching_secret')
   // ------------------------------------------------------------------
 
-  if (tiers.length === 0) {
+  // Loading state: useTiers is fetching (only fires when lookupKeys is non-empty)
+  if (tiersLoading) {
+    return (
+      <div className="rounded-md bg-gray-50 border border-gray-200 p-4 text-sm text-gray-500">
+        Loading plans…
+      </div>
+    );
+  }
+
+  // Error state: request failed or data is undefined after settling
+  if (tiersError || (lookupKeys.length > 0 && tiers === undefined)) {
+    return (
+      <div className="rounded-md bg-red-50 border border-red-200 p-4 text-sm text-red-700">
+        Unable to load plans. Please try again.
+      </div>
+    );
+  }
+
+  // Empty state: no lookupKeys supplied OR server returned no matching tiers
+  const resolvedTiers = tiers ?? [];
+  if (resolvedTiers.length === 0) {
     return (
       <div className="rounded-md bg-gray-50 border border-gray-200 p-4 text-sm text-gray-600">
         No plans available — contact support.
@@ -403,7 +418,7 @@ export function SubscribeForm({ tiers, onSuccess }: SubscribeFormProps) {
         </div>
       )}
       <div className="grid gap-3">
-        {tiers.map((tier) => (
+        {resolvedTiers.map((tier) => (
           <button
             key={tier.lookup_key}
             type="button"
@@ -419,7 +434,7 @@ export function SubscribeForm({ tiers, onSuccess }: SubscribeFormProps) {
                 {tier.price_display}
               </span>
             </div>
-            {tier.description && (
+            {tier.description !== null && tier.description !== undefined && (
               <p className="mt-1 text-xs text-gray-500">{tier.description}</p>
             )}
           </button>

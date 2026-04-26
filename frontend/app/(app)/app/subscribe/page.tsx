@@ -8,7 +8,7 @@ export default function SubscribePage() {
     <div className="max-w-2xl">
       <h1 className="text-2xl font-bold mb-2">Subscription</h1>
       <SubscriptionDisplay className="mb-6 text-sm text-gray-600" />
-      <SubscribeForm tiers={[]} />
+      <SubscribeForm lookupKeys={[]} />
     </div>
   );
 }
