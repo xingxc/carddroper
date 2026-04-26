@@ -99,6 +99,23 @@ Kept brief for future readers. Full analysis was in the discussion version of th
 - Real marketing content — design ticket, post-MVP.
 - Real `(app)/` body — Carddroper card-browse + customizer tickets.
 
+## Route-group URL convention
+
+Next.js App Router treats **parenthesized folders** (`(app)`, `(marketing)`, `(auth)`) as **route groups** — they organize files but **do not appear in the URL**. A page at `frontend/app/(app)/billing/page.tsx` serves `/billing`, NOT `/app/billing`.
+
+**Carddroper convention:** any page intended to live under a literal `/app/...` URL must be at `frontend/app/(app)/app/<path>/page.tsx` — note the nested literal `app/` folder inside the `(app)` route group. The `(app)` wrapper is invisible to the router; the inner `app/` is the literal URL segment.
+
+| File path | Served URL |
+|---|---|
+| `frontend/app/(app)/billing/page.tsx` | `/billing` |
+| `frontend/app/(app)/app/billing/page.tsx` | `/app/billing` (correct for Carddroper) |
+| `frontend/app/(marketing)/pricing/page.tsx` | `/pricing` |
+| `frontend/app/(auth)/login/page.tsx` | `/login` |
+
+**Why this matters:** the middleware proxy (`proxy.ts`, formerly `middleware.ts` in Next.js <16) gates all paths matching `/app/*`. A page at `(app)/billing/page.tsx` serves `/billing` — outside the `/app/*` gate — so it is reachable without authentication even though it is physically inside the `(app)` group. Moving it to `(app)/app/billing/page.tsx` makes it serve `/app/billing`, which is gated correctly.
+
+**Origin:** 0023 rollout — the billing page at `(app)/billing/page.tsx` 404'd at `/app/billing` until moved to `(app)/app/billing/page.tsx` (commit `0946a49`). Time lost: ~20 minutes.
+
 ## Implications for future tickets
 
 - **Editor / customizer ticket.** Lives entirely under `(app)/`. Middleware already enforces auth; no changes to the boundary.

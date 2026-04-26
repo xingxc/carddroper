@@ -83,6 +83,68 @@ Ask: **at what point in the pipeline is the value consumed?**
 
 Each new env var should show up in exactly one `.env.example` — the tier it belongs to — so fresh clones pick up the template from the right place.
 
+## NEXT_PUBLIC_* four-file checklist
+
+Every `NEXT_PUBLIC_*` build-time variable must appear in **all four** of the following locations or it silently bakes as an empty string in the JS bundle — no build error, no runtime error, just wrong behavior.
+
+| # | Location | What to add |
+|---|---|---|
+| 1 | `frontend/Dockerfile` | `ARG NAME` declaration + `ENV NAME=${NAME}` assignment (both lines required) |
+| 2 | `docker-compose.yml` | Under `services.frontend.build.args`: `NAME: ${NAME}` |
+| 3 | `cloudbuild.yaml` | In the frontend docker-build step: `--build-arg NAME=$_SUBSTITUTION_VAR` |
+| 4 | `frontend/.env.example` | `NAME=` (empty placeholder) so adopters know the var exists |
+
+**Why all four?** The pipeline is:
+
+```
+[root .env / Cloud Build substitution]
+    ↓ docker-compose ${VAR} / cloudbuild --build-arg
+[docker build --build-arg NAME=value]
+    ↓ Dockerfile: ARG NAME → ENV NAME=${NAME}
+[npm run build] inlines process.env.NAME into the bundle
+    ↓
+[browser] reads literal string from bundle
+```
+
+A gap at any stage propagates as an empty string silently. Specifically:
+
+- Missing `ARG NAME` in `Dockerfile` → `--build-arg NAME=value` is silently ignored; `process.env.NAME` is `undefined` at build time → bakes as empty string. This was the 0023 failure mode (commit `892bd66` was the fix).
+- Missing `ENV NAME=${NAME}` after `ARG` → `npm run build` runs without the var in the build environment.
+- Missing `build.args` in docker-compose → local `docker-compose up --build` silently omits the var.
+- Missing `--build-arg` in cloudbuild → staging deploy silently omits the var even if the other three locations are correct.
+- Missing `.env.example` entry → adopters copying the template miss the var entirely.
+
+**Checklist when adding a new `NEXT_PUBLIC_*` var:**
+
+```bash
+# Confirm all four locations:
+grep -n "ARG $NAME\|ENV $NAME" frontend/Dockerfile
+grep -n "$NAME" docker-compose.yml
+grep -n "$NAME" cloudbuild.yaml
+grep -n "$NAME" frontend/.env.example
+```
+
+All four greps must return matches before the PR is considered complete.
+
+## NEXT_PUBLIC_* runtime debugging
+
+**`printenv` is meaningless for `NEXT_PUBLIC_*` debugging.** Next.js inlines `process.env.NEXT_PUBLIC_*` references at build time — the variable is replaced with its literal value in the compiled JS bundle. The running container's OS environment does **not** need the var set at runtime.
+
+**Symptom:** `docker-compose exec frontend printenv NEXT_PUBLIC_FOO` returns empty (or the var is absent), but the app still works correctly. This is expected — `printenv` shows the runtime OS env, not the build-time-baked value.
+
+**Correct verification:** grep the compiled bundle for the expected value:
+
+```bash
+# After docker-compose up (or after docker build):
+docker-compose exec frontend grep -r "pk_test_" /app/.next --include="*.js" -l
+# or for a generic string:
+docker-compose exec frontend grep -r "expected-value" /app/.next -l
+```
+
+If the value is present in `.next/`, it was baked correctly. If it's absent, the build-time pipeline has a gap — recheck the four-file checklist above.
+
+**Origin:** During 0023 rollout, `printenv` in the running container showed `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY` as empty, falsely suggesting the env was missing. The bundle had the correct value baked in (verified with `grep "pk_test_" /app/.next`). Time lost: ~30 minutes.
+
 ## Day-to-day
 
 ```bash
