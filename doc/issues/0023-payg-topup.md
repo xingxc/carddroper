@@ -1,7 +1,7 @@
 ---
 id: 0023
 title: PAYG topup (chassis) — /billing/topup + /billing/balance + payment_intent.succeeded handler + Stripe Elements TopupForm
-status: open
+status: resolved
 priority: medium (first user-facing billing surface; completes the "user pays money → balance increases" loop end-to-end; chassis primitive, not carddroper-specific)
 found_by: PLAN.md §10.6 Stripe-layer roadmap; sequenced second after 0022 (app-shell refactor complete) so the Billing link slots into the existing ProfileMenu Settings section without layout churn. Pre-scope decisions locked in during the 2026-04-23 ultrathink sessions on Qs 8/9/10 (presets+free-form, idempotency now, no forced balance placement).
 ---
@@ -544,4 +544,35 @@ Orchestrator (on close):
 
 ## Resolution
 
-*(filled in by orchestrator after user confirms Phase 1 + Phase 2 pass)*
+Landed across the chassis billing chain (2026-04-23 → 2026-04-25):
+
+| Phase | Commits | What |
+|---|---|---|
+| 0a backend | `5056a3a`, `8daacd8` | Dispatch registry (`app/billing/handlers/`), `payment_intent.succeeded` handler, `POST /billing/topup`, `GET /billing/balance`, `TOPUP_RATE_LIMIT`, 19-test suite, `smoke_billing.py`, backend-api.md updates. |
+| 0b frontend | `c13298e` | Stripe Elements wiring (`lib/stripe.ts`, `useBalance`, `BalanceDisplay`, `TopupForm` two-phase fetch-secret + confirm + poll), `/app/billing` page, ProfileMenu Billing link, env wiring (Dockerfile + docker-compose + cloudbuild). |
+| Sub-fixes | `5f2b355`, `11b8c9a` | 0023.1 — Kind-1 `patch.object` + Kind-2 module-level `pytestmark.skipif`. Both `.env` states green. |
+| Race fix | `247b201` | 0023.2 — atomic `pg_insert(StripeEvent).on_conflict_do_nothing(index_elements=["id"])` replaces SELECT-then-INSERT. Two new tests pin the contract. |
+| Staging glue | `61528c2`, `892bd66`, `0946a49` | Cloud Build secrets (`STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`) + `BILLING_ENABLED=true`; frontend Dockerfile `ARG NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY`; billing page moved to `/app/billing` (route group `(app)` doesn't appear in URL — needed nested literal `app/`). |
+| Doc | `060407d` | Env-var tier structure: root `.env.example` + `development.md §Env-var tiers` + docker-compose comment. Documents the docker-compose substitution layer surfaced during staging rollout. |
+
+**Phase 1 (local):** end-to-end topup with `4242 4242 4242 4242`, `stripe listen` forwarding, balance polled and reflected, ledger row written. Decline card (`4000 0000 0000 0002`) → inline error with form preserved. Range validation rejects $0.25 / $600. Free-form $7.50 produces ledger row with `amount_micros=7500000`.
+
+**Phase 2 (staging):** GCP wiring via Secret Manager (one-step `echo -n "X" | gcloud secrets create NAME --data-file=-`); Cloud Build trigger gained `_STRIPE_PUBLISHABLE_KEY` substitution variable; Stripe Dashboard webhook endpoint configured at `https://api.staging.carddroper.com/billing/webhook` with curated event list (currently only `payment_intent.succeeded`; subscription/invoice events deferred to 0024). Full smoke battery green: `smoke_healthz.py`, `smoke_auth.py`, `smoke_cors.py`, `smoke_verify_email.py`, `smoke_billing.py` all return SMOKE OK. Real Stripe test-mode topup walked end-to-end: preset $5 + custom amount both produced Customer in Dashboard + `balance_ledger` rows on staging DB.
+
+**Gotchas captured during rollout (deferred for follow-up doc commit):**
+
+1. **`printenv` is meaningless for `NEXT_PUBLIC_*`.** Next.js inlines those at build time; runtime container env doesn't carry them. Verify with `grep "pk_test_" /app/.next` instead.
+2. **Four-file invariant for new `NEXT_PUBLIC_*` build-args:** Dockerfile `ARG` + `ENV`, docker-compose `args:`, cloudbuild `--build-arg`, `.env.example`. Missing any of the four silently ships an empty value.
+3. **Route groups in parens (`(app)`) don't appear in URLs.** Page at `app/(app)/billing/page.tsx` serves `/billing`; needed nested literal `app/billing/page.tsx` for `/app/billing`.
+
+**Chassis outcomes:**
+
+- Dispatch registry pattern proven; 0024 subscription handlers + future refund handlers are import-plus-decorator additions.
+- `BalanceDisplay` + `useBalance` shipped as chassis primitives; available for any project UI without forced placement.
+- Lazy Customer creation means `BILLING_ENABLED` can flip on at any time without backfill.
+- Atomic-INSERT idempotency (0023.2) is now the chassis pattern for all webhook handlers.
+- Test isolation discipline (0023.1) codified in `doc/operations/testing.md` and 0018 audit candidate.
+
+**Sub-tickets closed:** 0023.1 (test isolation Kind-1 + Kind-2), 0023.2 (webhook dedup race).
+
+**Next:** 0024 subscribe + subscription lifecycle handlers; 0025+ Customer Portal + pricing page integration.
