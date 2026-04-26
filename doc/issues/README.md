@@ -67,7 +67,7 @@ The Verification section exists because "tsc passes" and "lint passes" are neces
 | 0016.6 | proactive access-token refresh — OAuth 2.0 expires_in + 80%-TTL scheduler | resolved | medium |
 | 0016.7 | drop redundant logout client-state reset — hard-reload supersedes in-tree cache invalidation | resolved | low |
 | 0016.8 | distinct 401 error codes — stop wasted /auth/logout cleanup POSTs on anonymous + post-logout loads | resolved | medium |
-| 0017 | change-email retroactive audit — verify spec compliance + close any gaps | open | high |
+| 0017 | change-email retroactive audit — verify spec compliance + close any gaps | resolved | high |
 | 0018 | chassis-hardening audit — find missing validators, grow chassis-contract.md | resolved | medium |
 | 0019 | email deliverability — SendGrid Sender Authentication + SPF / DKIM / DMARC | open | high |
 | 0020 | legal acceptance — ToS checkbox on /register + /legal/terms + /legal/privacy static pages | open | high |

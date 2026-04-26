@@ -1,7 +1,7 @@
 ---
 id: 0017
 title: change-email retroactive audit — verify spec compliance + close any gaps
-status: open
+status: resolved (backend complete; frontend pages PAUSED → 0017.1 follow-up)
 priority: high (security-relevant: notification-to-old-address is the silent-account-takeover canary per PLAN.md §6 #8)
 found_by: 0018 chassis-hardening audit (token-version-bump grep found `POST /auth/confirm-email-change` at `auth.py:682` without a corresponding ticket file)
 ---
@@ -195,4 +195,49 @@ PAUSE conditions (do NOT work around):
 
 ## Resolution
 
-*(filled in by orchestrator after agent reports)*
+Landed 2026-04-25 as commit `13fbaaa`. Audit completed per §Audit checklist; one critical gap closed inline; two PAUSED items (frontend pages) deferred to 0017.1.
+
+### Gap-analysis table (15/15 items addressed)
+
+| # | Item | Classification | Action |
+|---|---|---|---|
+| 1 | Request endpoint `POST /auth/change-email` | present-and-correct | None — uses `get_current_user` (not `require_verified`) by **deliberate design**: lets users with a typo'd email fix it before verifying. Design choice documented in `require_not_locked` docstring; new `test_change_email_unverified_within_grace_allowed` codifies the behavior. |
+| 2 | Confirm endpoint `POST /auth/confirm-email-change` | present-with-gap | Fixed (see item 3). |
+| 3 | **Notification email to OLD address — security canary** | **present-with-gap (CRITICAL)** | **FIXED.** The notification was sent AFTER `user.email = new_email` and `token_version += 1`. A send-failure cascade post-flip would leave the original owner with **no notification AND no longer-controlled email** — exactly the silent-account-takeover failure mode `PLAN.md §6 #8` calls out. Moved the `send_email` call to **before** the flip so the canary fires before any state change is committed. Code comment in `auth.py` confirm_email_change explains the ordering requirement. |
+| 4 | Frontend page `(auth)/change-email/page.tsx` | **missing** | PAUSED → 0017.1 (frontend-builder follow-up). |
+| 5 | Frontend page `(auth)/confirm-email-change/page.tsx` | **missing** | PAUSED → 0017.1. |
+| 6 | Tests | present-with-gap | Added `tests/test_change_email.py` with 18 tests (see below). |
+| 7 | Chassis-contract entries | present-and-correct | None added — no new startup-time invariants. The token-version-bump table from 0018 already classifies confirm-email-change correctly. |
+
+### Tests added (18, all in `tests/test_change_email.py`)
+
+**Mandatory items from §Audit checklist item 6:**
+
+- `test_confirm_email_change_sends_notification_to_old_address` — **the security canary itself.** Asserts `send_email` was called with the OLD email address + `SENDGRID_TEMPLATE_EMAIL_CHANGED`.
+- `test_confirm_email_change_notification_sent_before_flip` — **proves the ordering at runtime.** Mocks `send_email` to raise; asserts `user.email` is unchanged after the call. Demonstrates the canary fires before any state mutation.
+
+**Request endpoint coverage (8 tests):** `requires_auth`, `unverified_within_grace_allowed` (codifies the design choice), `wrong_current_password`, `invalid_email_format`, `same_as_current`, `already_taken`, `sends_verification_to_new_address`, `does_not_flip_email_yet`.
+
+**Confirm endpoint coverage (8 tests, plus the two mandatory above):** `invalid_token`, `expired_token`, `replays_token`, `flips_email`, `bumps_token_version`, `race_condition_email_taken`, `old_email_login_rejected`, `new_email_login_works`.
+
+### Verification
+
+- **Two-state pytest:** `BILLING_ENABLED=true` → 144 passed, 0 failed, 0 skipped (126 baseline from 0018 + 18 new). `BILLING_ENABLED=false` → 123 passed, 0 failed, 21 skipped (the test_billing_topup.py module-level skipif from 0023.1; change-email tests run in both states because they don't depend on `BILLING_ENABLED`).
+- **ruff:** `ruff check .` clean; `ruff format --check .` clean (test_change_email.py reformatted on commit).
+- **No new dependencies, no migrations, no env vars, no chassis-contract changes.**
+
+### Headline takeaway
+
+The audit was scoped specifically to catch the silent-account-takeover canary failure mode. It found exactly that — a critical ordering bug that would have been invisible until exploited. Cost to fix: ~10 lines of code reordered; cost of *not* fixing: indeterminate but potentially permanent loss of account control on compromise. The retroactive audit pattern earned its keep here, mirroring the chassis-reliability principle from 0018.
+
+### PAUSED — 0017.1 follow-up scope (frontend-builder)
+
+Both `frontend/app/(auth)/change-email/page.tsx` and `frontend/app/(auth)/confirm-email-change/page.tsx` are absent. The backend API exists, is fully tested, and is secure, but **change-email is not currently reachable through the UI**. `site-model.md:32` mentions change-email as part of the `(auth)/` route group, but the pages were never landed.
+
+Proposed 0017.1 scope:
+
+- `(auth)/change-email/page.tsx` — form: current password + new email; POSTs to `/auth/change-email`; success state ("verification link sent to your new address"); error states (wrong password, email taken, validation).
+- `(auth)/confirm-email-change/page.tsx` — reads `?token=` from URL; POSTs to `/auth/confirm-email-change`; success → redirect to `/login` with "please log in with your new email" message; error states (expired, invalid, replay).
+- Link from ProfileMenu Settings section (mirroring the Billing link pattern from 0023).
+- Standard frontend gates: `npm run lint`, `npx tsc --noEmit`, `npm run build`.
+- No backend changes — that surface is locked by this ticket.
