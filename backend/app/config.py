@@ -190,6 +190,7 @@ class Settings(BaseSettings):
     CHANGE_EMAIL_RATE_LIMIT: str = "3/hour"
     CONFIRM_EMAIL_CHANGE_RATE_LIMIT: str = "10/minute"
     TOPUP_RATE_LIMIT: str = "10/minute"
+    SUBSCRIBE_RATE_LIMIT: str = "5/minute"  # deliberately un-validated — chassis-tunable rate limit; chassis-contract entry not required (per 0018 audit pattern for rate-limit settings)
 
     # Per-account login lockout (independent of per-IP)
     # Deliberately un-validated: purely product-tunable; all have safe non-zero defaults.

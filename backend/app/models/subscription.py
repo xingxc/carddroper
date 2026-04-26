@@ -19,6 +19,9 @@ class Subscription(Base):
     stripe_subscription_id: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     stripe_price_id: Mapped[str] = mapped_column(String(64), nullable=False)
     tier_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    tier_name: Mapped[str] = mapped_column(
+        String(64), nullable=False
+    )  # mirrored from Price.metadata.tier_name at subscribe + on update
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     grant_micros: Mapped[int] = mapped_column(BigInteger, nullable=False)
     current_period_start: Mapped[Optional[datetime]] = mapped_column(nullable=True)
