@@ -10,7 +10,8 @@ Google Cloud deployment playbook. This doc is a stub that gets filled in as we s
 - [x] `carddroper-staging` Cloud Build trigger wired to `main`
 - [x] `carddroper-staging` deployed (backend + frontend)
 - [x] `carddroper-staging` custom domain mapped (frontend + api)
-- [ ] `carddroper-staging` Stripe webhook endpoint configured
+- [x] `carddroper-staging` Stripe webhook endpoint configured (2026-04-25, `payment_intent.succeeded` only; subscription/invoice events deferred to 0024)
+- [x] `carddroper-staging` default compute SA deleted; both Cloud Run services on dedicated runtime SAs (per §Service-account discipline; 2026-04-25 / ticket 0018)
 - [ ] `carddroper-prod` GCP project created
 - [ ] `carddroper-prod` Cloud SQL instance created
 - [ ] `carddroper-prod` secrets uploaded
@@ -18,6 +19,7 @@ Google Cloud deployment playbook. This doc is a stub that gets filled in as we s
 - [ ] `carddroper-prod` deployed
 - [ ] `carddroper-prod` domain mapped (frontend + api)
 - [ ] `carddroper-prod` Stripe live webhook endpoint configured
+- [ ] `carddroper-prod` default compute SA deleted (apply same sequence as staging — see §Service-account discipline)
 
 ## High-level plan
 
@@ -77,7 +79,90 @@ Per project (`carddroper-staging` and `carddroper-prod` each have their own):
 | `carddroper-stripe-webhook-secret` | `whsec_...` | Cloud Run backend |
 | `carddroper-sendgrid-api-key` | `SG....` | Cloud Run backend |
 
-The Compute Engine default service account needs `roles/secretmanager.secretAccessor` on each.
+The dedicated backend runtime SA (`carddroper-runtime@<project>.iam.gserviceaccount.com`) needs `roles/secretmanager.secretAccessor` on each. The default Compute Engine SA is **deleted** per §Service-account discipline below — relying on it would inherit `Editor` and is a chassis-reliability violation.
+
+## Service-account discipline
+
+Every Cloud Run service deploys with an explicit `--service-account` flag in `cloudbuild.yaml`. The default Compute Engine SA (`<PROJECT_NUMBER>-compute@developer.gserviceaccount.com`) is **deleted** per project — relying on it is a chassis-reliability violation. With the default SA absent, any Cloud Run deploy missing `--service-account` fails at deploy time with a clear error rather than silently inheriting the SA's `Editor` role.
+
+### Per-service runtime SAs
+
+| Service | Runtime SA | Project-level roles | Why |
+|---|---|---|---|
+| `carddroper-backend` | `carddroper-runtime@<project>.iam.gserviceaccount.com` | `roles/secretmanager.secretAccessor`, `roles/cloudsql.client` | Reads secrets at boot; opens Cloud SQL connections via Auth Proxy |
+| `carddroper-frontend` | `carddroper-frontend-runtime@<project>.iam.gserviceaccount.com` | none | Stateless Next.js SSR; makes no outbound GCP API calls |
+
+### Default compute SA cleanup (one-time, per project)
+
+Origin: 0018 chassis-hardening audit. Executed for `carddroper-staging` on 2026-04-25; same cleanup pending for `carddroper-prod` when it stands up. Run as the project Owner.
+
+```bash
+PROJECT=carddroper-staging  # or carddroper-prod
+PROJECT_NUMBER=$(gcloud projects describe $PROJECT --format='value(projectNumber)')
+```
+
+1. **Verify dependencies** on the default compute SA. Expected: only the frontend Cloud Run service depends on it (any service deployed without `--service-account`).
+
+   ```bash
+   gcloud run services list --project=$PROJECT \
+     --format='table(metadata.name,spec.template.spec.serviceAccountName)'
+   gcloud functions list --project=$PROJECT 2>/dev/null || echo "no functions"
+   gcloud scheduler jobs list --project=$PROJECT 2>/dev/null || echo "no scheduler"
+   gcloud run jobs list --project=$PROJECT
+   ```
+
+2. **Create dedicated SAs** for any service that lacks one (carddroper-staging needed `carddroper-frontend-runtime`; the backend already had `carddroper-runtime`):
+
+   ```bash
+   gcloud iam service-accounts create carddroper-frontend-runtime \
+     --display-name="Carddroper frontend runtime" --project=$PROJECT
+   ```
+
+3. **Grant Cloud Build `actAs` permission** on each new SA so the deploy step can run as it:
+
+   ```bash
+   gcloud iam service-accounts add-iam-policy-binding \
+     carddroper-frontend-runtime@${PROJECT}.iam.gserviceaccount.com \
+     --member="serviceAccount:carddroper-build@${PROJECT}.iam.gserviceaccount.com" \
+     --role="roles/iam.serviceAccountUser" --project=$PROJECT
+   ```
+
+4. **Update `cloudbuild.yaml`** deploy steps to pass `--service-account=<sa>@${PROJECT}.iam.gserviceaccount.com`. Push; verify Cloud Build succeeds and `gcloud run services list` shows the new binding.
+
+5. **Delete the default compute SA:**
+
+   ```bash
+   gcloud iam service-accounts delete \
+     ${PROJECT_NUMBER}-compute@developer.gserviceaccount.com --project=$PROJECT
+   ```
+
+6. **Stale-binding cleanup (gotcha).** GCP doesn't auto-remove IAM bindings when an SA is deleted — it marks them `deleted:serviceAccount:...?uid=<uid>` for 30-day `undelete` recovery. The binding is functionally inert but pollutes the IAM policy. Find the `?uid=...` suffix in `get-iam-policy` output and remove explicitly:
+
+   ```bash
+   gcloud projects get-iam-policy $PROJECT \
+     --flatten="bindings[].members" \
+     --format="table(bindings.role,bindings.members)" \
+     --filter="bindings.members:${PROJECT_NUMBER}-compute"
+   # Copy the ?uid=... suffix from the deleted-member entry.
+
+   gcloud projects remove-iam-policy-binding $PROJECT \
+     --member="deleted:serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com?uid=<paste>" \
+     --role="roles/editor" \
+     --condition=None
+   ```
+
+   `--condition=None` skips the interactive condition selector — required because the policy has conditional bindings.
+
+7. **Verify clean.** No bindings reference `${PROJECT_NUMBER}-compute`; project Editor scan returns only human Owners (Owner > Editor, so no project-Editor binding is expected).
+
+   ```bash
+   gcloud projects get-iam-policy $PROJECT \
+     --flatten="bindings[].members" \
+     --format="table(bindings.role,bindings.members)" \
+     --filter="bindings.role:roles/editor"
+   ```
+
+**Recovery:** within 30 days, `gcloud iam service-accounts undelete <unique_id>` restores the SA. After 30 days, recreation by name requires that the deleted SA's tombstone has cleared.
 
 ## Why migrate-before-deploy
 
