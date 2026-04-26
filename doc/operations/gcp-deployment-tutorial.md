@@ -486,11 +486,32 @@ The chassis defaults to SendGrid Dynamic Templates. For deliverability:
 3. Add those records at Cloudflare with **proxy status: DNS-only** (grey).
 4. Click **Verify** in SendGrid. Should pass within minutes.
 5. Add a DMARC record at Cloudflare:
-   - `TXT _dmarc "v=DMARC1; p=quarantine; rua=mailto:dmarc@<your-domain>"`
-   - Start at `p=quarantine`, not `p=reject`, until DMARC reports confirm legitimate mail isn't being dropped. Promote to `p=reject` after a few weeks of clean reports.
-6. Verify deliverability with a real signup. Check the inbox + spam folder.
+   - `TXT _dmarc "v=DMARC1; p=none; rua=mailto:dmarc@<your-domain>; fo=1"`
+   - Start at `p=none` (monitor-only) so legitimate-mail-failing-DMARC surfaces in `rua` reports without breaking delivery. Promote to `p=quarantine` after a clean week, then `p=reject` after a clean fortnight.
+   - For the `rua=` mailbox to actually receive reports, set up Cloudflare Email Routing for `dmarc@<your-domain>` → forward to your operations inbox. Skipping this means reports black-hole.
+6. **Disable account-level SendGrid tracking** — chassis posture for transactional email. SendGrid Dashboard → **Settings** → **Tracking** → uncheck:
+   - Click Tracking
+   - Open Tracking
+   - Subscription Tracking
+   - Google Analytics Tracking
 
-Reference: `doc/operations/environments.md §Email DNS`, ticket 0010 (initial SendGrid setup), and (when written) ticket 0019 (full SPF/DKIM/DMARC + Sender Authentication ticket).
+   Why all four off:
+   - **Click Tracking** rewrites email URLs through SendGrid's Link Branding subdomain (e.g., `url1234.<your-domain>`). That subdomain only serves valid HTTPS after Link Branding is **Verified** in SendGrid Dashboard, which provisions a TLS cert. Until verified (and even after, depending on cert propagation), clickable links break with a Chrome `doesn't support a secure connection with HTTPS` warning. Disabling Click Tracking eliminates the dependency entirely and routes links directly to your chassis domain — cleaner URLs, no SendGrid redirect, no privacy concern.
+   - **Open Tracking** embeds a 1×1 pixel; no business value for one-off triggered emails; increasingly blocked by Apple Mail Privacy Protection + corporate scanners; privacy-icky on the security canary specifically (you'd be measuring whether the user noticed an account-takeover alert).
+   - **Subscription Tracking** auto-inserts an unsubscribe footer that doesn't belong on CAN-SPAM-exempt transactional mail, and would conflict with the chassis's polished templates (which deliberately have no unsubscribe block — see 0019.1).
+   - **Google Analytics Tracking** appends UTM parameters; marketing-only; pure noise on auth/security emails (and UTM-tagged URLs look more spammy to filters).
+
+   If you later add marketing email surface (a future ticket, separate from anything in chassis v1), enable tracking **per-send** in the Mail Send API call (`mail.tracking_settings.click_tracking.enable=True`) rather than flipping the account default. Account-default-off + per-send-override-on for marketing is the chassis-correct shape.
+
+7. **Polish the SendGrid Dynamic Templates** — set Subject lines on all 5 templates and replace placeholder bodies with branded HTML. The chassis ships polished default templates documented in ticket 0019.1 (`carddroper-verify-email`, `carddroper-reset-password`, `carddroper-change-email`, `carddroper-email-changed`, `carddroper-credits-purchased`). Copy-paste the HTML + plain text from 0019.1 into each template's active version and save. Adopters substitute "Carddroper" with their brand name. Without this polish, emails land in spam (empty Subject is the biggest single spam signal in Gmail).
+
+8. **Verify deliverability with a real send** — best test is the change-email flow on staging (exercises both `SENDGRID_TEMPLATE_CHANGE_EMAIL` and the security canary `SENDGRID_TEMPLATE_EMAIL_CHANGED` in one user action):
+   - Log in to your staging URL → Profile menu → Change email → submit.
+   - On both delivered emails (verification at new address + canary at old address), Gmail "Show original" should show `dkim=pass`, `spf=pass`, `dmarc=pass`.
+   - Both should land in **Primary** inbox, not Spam or Promotions.
+   - Optional: send a test verify email to https://www.mail-tester.com/ for an objective 0–10 score (aim for 9+).
+
+References: `doc/operations/environments.md §Email DNS`, ticket 0010 (initial SendGrid integration), ticket 0019 (full SPF/DKIM/DMARC + Sender Authentication runbook), ticket 0019.1 (template polish + tracking-disable origin).
 
 ---
 

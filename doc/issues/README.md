@@ -71,7 +71,7 @@ The Verification section exists because "tsc passes" and "lint passes" are neces
 | 0017.1 | change-email frontend pages — request form + confirm landing + ProfileMenu link | resolved | medium |
 | 0018 | chassis-hardening audit — find missing validators, grow chassis-contract.md | resolved | medium |
 | 0019 | email deliverability — SendGrid Sender Authentication + SPF / DKIM / DMARC | resolved | high |
-| 0019.1 | email template polish — Subject lines + branded HTML + drop unsubscribe block (5 templates) | open | medium |
+| 0019.1 | email template polish — Subject lines + branded HTML + drop unsubscribe block (5 templates) | resolved | medium |
 | 0024 | subscribe + lifecycle handlers (chassis) — /billing/subscribe + /billing/setup-intent + GET subscription + 5 webhook handlers + Stripe Elements SubscribeForm | open | medium |
 | 0020 | legal acceptance — ToS checkbox on /register + /legal/terms + /legal/privacy static pages | open | high |
 | 0021 | Stripe foundation (chassis) — balance ledger, billing primitives, webhook skeleton | resolved | medium |
