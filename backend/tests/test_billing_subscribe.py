@@ -1169,13 +1169,21 @@ async def test_handle_subscription_updated_syncs_state():
         async with session.begin():
             await handle_subscription_updated(event, session)
 
-    # Row reflects updated state.
+    # Row reflects updated state — status + cancel_at_period_end synced; period NOT changed.
     async with AsyncSession(engine, expire_on_commit=False) as session:
         result = await session.execute(select(Subscription).where(Subscription.user_id == user_id))
         row = result.scalar_one()
     assert row.cancel_at_period_end is True
-    expected_end = datetime.fromtimestamp(new_period_end, tz=timezone.utc).replace(tzinfo=None)
-    assert row.current_period_end == expected_end
+    # Period fields are NOT updated by handle_subscription_updated (ticket 0024.5).
+    # The pre-existing period from _create_subscription_row should be preserved.
+    # (new_period_end in the event is ignored; invoice.paid cycle handler owns renewals.)
+    original_period_end = datetime.fromtimestamp(_PERIOD_END_TS, tz=timezone.utc).replace(
+        tzinfo=None
+    )
+    assert row.current_period_end == original_period_end, (
+        "handle_subscription_updated must NOT overwrite period fields — invoice.paid cycle "
+        "handler is authoritative for renewal periods (ticket 0024.5)"
+    )
 
     # No ledger entry.
     async with AsyncSession(engine, expire_on_commit=False) as session:
@@ -1362,6 +1370,175 @@ async def test_handle_invoice_paid_subscription_cycle_grants():
         row = result.scalar_one()
     expected_end = datetime.fromtimestamp(new_period_end, tz=timezone.utc).replace(tzinfo=None)
     assert row.current_period_end == expected_end
+
+
+@pytest.mark.asyncio
+async def test_handle_invoice_paid_subscription_cycle_updates_periods():
+    """invoice.paid (subscription_cycle) updates current_period_* from invoice line-item period.
+
+    Architectural invariant (ticket 0024.5): invoice.paid cycle handler is the
+    authoritative source for renewal period boundaries. This test verifies that
+    the period fields are updated from invoice.lines.data[0].period.start/end,
+    independently of the subscription.created/updated handlers which do NOT write periods.
+    """
+    from app.billing.handlers.subscription import handle_invoice_paid
+    from app.services.auth_service import hash_password
+
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        async with session.begin():
+            user = User(
+                email="inv_cycle_period_update@example.com",
+                password_hash=hash_password("Password123!"),
+                full_name="Inv Cycle Period Update",
+                stripe_customer_id="cus_cycle_period",
+            )
+            session.add(user)
+            await session.flush()
+            user_id = user.id
+
+    # Pre-insert row with the INITIAL period (as set by subscribe endpoint).
+    initial_start = datetime(2026, 1, 1, tzinfo=None)
+    initial_end = datetime(2026, 2, 1, tzinfo=None)
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        async with session.begin():
+            row = Subscription(
+                user_id=user_id,
+                stripe_subscription_id="sub_cycle_period_001",
+                stripe_price_id="price_test_001",
+                tier_key="starter_monthly",
+                tier_name="Starter",
+                status="active",
+                grant_micros=10_000_000,
+                current_period_start=initial_start,
+                current_period_end=initial_end,
+                cancel_at_period_end=False,
+            )
+            session.add(row)
+
+    # New period from the renewal invoice.
+    new_period_start_ts = int(datetime(2026, 2, 1, tzinfo=timezone.utc).timestamp())
+    new_period_end_ts = int(datetime(2026, 3, 1, tzinfo=timezone.utc).timestamp())
+
+    line_period = MagicMock()
+    line_period.start = new_period_start_ts
+    line_period.end = new_period_end_ts
+
+    line = MagicMock()
+    line.period = line_period
+
+    invoice_obj = MagicMock()
+    invoice_obj.billing_reason = "subscription_cycle"
+    invoice_obj.subscription = "sub_cycle_period_001"
+    invoice_obj.lines.data = [line]
+
+    event = MagicMock()
+    event.id = "evt_inv_cycle_period_001"
+    event.data.object = invoice_obj
+
+    with patch.object(settings, "BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER", True):
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            async with session.begin():
+                await handle_invoice_paid(event, session)
+
+    # Period fields should be updated to the new renewal period from the invoice.
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(select(Subscription).where(Subscription.user_id == user_id))
+        row = result.scalar_one()
+
+    expected_new_start = datetime(2026, 2, 1, tzinfo=None)
+    expected_new_end = datetime(2026, 3, 1, tzinfo=None)
+
+    assert row.current_period_start == expected_new_start, (
+        f"invoice.paid cycle handler must update current_period_start from invoice line period. "
+        f"Expected {expected_new_start!r}, got {row.current_period_start!r}. "
+        f"Architectural invariant: invoice.paid is authoritative for renewal periods (ticket 0024.5)."
+    )
+    assert row.current_period_end == expected_new_end, (
+        f"invoice.paid cycle handler must update current_period_end from invoice line period. "
+        f"Expected {expected_new_end!r}, got {row.current_period_end!r}. "
+        f"Architectural invariant: invoice.paid is authoritative for renewal periods (ticket 0024.5)."
+    )
+    assert row.current_period_start.tzinfo is None, "Should be naive UTC"
+    assert row.current_period_end.tzinfo is None, "Should be naive UTC"
+
+    # Ledger entry also written (grants enabled).
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(
+            select(BalanceLedger).where(BalanceLedger.user_id == user_id)
+        )
+        entries = result.scalars().all()
+    assert len(entries) == 1
+    assert entries[0].reason == "subscription_reset"
+    assert entries[0].stripe_event_id == "evt_inv_cycle_period_001"
+
+
+@pytest.mark.asyncio
+async def test_handle_invoice_paid_subscription_create_no_op_periods():
+    """invoice.paid (subscription_create) does NOT write period fields.
+
+    Architectural invariant (ticket 0024.5): initial period is the subscribe
+    endpoint's job. The subscription_create invoice.paid is a no-op — it should
+    not modify period fields or ledger.
+    """
+    from app.billing.handlers.subscription import handle_invoice_paid
+    from app.services.auth_service import hash_password
+
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        async with session.begin():
+            user = User(
+                email="inv_create_noop_period@example.com",
+                password_hash=hash_password("Password123!"),
+                full_name="Inv Create NoOp Period",
+            )
+            session.add(user)
+            await session.flush()
+            user_id = user.id
+
+    # Pre-insert row with known periods (as subscribe endpoint would write).
+    pre_period_start = datetime(2026, 1, 1, tzinfo=None)
+    pre_period_end = datetime(2026, 2, 1, tzinfo=None)
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        async with session.begin():
+            row = Subscription(
+                user_id=user_id,
+                stripe_subscription_id="sub_create_noop_001",
+                stripe_price_id="price_test_001",
+                tier_key="starter_monthly",
+                tier_name="Starter",
+                status="active",
+                grant_micros=10_000_000,
+                current_period_start=pre_period_start,
+                current_period_end=pre_period_end,
+                cancel_at_period_end=False,
+            )
+            session.add(row)
+
+    invoice_obj = MagicMock()
+    invoice_obj.billing_reason = "subscription_create"
+    invoice_obj.subscription = "sub_create_noop_001"
+
+    event = MagicMock()
+    event.id = "evt_inv_create_noop_period_001"
+    event.data.object = invoice_obj
+
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        async with session.begin():
+            await handle_invoice_paid(event, session)
+
+    # No ledger entry — subscription_create is a no-op.
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(
+            select(BalanceLedger).where(BalanceLedger.user_id == user_id)
+        )
+        entries = result.scalars().all()
+    assert len(entries) == 0
+
+    # Period fields unchanged — subscription_create no-op does not touch the row.
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(select(Subscription).where(Subscription.user_id == user_id))
+        row = result.scalar_one()
+    assert row.current_period_start == pre_period_start
+    assert row.current_period_end == pre_period_end
 
 
 @pytest.mark.asyncio
@@ -1893,10 +2070,17 @@ async def test_subscribe_persists_current_period_fields(client):
 
 @pytest.mark.asyncio
 async def test_handle_subscription_created_persists_periods():
-    """handle_subscription_created → subscriptions row has both period fields populated.
+    """handle_subscription_created webhook does NOT overwrite pre-existing period fields.
 
-    Regression guard (0024.4): the created handler must persist current_period_*
-    from the event payload, not leave them NULL even when overwriting an existing row.
+    Architectural invariant (ticket 0024.5 Path B): the subscription.created webhook
+    handler must NOT overwrite current_period_* on an existing row. The subscribe
+    endpoint is the authoritative source of truth for initial periods. If the webhook
+    arrives after the endpoint has already written good period values, those values
+    must be preserved — even if the webhook payload has no extractable period data.
+
+    This is the primary regression guard for the NULL-period bug: subscriptions created
+    under `stripe listen` were having their endpoint-written periods silently overwritten
+    with NULL by the webhook handler.
     """
     from app.billing.handlers.subscription import handle_subscription_created
     from app.services.auth_service import hash_password
@@ -1913,6 +2097,27 @@ async def test_handle_subscription_created_persists_periods():
             await session.flush()
             user_id = user.id
 
+    # Pre-insert a subscriptions row with known period values (as the subscribe endpoint would).
+    pre_period_start = datetime(2026, 1, 1, tzinfo=None)
+    pre_period_end = datetime(2026, 2, 1, tzinfo=None)
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        async with session.begin():
+            existing_row = Subscription(
+                user_id=user_id,
+                stripe_subscription_id="sub_period_created_001",
+                stripe_price_id="price_period_001",
+                tier_key="starter_monthly",
+                tier_name="Starter",
+                status="active",
+                grant_micros=10_000_000,
+                current_period_start=pre_period_start,
+                current_period_end=pre_period_end,
+                cancel_at_period_end=False,
+            )
+            session.add(existing_row)
+
+    # Build a webhook event that has NO extractable period data
+    # (simulates the API-version variance where current_period_* isn't at top level).
     price_mock = MagicMock()
     price_mock.id = "price_period_001"
     price_mock.lookup_key = "starter_monthly"
@@ -1925,8 +2130,9 @@ async def test_handle_subscription_created_persists_periods():
     sub_obj.id = "sub_period_created_001"
     sub_obj.status = "active"
     sub_obj.cancel_at_period_end = False
-    sub_obj.current_period_start = _PERIOD_START_TS
-    sub_obj.current_period_end = _PERIOD_END_TS
+    # Simulate period fields absent/None in the webhook payload.
+    sub_obj.current_period_start = None
+    sub_obj.current_period_end = None
     sub_obj.metadata = {"user_id": str(user_id)}
     sub_obj.items.data = [sub_item]
 
@@ -1934,7 +2140,75 @@ async def test_handle_subscription_created_persists_periods():
     event.id = "evt_period_created_001"
     event.data.object = sub_obj
 
-    with patch.object(settings, "BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER", True):
+    with patch.object(settings, "BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER", False):
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            async with session.begin():
+                await handle_subscription_created(event, session)
+
+    # The pre-existing period values must be preserved — the webhook must NOT overwrite them.
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(select(Subscription).where(Subscription.user_id == user_id))
+        row = result.scalar_one_or_none()
+
+    assert row is not None
+    assert row.current_period_start == pre_period_start, (
+        f"handle_subscription_created webhook MUST NOT overwrite pre-existing period fields. "
+        f"Expected {pre_period_start!r}, got {row.current_period_start!r}. "
+        f"Architectural invariant: subscribe endpoint is authoritative (ticket 0024.5)."
+    )
+    assert row.current_period_end == pre_period_end, (
+        f"handle_subscription_created webhook MUST NOT overwrite pre-existing period fields. "
+        f"Expected {pre_period_end!r}, got {row.current_period_end!r}. "
+        f"Architectural invariant: subscribe endpoint is authoritative (ticket 0024.5)."
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_subscription_created_inserts_periods_on_fresh_row():
+    """handle_subscription_created inserts period fields when creating a brand-new row.
+
+    The INSERT path (no pre-existing row) should still write current_period_*
+    from the event payload. This covers the rare out-of-band case where the
+    webhook is the first to create the subscriptions row (no subscribe endpoint ran).
+    """
+    from app.billing.handlers.subscription import handle_subscription_created
+    from app.services.auth_service import hash_password
+
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        async with session.begin():
+            user = User(
+                email="handler_period_fresh@example.com",
+                password_hash=hash_password("Password123!"),
+                full_name="Handler Period Fresh",
+                stripe_customer_id="cus_handler_period_fresh",
+            )
+            session.add(user)
+            await session.flush()
+            user_id = user.id
+
+    # No pre-existing row — webhook is first to insert.
+    price_mock = MagicMock()
+    price_mock.id = "price_period_fresh_001"
+    price_mock.lookup_key = "starter_monthly"
+    price_mock.metadata = {"grant_micros": "10000000", "tier_name": "Starter"}
+
+    sub_item = MagicMock()
+    sub_item.price = price_mock
+
+    sub_obj = MagicMock()
+    sub_obj.id = "sub_period_fresh_001"
+    sub_obj.status = "active"
+    sub_obj.cancel_at_period_end = False
+    sub_obj.current_period_start = _PERIOD_START_TS
+    sub_obj.current_period_end = _PERIOD_END_TS
+    sub_obj.metadata = {"user_id": str(user_id)}
+    sub_obj.items.data = [sub_item]
+
+    event = MagicMock()
+    event.id = "evt_period_fresh_001"
+    event.data.object = sub_obj
+
+    with patch.object(settings, "BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER", False):
         async with AsyncSession(engine, expire_on_commit=False) as session:
             async with session.begin():
                 await handle_subscription_created(event, session)
@@ -1944,30 +2218,32 @@ async def test_handle_subscription_created_persists_periods():
         row = result.scalar_one_or_none()
 
     assert row is not None
-    assert row.current_period_start is not None, (
-        "handle_subscription_created: current_period_start should be populated; got NULL. "
-        "Regression: handler not extracting period fields from event payload."
-    )
-    assert row.current_period_end is not None, (
-        "handle_subscription_created: current_period_end should be populated; got NULL. "
-        "Regression: handler not extracting period fields from event payload."
-    )
-
+    assert row.stripe_subscription_id == "sub_period_fresh_001"
+    # INSERT path: period fields should be set from the event payload.
     expected_start = datetime.fromtimestamp(_PERIOD_START_TS, tz=timezone.utc).replace(tzinfo=None)
     expected_end = datetime.fromtimestamp(_PERIOD_END_TS, tz=timezone.utc).replace(tzinfo=None)
-    assert row.current_period_start == expected_start
-    assert row.current_period_end == expected_end
-    assert row.current_period_start.tzinfo is None, "current_period_start should be naive UTC"
-    assert row.current_period_end.tzinfo is None, "current_period_end should be naive UTC"
+    assert row.current_period_start == expected_start, (
+        "Fresh INSERT via handle_subscription_created should write period fields from event."
+    )
+    assert row.current_period_end == expected_end, (
+        "Fresh INSERT via handle_subscription_created should write period fields from event."
+    )
+    assert row.current_period_start.tzinfo is None, "Should be naive UTC"
+    assert row.current_period_end.tzinfo is None, "Should be naive UTC"
 
 
 @pytest.mark.asyncio
 async def test_handle_subscription_updated_persists_periods():
-    """handle_subscription_updated → subscriptions row has both period fields updated.
+    """handle_subscription_updated does NOT overwrite pre-existing period fields.
 
-    Regression guard (0024.4): the updated handler must persist current_period_*
-    from the event payload. A row that already has period data should be updated
-    to the new values from the event; a row with NULL periods should get them filled.
+    Architectural invariant (ticket 0024.5 Path B): the subscription.updated webhook
+    handler must NOT touch current_period_*. A pre-existing row with valid period
+    fields must retain them after the handler runs — even if the event payload carries
+    different period values.
+
+    This guards the case where a plan-change or cancel-at-period-end event fires and
+    the handler previously would overwrite the subscribe endpoint's correct values
+    with webhook-extracted values that may be None or incorrect.
     """
     from app.billing.handlers.subscription import handle_subscription_updated
     from app.services.auth_service import hash_password
@@ -1984,10 +2260,12 @@ async def test_handle_subscription_updated_persists_periods():
             await session.flush()
             user_id = user.id
 
-    # Create a row with NULL period fields (simulates the post-0024.2 regression state).
+    # Pre-insert a row with known, valid period values (as the subscribe endpoint would write).
+    pre_period_start = datetime(2026, 1, 1, tzinfo=None)
+    pre_period_end = datetime(2026, 2, 1, tzinfo=None)
     async with AsyncSession(engine, expire_on_commit=False) as session:
         async with session.begin():
-            row = Subscription(
+            existing_row = Subscription(
                 user_id=user_id,
                 stripe_subscription_id="sub_period_upd_001",
                 stripe_price_id="price_period_001",
@@ -1995,11 +2273,11 @@ async def test_handle_subscription_updated_persists_periods():
                 tier_name="Starter",
                 status="active",
                 grant_micros=10_000_000,
-                current_period_start=None,  # NULL — regression state
-                current_period_end=None,  # NULL — regression state
+                current_period_start=pre_period_start,
+                current_period_end=pre_period_end,
                 cancel_at_period_end=False,
             )
-            session.add(row)
+            session.add(existing_row)
 
     price_mock = MagicMock()
     price_mock.id = "price_period_001"
@@ -2009,12 +2287,16 @@ async def test_handle_subscription_updated_persists_periods():
     sub_item = MagicMock()
     sub_item.price = price_mock
 
+    # Event has different period values than the pre-existing row — handler must ignore them.
+    different_period_start = _PERIOD_START_TS
+    different_period_end = _PERIOD_END_TS + 86400 * 30
+
     sub_obj = MagicMock()
     sub_obj.id = "sub_period_upd_001"
     sub_obj.status = "active"
-    sub_obj.cancel_at_period_end = False
-    sub_obj.current_period_start = _PERIOD_START_TS
-    sub_obj.current_period_end = _PERIOD_END_TS
+    sub_obj.cancel_at_period_end = True  # flag that will be updated
+    sub_obj.current_period_start = different_period_start
+    sub_obj.current_period_end = different_period_end
     sub_obj.metadata = {"user_id": str(user_id)}
     sub_obj.items.data = [sub_item]
 
@@ -2030,21 +2312,20 @@ async def test_handle_subscription_updated_persists_periods():
         result = await session.execute(select(Subscription).where(Subscription.user_id == user_id))
         row = result.scalar_one()
 
-    assert row.current_period_start is not None, (
-        "handle_subscription_updated: current_period_start should be populated; got NULL. "
-        "Regression: handler not extracting period fields from event payload."
-    )
-    assert row.current_period_end is not None, (
-        "handle_subscription_updated: current_period_end should be populated; got NULL. "
-        "Regression: handler not extracting period fields from event payload."
-    )
+    # Non-period state fields were updated correctly.
+    assert row.cancel_at_period_end is True
 
-    expected_start = datetime.fromtimestamp(_PERIOD_START_TS, tz=timezone.utc).replace(tzinfo=None)
-    expected_end = datetime.fromtimestamp(_PERIOD_END_TS, tz=timezone.utc).replace(tzinfo=None)
-    assert row.current_period_start == expected_start
-    assert row.current_period_end == expected_end
-    assert row.current_period_start.tzinfo is None, "current_period_start should be naive UTC"
-    assert row.current_period_end.tzinfo is None, "current_period_end should be naive UTC"
+    # Period fields MUST be unchanged — the handler does not own period authority.
+    assert row.current_period_start == pre_period_start, (
+        f"handle_subscription_updated MUST NOT overwrite period fields. "
+        f"Expected {pre_period_start!r}, got {row.current_period_start!r}. "
+        f"Architectural invariant: subscribe endpoint + invoice.paid are authoritative (ticket 0024.5)."
+    )
+    assert row.current_period_end == pre_period_end, (
+        f"handle_subscription_updated MUST NOT overwrite period fields. "
+        f"Expected {pre_period_end!r}, got {row.current_period_end!r}. "
+        f"Architectural invariant: subscribe endpoint + invoice.paid are authoritative (ticket 0024.5)."
+    )
 
 
 @pytest.mark.asyncio

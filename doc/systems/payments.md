@@ -98,8 +98,8 @@ subscriptions (
     tier_name               VARCHAR(64) NOT NULL,   -- mirrors Price.metadata.tier_name at subscribe + on customer.subscription.updated; avoids a Stripe API call on every GET /billing/subscription
     status                  VARCHAR(32) NOT NULL,   -- trialing | active | past_due | cancelled | incomplete
     grant_micros            BIGINT NOT NULL,        -- per-period balance grant, mirrored from Price metadata at subscribe time
-    current_period_start    TIMESTAMP,              -- naive UTC; populated from Stripe Subscription.current_period_start (top-level Unix timestamp) at POST /billing/subscribe and on customer.subscription.created / updated events. Defense-in-depth: both the subscribe endpoint and the webhook handlers populate these fields independently.
-    current_period_end      TIMESTAMP,              -- naive UTC; same source as current_period_start. Used by GET /billing/subscription response and cancel-at-period-end UX. Also updated on invoice.paid (renewal) via the invoice line-item period.
+    current_period_start    TIMESTAMP,              -- naive UTC; single-source-of-truth model (ticket 0024.5): written by POST /billing/subscribe at creation (from Stripe SDK API response where current_period_* is reliably top-level); updated on renewal by invoice.paid (subscription_cycle) from invoice.lines.data[0].period.start (invoice schema is stable across Stripe API versions). customer.subscription.created writes it on INSERT only (rare out-of-band case); customer.subscription.updated does NOT touch it — webhook payload period extraction is unreliable across API versions.
+    current_period_end      TIMESTAMP,              -- naive UTC; same single-source-of-truth model as current_period_start. Used by GET /billing/subscription response and cancel-at-period-end UX (displays next billing date / access-through date).
     cancel_at_period_end    BOOLEAN NOT NULL DEFAULT false,
     created_at              TIMESTAMP DEFAULT now(),
     updated_at              TIMESTAMP DEFAULT now()

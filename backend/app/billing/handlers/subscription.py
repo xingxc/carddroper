@@ -192,6 +192,13 @@ async def handle_subscription_created(event: stripe.Event, db: AsyncSession) -> 
         grant_micros = 0
 
     # Upsert subscriptions row keyed on user_id (one subscription per user).
+    # NOTE: current_period_* are included in values= for the INSERT case (rare out-of-band
+    # subscription created before subscribe endpoint runs) but intentionally omitted from
+    # set_= in the UPDATE case. The subscribe endpoint is the authoritative source of truth
+    # for initial period fields; invoice.paid (subscription_cycle) handles renewals.
+    # Keeping period writes here in the UPDATE path would overwrite the subscribe endpoint's
+    # correctly-extracted values with webhook-extracted values that are unreliable across
+    # Stripe API versions (the root cause of ticket 0024.5).
     stmt = (
         pg_insert(Subscription)
         .values(
@@ -215,8 +222,9 @@ async def handle_subscription_created(event: stripe.Event, db: AsyncSession) -> 
                 "tier_name": tier_name,
                 "status": status,
                 "grant_micros": grant_micros,
-                "current_period_start": period_start,
-                "current_period_end": period_end,
+                # current_period_start and current_period_end deliberately omitted:
+                # subscribe endpoint (initial) and invoice.paid cycle handler (renewals)
+                # are authoritative. This handler does not overwrite period fields on update.
                 "cancel_at_period_end": cancel_at_period_end,
             },
         )
@@ -254,9 +262,13 @@ async def handle_subscription_created(event: stripe.Event, db: AsyncSession) -> 
 async def handle_subscription_updated(event: stripe.Event, db: AsyncSession) -> None:
     """Sync subscription state on update.
 
-    Updates status, period timestamps, cancel_at_period_end, tier metadata
-    (in case of plan change / upgrade / downgrade). Does NOT post a ledger
-    entry — only subscription.created and invoice.paid do that.
+    Updates status, cancel_at_period_end, and tier metadata (in case of plan
+    change / upgrade / downgrade). Does NOT update period timestamps — those are
+    authoritative from the subscribe endpoint (initial) and invoice.paid cycle
+    handler (renewals). Webhook payload period extraction is unreliable across
+    Stripe API versions; see ticket 0024.5 for the full rationale.
+
+    Does NOT post a ledger entry — only subscription.created and invoice.paid do that.
 
     If the subscriptions row doesn't exist (edge case: updated fires before
     created), logs a warning and returns; the created event should reconcile.
@@ -295,10 +307,10 @@ async def handle_subscription_updated(event: stripe.Event, db: AsyncSession) -> 
 
     row.status = getattr(sub, "status", row.status) or row.status
     row.cancel_at_period_end = bool(getattr(sub, "cancel_at_period_end", row.cancel_at_period_end))
-    # Defensive dual-access for period timestamps (see _extract_period_timestamps docstring).
-    new_period_start, new_period_end = _extract_period_timestamps(sub)
-    row.current_period_start = new_period_start or row.current_period_start
-    row.current_period_end = new_period_end or row.current_period_end
+    # Period timestamps (current_period_start / current_period_end) are deliberately NOT
+    # updated here. The subscribe endpoint is authoritative at creation; invoice.paid
+    # (subscription_cycle) is authoritative at renewal. Webhook payload period extraction
+    # is unreliable across Stripe API versions — see ticket 0024.5.
 
     if price_obj is not None and price_meta is not None:
         grant_micros, tier_name = price_meta
@@ -366,7 +378,9 @@ async def handle_invoice_paid(event: stripe.Event, db: AsyncSession) -> None:
     ticket (the accounting is additive which is what users expect: balance increases
     monotonically across renewals).
 
-    Also updates current_period_* from the invoice object.
+    On subscription_cycle: also writes current_period_start/end from
+    invoice.lines.data[0].period.start/end — the canonical, API-version-stable
+    source for renewal period boundaries (ticket 0024.5).
     """
     invoice = event.data.object
 
@@ -410,19 +424,37 @@ async def handle_invoice_paid(event: stripe.Event, db: AsyncSession) -> None:
         )
         return
 
-    # Update period timestamps from the invoice's period.
-    lines = getattr(invoice, "lines", None)
-    if lines:
+    # Update period timestamps from the invoice line-item period.
+    # invoice.lines.data[0].period.start/end is the authoritative renewal period source
+    # (invoice schema is stable across Stripe API versions — ticket 0024.5).
+    # Use defensive dual-access: attribute access first, then dict-style fallback.
+    lines_data = (
+        invoice.lines.data
+        if hasattr(invoice, "lines") and hasattr(invoice.lines, "data")
+        else (invoice.get("lines", {}).get("data", []) if hasattr(invoice, "get") else [])
+    )
+    new_period_start = None
+    new_period_end = None
+    if lines_data:
         try:
-            line = lines.data[0]
-            period_start = _naive_utc_from_timestamp(getattr(line.period, "start", None))
-            period_end = _naive_utc_from_timestamp(getattr(line.period, "end", None))
-            if period_start:
-                row.current_period_start = period_start
-            if period_end:
-                row.current_period_end = period_end
-        except (AttributeError, IndexError):
+            line = lines_data[0]
+            period = getattr(line, "period", None) or (
+                line.get("period", {}) if hasattr(line, "get") else {}
+            )
+            raw_start = getattr(period, "start", None) or (
+                period.get("start") if hasattr(period, "get") else None
+            )
+            raw_end = getattr(period, "end", None) or (
+                period.get("end") if hasattr(period, "get") else None
+            )
+            new_period_start = _naive_utc_from_timestamp(raw_start)
+            new_period_end = _naive_utc_from_timestamp(raw_end)
+        except (AttributeError, IndexError, TypeError):
             pass  # non-fatal; period update is best-effort
+    if new_period_start is not None:
+        row.current_period_start = new_period_start
+    if new_period_end is not None:
+        row.current_period_end = new_period_end
 
     db.add(row)
 
