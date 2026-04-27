@@ -383,14 +383,22 @@ async def subscribe(
     sub_status = getattr(sub, "status", "incomplete") or "incomplete"
     cancel_at_period_end = bool(getattr(sub, "cancel_at_period_end", False))
 
+    # Defensive dual-access: StripeObject is dict-backed; attribute access via
+    # __getattr__ works for most fields, but dict-method-name collisions can
+    # cause attribute lookup to return the dict method rather than the value.
+    # Using `getattr(...) or sub.get(...)` guards against that edge case.
     period_start = None
     period_end = None
-    raw_start = getattr(sub, "current_period_start", None)
-    raw_end = getattr(sub, "current_period_end", None)
+    raw_start = getattr(sub, "current_period_start", None) or (
+        sub.get("current_period_start") if hasattr(sub, "get") else None
+    )
+    raw_end = getattr(sub, "current_period_end", None) or (
+        sub.get("current_period_end") if hasattr(sub, "get") else None
+    )
     if raw_start:
-        period_start = datetime.fromtimestamp(raw_start, tz=timezone.utc).replace(tzinfo=None)
+        period_start = datetime.fromtimestamp(int(raw_start), tz=timezone.utc).replace(tzinfo=None)
     if raw_end:
-        period_end = datetime.fromtimestamp(raw_end, tz=timezone.utc).replace(tzinfo=None)
+        period_end = datetime.fromtimestamp(int(raw_end), tz=timezone.utc).replace(tzinfo=None)
 
     # 6. Upsert subscriptions row. Balance grant deferred to webhook (subscription.created).
     upsert_stmt = (

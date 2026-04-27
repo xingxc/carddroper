@@ -1803,3 +1803,293 @@ async def test_handle_subscription_created_extracts_price_from_items_data():
     assert entries[0].amount_micros == 7_500_000
     assert entries[0].reason == "subscription_grant"
     assert entries[0].stripe_event_id == "evt_bugfix_regression_001"
+
+
+# ---------------------------------------------------------------------------
+# 0024.4 Regression tests — current_period_* persistence
+# ---------------------------------------------------------------------------
+# These tests guard against the class of bug where current_period_start /
+# current_period_end are dropped during subscribe or webhook handling.
+# Ticket: 0024.4 (subscriptions.current_period_start/end extraction regression).
+
+
+@pytest.mark.asyncio
+async def test_subscribe_persists_current_period_fields(client):
+    """POST /billing/subscribe → subscriptions row has current_period_start and
+    current_period_end populated as naive-UTC datetimes.
+
+    Regression guard: subscribe endpoint must extract and persist period fields
+    from the Stripe Subscription API response, not leave them NULL.
+    """
+    mock_customer = MagicMock()
+    mock_customer.id = "cus_period_sub"
+
+    with (
+        patch.object(settings, "BILLING_ENABLED", True),
+        patch("app.billing.primitives.stripe") as mock_p,
+    ):
+        mock_p.Customer.create.return_value = mock_customer
+        reg_resp, user_id = await _register_and_verify(client, "period_sub@example.com")
+
+    access_token = reg_resp.get("access_token")
+
+    price = _mock_price()
+    mock_prices = MagicMock()
+    mock_prices.data = [price]
+    mock_prices.auto_paging_iter.return_value = iter([price])
+
+    # Stripe Subscription.create returns explicit period timestamps.
+    mock_sub = _mock_subscription(
+        sub_id="sub_period_001",
+        status="active",
+        period_start=_PERIOD_START_TS,
+        period_end=_PERIOD_END_TS,
+    )
+
+    with (
+        patch.object(settings, "BILLING_ENABLED", True),
+        patch("app.routes.billing.stripe") as mock_stripe,
+        patch("app.billing.primitives.stripe"),
+    ):
+        mock_stripe.Price.list.return_value = mock_prices
+        mock_stripe.PaymentMethod.attach.return_value = MagicMock()
+        mock_stripe.Customer.modify.return_value = MagicMock()
+        mock_stripe.Subscription.create.return_value = mock_sub
+        resp = await client.post(
+            "/billing/subscribe",
+            json={"price_lookup_key": "starter_monthly", "payment_method_id": "pm_period"},
+            headers=_auth_headers(access_token),
+        )
+
+    assert resp.status_code == 200, resp.text
+
+    # Assert that period fields were persisted — not NULL.
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(select(Subscription).where(Subscription.user_id == user_id))
+        row = result.scalar_one()
+
+    assert row.current_period_start is not None, (
+        "current_period_start should be populated after subscribe; got NULL. "
+        "Regression: subscribe endpoint dropped period field extraction."
+    )
+    assert row.current_period_end is not None, (
+        "current_period_end should be populated after subscribe; got NULL. "
+        "Regression: subscribe endpoint dropped period field extraction."
+    )
+
+    expected_start = datetime.fromtimestamp(_PERIOD_START_TS, tz=timezone.utc).replace(tzinfo=None)
+    expected_end = datetime.fromtimestamp(_PERIOD_END_TS, tz=timezone.utc).replace(tzinfo=None)
+    assert row.current_period_start == expected_start, (
+        f"current_period_start mismatch: {row.current_period_start!r} != {expected_start!r}"
+    )
+    assert row.current_period_end == expected_end, (
+        f"current_period_end mismatch: {row.current_period_end!r} != {expected_end!r}"
+    )
+
+    # Confirm naive UTC (no tzinfo) — chassis datetime convention.
+    assert row.current_period_start.tzinfo is None, "current_period_start should be naive UTC"
+    assert row.current_period_end.tzinfo is None, "current_period_end should be naive UTC"
+
+
+@pytest.mark.asyncio
+async def test_handle_subscription_created_persists_periods():
+    """handle_subscription_created → subscriptions row has both period fields populated.
+
+    Regression guard (0024.4): the created handler must persist current_period_*
+    from the event payload, not leave them NULL even when overwriting an existing row.
+    """
+    from app.billing.handlers.subscription import handle_subscription_created
+    from app.services.auth_service import hash_password
+
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        async with session.begin():
+            user = User(
+                email="handler_period_created@example.com",
+                password_hash=hash_password("Password123!"),
+                full_name="Handler Period Created",
+                stripe_customer_id="cus_handler_period",
+            )
+            session.add(user)
+            await session.flush()
+            user_id = user.id
+
+    price_mock = MagicMock()
+    price_mock.id = "price_period_001"
+    price_mock.lookup_key = "starter_monthly"
+    price_mock.metadata = {"grant_micros": "10000000", "tier_name": "Starter"}
+
+    sub_item = MagicMock()
+    sub_item.price = price_mock
+
+    sub_obj = MagicMock()
+    sub_obj.id = "sub_period_created_001"
+    sub_obj.status = "active"
+    sub_obj.cancel_at_period_end = False
+    sub_obj.current_period_start = _PERIOD_START_TS
+    sub_obj.current_period_end = _PERIOD_END_TS
+    sub_obj.metadata = {"user_id": str(user_id)}
+    sub_obj.items.data = [sub_item]
+
+    event = MagicMock()
+    event.id = "evt_period_created_001"
+    event.data.object = sub_obj
+
+    with patch.object(settings, "BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER", True):
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            async with session.begin():
+                await handle_subscription_created(event, session)
+
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(select(Subscription).where(Subscription.user_id == user_id))
+        row = result.scalar_one_or_none()
+
+    assert row is not None
+    assert row.current_period_start is not None, (
+        "handle_subscription_created: current_period_start should be populated; got NULL. "
+        "Regression: handler not extracting period fields from event payload."
+    )
+    assert row.current_period_end is not None, (
+        "handle_subscription_created: current_period_end should be populated; got NULL. "
+        "Regression: handler not extracting period fields from event payload."
+    )
+
+    expected_start = datetime.fromtimestamp(_PERIOD_START_TS, tz=timezone.utc).replace(tzinfo=None)
+    expected_end = datetime.fromtimestamp(_PERIOD_END_TS, tz=timezone.utc).replace(tzinfo=None)
+    assert row.current_period_start == expected_start
+    assert row.current_period_end == expected_end
+    assert row.current_period_start.tzinfo is None, "current_period_start should be naive UTC"
+    assert row.current_period_end.tzinfo is None, "current_period_end should be naive UTC"
+
+
+@pytest.mark.asyncio
+async def test_handle_subscription_updated_persists_periods():
+    """handle_subscription_updated → subscriptions row has both period fields updated.
+
+    Regression guard (0024.4): the updated handler must persist current_period_*
+    from the event payload. A row that already has period data should be updated
+    to the new values from the event; a row with NULL periods should get them filled.
+    """
+    from app.billing.handlers.subscription import handle_subscription_updated
+    from app.services.auth_service import hash_password
+
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        async with session.begin():
+            user = User(
+                email="handler_period_updated@example.com",
+                password_hash=hash_password("Password123!"),
+                full_name="Handler Period Updated",
+                stripe_customer_id="cus_handler_period_upd",
+            )
+            session.add(user)
+            await session.flush()
+            user_id = user.id
+
+    # Create a row with NULL period fields (simulates the post-0024.2 regression state).
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        async with session.begin():
+            row = Subscription(
+                user_id=user_id,
+                stripe_subscription_id="sub_period_upd_001",
+                stripe_price_id="price_period_001",
+                tier_key="starter_monthly",
+                tier_name="Starter",
+                status="active",
+                grant_micros=10_000_000,
+                current_period_start=None,  # NULL — regression state
+                current_period_end=None,    # NULL — regression state
+                cancel_at_period_end=False,
+            )
+            session.add(row)
+
+    price_mock = MagicMock()
+    price_mock.id = "price_period_001"
+    price_mock.lookup_key = "starter_monthly"
+    price_mock.metadata = {"grant_micros": "10000000", "tier_name": "Starter"}
+
+    sub_item = MagicMock()
+    sub_item.price = price_mock
+
+    sub_obj = MagicMock()
+    sub_obj.id = "sub_period_upd_001"
+    sub_obj.status = "active"
+    sub_obj.cancel_at_period_end = False
+    sub_obj.current_period_start = _PERIOD_START_TS
+    sub_obj.current_period_end = _PERIOD_END_TS
+    sub_obj.metadata = {"user_id": str(user_id)}
+    sub_obj.items.data = [sub_item]
+
+    event = MagicMock()
+    event.id = "evt_period_updated_001"
+    event.data.object = sub_obj
+
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        async with session.begin():
+            await handle_subscription_updated(event, session)
+
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(select(Subscription).where(Subscription.user_id == user_id))
+        row = result.scalar_one()
+
+    assert row.current_period_start is not None, (
+        "handle_subscription_updated: current_period_start should be populated; got NULL. "
+        "Regression: handler not extracting period fields from event payload."
+    )
+    assert row.current_period_end is not None, (
+        "handle_subscription_updated: current_period_end should be populated; got NULL. "
+        "Regression: handler not extracting period fields from event payload."
+    )
+
+    expected_start = datetime.fromtimestamp(_PERIOD_START_TS, tz=timezone.utc).replace(tzinfo=None)
+    expected_end = datetime.fromtimestamp(_PERIOD_END_TS, tz=timezone.utc).replace(tzinfo=None)
+    assert row.current_period_start == expected_start
+    assert row.current_period_end == expected_end
+    assert row.current_period_start.tzinfo is None, "current_period_start should be naive UTC"
+    assert row.current_period_end.tzinfo is None, "current_period_end should be naive UTC"
+
+
+@pytest.mark.asyncio
+async def test_period_extraction_defensive_dual_access():
+    """_extract_period_timestamps uses dual attribute+dict access for resilience.
+
+    Unit test: verifies the helper works on both a MagicMock (attribute-style)
+    and a plain dict (dict-style access via .get). This covers the dual-access
+    pattern documented in the helper's docstring.
+    """
+    from app.billing.handlers.subscription import _extract_period_timestamps
+
+    # Attribute-style (MagicMock / Stripe SDK StripeObject shape).
+    attr_obj = MagicMock()
+    attr_obj.current_period_start = _PERIOD_START_TS
+    attr_obj.current_period_end = _PERIOD_END_TS
+
+    start, end = _extract_period_timestamps(attr_obj)
+    assert start is not None
+    assert end is not None
+    assert start.tzinfo is None, "Should be naive UTC"
+    assert end.tzinfo is None, "Should be naive UTC"
+
+    expected_start = datetime.fromtimestamp(_PERIOD_START_TS, tz=timezone.utc).replace(tzinfo=None)
+    expected_end = datetime.fromtimestamp(_PERIOD_END_TS, tz=timezone.utc).replace(tzinfo=None)
+    assert start == expected_start
+    assert end == expected_end
+
+    # Dict-style (for objects where getattr returns None but .get() works).
+    class DictBackedObj:
+        """Simulates a StripeObject where __getattr__ returns None for period fields
+        but the dict backing provides them via .get()."""
+        def __init__(self):
+            self._data = {
+                "current_period_start": _PERIOD_START_TS,
+                "current_period_end": _PERIOD_END_TS,
+            }
+
+        def get(self, key, default=None):
+            return self._data.get(key, default)
+
+    dict_obj = DictBackedObj()
+    # Simulate getattr returning None (attribute access fails on this object).
+    start2, end2 = _extract_period_timestamps(dict_obj)
+    assert start2 is not None
+    assert end2 is not None
+    assert start2 == expected_start
+    assert end2 == expected_end

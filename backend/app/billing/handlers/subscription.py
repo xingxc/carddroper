@@ -93,11 +93,28 @@ def _extract_price_metadata(price_obj, event_id: str) -> tuple[int, str] | None:
     return grant_micros, tier_name
 
 
-def _naive_utc_from_timestamp(ts: int | None) -> datetime | None:
+def _naive_utc_from_timestamp(ts: int | float | None) -> datetime | None:
     """Convert a Unix timestamp to a naive UTC datetime (for DB storage)."""
     if ts is None:
         return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).replace(tzinfo=None)
+    return datetime.fromtimestamp(int(ts), tz=timezone.utc).replace(tzinfo=None)
+
+
+def _extract_period_timestamps(obj) -> tuple[datetime | None, datetime | None]:
+    """Extract current_period_start and current_period_end from a Stripe object.
+
+    Uses defensive dual-access: attribute access first, then dict-style access.
+    StripeObject is dict-backed; attribute access via __getattr__ works for most
+    fields, but dict-method-name collisions can cause __getattr__ to return the
+    dict method instead of the field value. Belt-and-suspenders guards against that.
+    """
+    raw_start = getattr(obj, "current_period_start", None) or (
+        obj.get("current_period_start") if hasattr(obj, "get") else None
+    )
+    raw_end = getattr(obj, "current_period_end", None) or (
+        obj.get("current_period_end") if hasattr(obj, "get") else None
+    )
+    return _naive_utc_from_timestamp(raw_start), _naive_utc_from_timestamp(raw_end)
 
 
 # ---------------------------------------------------------------------------
@@ -158,8 +175,8 @@ async def handle_subscription_created(event: stripe.Event, db: AsyncSession) -> 
     stripe_sub_id = getattr(sub, "id", "") or ""
     status = getattr(sub, "status", "incomplete") or "incomplete"
     cancel_at_period_end = bool(getattr(sub, "cancel_at_period_end", False))
-    period_start = _naive_utc_from_timestamp(getattr(sub, "current_period_start", None))
-    period_end = _naive_utc_from_timestamp(getattr(sub, "current_period_end", None))
+    # Defensive dual-access for period timestamps (see _extract_period_timestamps docstring).
+    period_start, period_end = _extract_period_timestamps(sub)
 
     if grants_enabled:
         price_meta = _extract_price_metadata(price_obj, event.id)
@@ -278,14 +295,10 @@ async def handle_subscription_updated(event: stripe.Event, db: AsyncSession) -> 
 
     row.status = getattr(sub, "status", row.status) or row.status
     row.cancel_at_period_end = bool(getattr(sub, "cancel_at_period_end", row.cancel_at_period_end))
-    row.current_period_start = (
-        _naive_utc_from_timestamp(getattr(sub, "current_period_start", None))
-        or row.current_period_start
-    )
-    row.current_period_end = (
-        _naive_utc_from_timestamp(getattr(sub, "current_period_end", None))
-        or row.current_period_end
-    )
+    # Defensive dual-access for period timestamps (see _extract_period_timestamps docstring).
+    new_period_start, new_period_end = _extract_period_timestamps(sub)
+    row.current_period_start = new_period_start or row.current_period_start
+    row.current_period_end = new_period_end or row.current_period_end
 
     if price_obj is not None and price_meta is not None:
         grant_micros, tier_name = price_meta
