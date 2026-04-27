@@ -72,9 +72,7 @@ async def main() -> int:
     for sub_row in rows:
         stripe_sub_id = sub_row.stripe_subscription_id
         try:
-            stripe_sub = await asyncio.to_thread(
-                stripe.Subscription.retrieve, stripe_sub_id
-            )
+            stripe_sub = await asyncio.to_thread(stripe.Subscription.retrieve, stripe_sub_id)
 
             # Defensive dual-access: attribute first, then dict-style.
             raw_start = getattr(stripe_sub, "current_period_start", None) or (

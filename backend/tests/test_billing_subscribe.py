@@ -1996,7 +1996,7 @@ async def test_handle_subscription_updated_persists_periods():
                 status="active",
                 grant_micros=10_000_000,
                 current_period_start=None,  # NULL — regression state
-                current_period_end=None,    # NULL — regression state
+                current_period_end=None,  # NULL — regression state
                 cancel_at_period_end=False,
             )
             session.add(row)
@@ -2077,6 +2077,7 @@ async def test_period_extraction_defensive_dual_access():
     class DictBackedObj:
         """Simulates a StripeObject where __getattr__ returns None for period fields
         but the dict backing provides them via .get()."""
+
         def __init__(self):
             self._data = {
                 "current_period_start": _PERIOD_START_TS,
