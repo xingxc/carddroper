@@ -97,7 +97,7 @@ subscriptions (
     tier_key                VARCHAR(64) NOT NULL,   -- mirrors Stripe Price lookup_key
     tier_name               VARCHAR(64) NOT NULL,   -- mirrors Price.metadata.tier_name at subscribe + on customer.subscription.updated; avoids a Stripe API call on every GET /billing/subscription
     status                  VARCHAR(32) NOT NULL,   -- trialing | active | past_due | cancelled | incomplete
-    grant_micros            BIGINT NOT NULL,        -- per-period balance grant, mirrored from Price metadata at subscribe time
+    grant_micros            BIGINT NOT NULL,        -- per-period balance grant. Single-source-of-truth model (ticket 0024.7): set by POST /billing/subscribe at creation (flag-gated: 0 when BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=false; Price.metadata.grant_micros when true). Updated on renewal by invoice.paid (subscription_cycle) from invoice.lines.data[0].price.metadata.grant_micros when flag=true (captures mid-subscription tier changes). customer.subscription.created writes it on INSERT only (rare out-of-band case); customer.subscription.updated does NOT touch it — mirrors the period-fields architectural model (ticket 0024.5).
     current_period_start    TIMESTAMP,              -- naive UTC; single-source-of-truth model (ticket 0024.5): written by POST /billing/subscribe at creation (from Stripe SDK API response where current_period_* is reliably top-level); updated on renewal by invoice.paid (subscription_cycle) from invoice.lines.data[0].period.start (invoice schema is stable across Stripe API versions). customer.subscription.created writes it on INSERT only (rare out-of-band case); customer.subscription.updated does NOT touch it — webhook payload period extraction is unreliable across API versions.
     current_period_end      TIMESTAMP,              -- naive UTC; same single-source-of-truth model as current_period_start. Used by GET /billing/subscription response and cancel-at-period-end UX (displays next billing date / access-through date).
     cancel_at_period_end    BOOLEAN NOT NULL DEFAULT false,
@@ -248,7 +248,7 @@ project-layer actions calling this primitive.
 | Event | Action |
 |---|---|
 | `customer.subscription.created` | Upsert subscription row. **When `BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=true`:** also grant `subscription_grant`. When false: row only, no ledger write. |
-| `customer.subscription.updated` | Update `status`, `current_period_end`, `cancel_at_period_end`, `tier_key`, `grant_micros` (re-read from Price metadata). No ledger write regardless of flag. |
+| `customer.subscription.updated` | Update `status`, `cancel_at_period_end`, `tier_key`, `tier_name`, `stripe_price_id`. Does NOT update `grant_micros` or period timestamps — subscribe endpoint is authoritative at creation; `invoice.paid` cycle handler is authoritative at renewal (Path B architectural model — tickets 0024.5, 0024.7). No ledger write regardless of flag. |
 | `customer.subscription.deleted` | Mark `status='cancelled'`. Do NOT revoke already-granted balance. |
 | `invoice.paid` | If subscription renewal: update period timestamps. **When `BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=true`:** also post `subscription_reset` entries. When false: timestamps updated only, no ledger write. |
 | `invoice.payment_failed` | Mark subscription `past_due`. Balance stays spendable. |

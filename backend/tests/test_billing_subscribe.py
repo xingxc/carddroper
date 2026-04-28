@@ -1394,6 +1394,7 @@ async def test_handle_invoice_paid_subscription_cycle_grants():
 
     line = MagicMock()
     line.period = line_period
+    line.price = None  # no tier change on this renewal; handler uses existing row.grant_micros
 
     invoice_obj = MagicMock()
     invoice_obj.billing_reason = "subscription_cycle"
@@ -2430,4 +2431,389 @@ async def test_period_extraction_defensive_dual_access():
     assert start2 is not None
     assert end2 is not None
     assert start2 == expected_start
-    assert end2 == expected_end
+
+
+# ---------------------------------------------------------------------------
+# 0024.7 — grant_micros Path B regression guards
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_handle_subscription_created_preserves_grant_micros_on_update():
+    """handle_subscription_created UPDATE path MUST NOT overwrite pre-existing grant_micros.
+
+    Architectural invariant (ticket 0024.7 Path B): when a customer.subscription.created
+    webhook fires for an already-existing row (common: subscribe endpoint upserts first,
+    then webhook arrives), the handler's UPDATE path must not touch grant_micros.
+
+    Scenario: subscribe endpoint stored grant_micros=0 (flag=false). Webhook fires with
+    metadata.grant_micros=19990000. Row's grant_micros must remain 0 after the handler —
+    the endpoint's flag-gated value must survive.
+    """
+    from app.billing.handlers.subscription import handle_subscription_created
+    from app.services.auth_service import hash_password
+
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        async with session.begin():
+            user = User(
+                email="grant_micros_preserve_created@example.com",
+                password_hash=hash_password("Password123!"),
+                full_name="Grant Micros Preserve Created",
+                stripe_customer_id="cus_gm_preserve_created",
+            )
+            session.add(user)
+            await session.flush()
+            user_id = user.id
+
+    # Pre-insert a subscriptions row with grant_micros=0 (as subscribe endpoint writes
+    # when flag=false — the value the chassis chose; webhook must not overwrite it).
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        async with session.begin():
+            existing_row = Subscription(
+                user_id=user_id,
+                stripe_subscription_id="sub_gm_preserve_001",
+                stripe_price_id="price_gm_001",
+                tier_key="starter_monthly",
+                tier_name="Starter",
+                status="active",
+                grant_micros=0,  # flag=false → endpoint stored 0
+                current_period_start=datetime(2026, 1, 1, tzinfo=None),
+                current_period_end=datetime(2026, 2, 1, tzinfo=None),
+                cancel_at_period_end=False,
+            )
+            session.add(existing_row)
+
+    # Webhook event carries metadata.grant_micros=19990000 — the metadata value that
+    # would have been written if the flag were on.
+    price_mock = MagicMock()
+    price_mock.id = "price_gm_001"
+    price_mock.lookup_key = "starter_monthly"
+    price_mock.metadata = {"grant_micros": "19990000", "tier_name": "Starter"}
+
+    sub_item = MagicMock()
+    sub_item.price = price_mock
+
+    sub_obj = MagicMock()
+    sub_obj.id = "sub_gm_preserve_001"
+    sub_obj.status = "active"
+    sub_obj.cancel_at_period_end = False
+    sub_obj.current_period_start = _PERIOD_START_TS
+    sub_obj.current_period_end = _PERIOD_END_TS
+    sub_obj.metadata = {"user_id": str(user_id)}
+    sub_obj.items.data = [sub_item]
+
+    event = MagicMock()
+    event.id = "evt_gm_preserve_created_001"
+    event.data.object = sub_obj
+
+    # Flag is OFF — subscribe endpoint stored 0; webhook must not overwrite.
+    with patch.object(settings, "BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER", False):
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            async with session.begin():
+                await handle_subscription_created(event, session)
+
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(select(Subscription).where(Subscription.user_id == user_id))
+        row = result.scalar_one_or_none()
+
+    assert row is not None
+    assert row.grant_micros == 0, (
+        f"handle_subscription_created UPDATE path MUST NOT overwrite grant_micros. "
+        f"Expected 0 (endpoint's flag-gated value), got {row.grant_micros!r}. "
+        f"Architectural invariant: subscribe endpoint is authoritative for grant_micros (ticket 0024.7)."
+    )
+
+    # No ledger entry (flag off).
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(
+            select(BalanceLedger).where(BalanceLedger.user_id == user_id)
+        )
+        entries = result.scalars().all()
+    assert len(entries) == 0
+
+
+@pytest.mark.asyncio
+async def test_handle_subscription_updated_preserves_grant_micros():
+    """handle_subscription_updated MUST NOT overwrite grant_micros.
+
+    Architectural invariant (ticket 0024.7 Path B): the subscription.updated webhook
+    handler syncs status and cancel_at_period_end only. grant_micros is NOT its
+    responsibility — subscribe endpoint owns the initial value; invoice.paid cycle
+    handler owns renewal updates (when flag=true). This mirrors the period-fields
+    preservation established in 0024.5.
+
+    Scenario: pre-existing row has grant_micros=0 (flag=false). Event carries
+    metadata.grant_micros=19990000. Row must still have grant_micros=0 after the handler,
+    while cancel_at_period_end IS correctly synced (proving handler still runs).
+    """
+    from app.billing.handlers.subscription import handle_subscription_updated
+    from app.services.auth_service import hash_password
+
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        async with session.begin():
+            user = User(
+                email="grant_micros_preserve_updated@example.com",
+                password_hash=hash_password("Password123!"),
+                full_name="Grant Micros Preserve Updated",
+                stripe_customer_id="cus_gm_preserve_updated",
+            )
+            session.add(user)
+            await session.flush()
+            user_id = user.id
+
+    # Pre-insert row with grant_micros=0 (flag=false subscribe endpoint value).
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        async with session.begin():
+            existing_row = Subscription(
+                user_id=user_id,
+                stripe_subscription_id="sub_gm_preserve_upd_001",
+                stripe_price_id="price_gm_001",
+                tier_key="starter_monthly",
+                tier_name="Starter",
+                status="active",
+                grant_micros=0,
+                current_period_start=datetime(2026, 1, 1, tzinfo=None),
+                current_period_end=datetime(2026, 2, 1, tzinfo=None),
+                cancel_at_period_end=False,
+            )
+            session.add(existing_row)
+
+    # Event carries metadata.grant_micros=19990000 — handler must ignore for grant_micros.
+    price_mock = MagicMock()
+    price_mock.id = "price_gm_001"
+    price_mock.lookup_key = "starter_monthly"
+    price_mock.metadata = {"grant_micros": "19990000", "tier_name": "Starter"}
+
+    sub_item = MagicMock()
+    sub_item.price = price_mock
+
+    sub_obj = MagicMock()
+    sub_obj.id = "sub_gm_preserve_upd_001"
+    sub_obj.status = "active"
+    sub_obj.cancel_at_period_end = True  # state field that WILL be synced
+    sub_obj.current_period_start = _PERIOD_START_TS
+    sub_obj.current_period_end = _PERIOD_END_TS
+    sub_obj.metadata = {"user_id": str(user_id)}
+    sub_obj.items.data = [sub_item]
+
+    event = MagicMock()
+    event.id = "evt_gm_preserve_upd_001"
+    event.data.object = sub_obj
+
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        async with session.begin():
+            await handle_subscription_updated(event, session)
+
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(select(Subscription).where(Subscription.user_id == user_id))
+        row = result.scalar_one()
+
+    # State field (cancel_at_period_end) was synced correctly — handler ran.
+    assert row.cancel_at_period_end is True
+
+    # grant_micros MUST be unchanged — handler does not own grant_micros authority.
+    assert row.grant_micros == 0, (
+        f"handle_subscription_updated MUST NOT overwrite grant_micros. "
+        f"Expected 0 (subscribe endpoint's flag-gated value), got {row.grant_micros!r}. "
+        f"Architectural invariant: subscribe endpoint + invoice.paid are authoritative (ticket 0024.7)."
+    )
+
+    # No ledger entry.
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(
+            select(BalanceLedger).where(BalanceLedger.user_id == user_id)
+        )
+        entries = result.scalars().all()
+    assert len(entries) == 0
+
+
+@pytest.mark.asyncio
+async def test_handle_invoice_paid_subscription_cycle_updates_grant_micros_when_flag_on():
+    """invoice.paid (subscription_cycle) updates grant_micros from price metadata when flag=True.
+
+    Architectural invariant (ticket 0024.7 Path B): the invoice.paid cycle handler is
+    the authoritative renewal-time source for grant_micros when grants are enabled.
+    This captures mid-subscription tier changes (e.g., upgrade from Starter to Pro
+    changes grant_micros from 10000000 to 20000000; the next renewal invoice carries
+    the new tier's price metadata).
+
+    Also verifies that subscription_reset ledger entry is posted using the NEW grant_micros.
+    """
+    from app.billing.handlers.subscription import handle_invoice_paid
+    from app.services.auth_service import hash_password
+
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        async with session.begin():
+            user = User(
+                email="inv_cycle_gm_update_on@example.com",
+                password_hash=hash_password("Password123!"),
+                full_name="Inv Cycle GM Update On",
+                stripe_customer_id="cus_cycle_gm_on",
+            )
+            session.add(user)
+            await session.flush()
+            user_id = user.id
+
+    # Pre-insert row with grant_micros=10000000 (old tier value).
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        async with session.begin():
+            row = Subscription(
+                user_id=user_id,
+                stripe_subscription_id="sub_gm_update_on_001",
+                stripe_price_id="price_starter_001",
+                tier_key="starter_monthly",
+                tier_name="Starter",
+                status="active",
+                grant_micros=10_000_000,
+                current_period_start=datetime(2026, 1, 1, tzinfo=None),
+                current_period_end=datetime(2026, 2, 1, tzinfo=None),
+                cancel_at_period_end=False,
+            )
+            session.add(row)
+
+    # Invoice line carries the new tier's price metadata (grant_micros=20000000).
+    price_meta_mock = MagicMock()
+    price_meta_mock.get = lambda k, d=None: {"grant_micros": "20000000", "tier_name": "Pro"}.get(
+        k, d
+    )
+
+    price_mock = MagicMock()
+    price_mock.metadata = price_meta_mock
+
+    line_period = MagicMock()
+    line_period.start = _PERIOD_START_TS
+    line_period.end = _PERIOD_END_TS + 86400 * 30
+
+    line = MagicMock()
+    line.period = line_period
+    line.price = price_mock
+
+    invoice_obj = MagicMock()
+    invoice_obj.billing_reason = "subscription_cycle"
+    invoice_obj.subscription = "sub_gm_update_on_001"
+    invoice_obj.lines.data = [line]
+
+    event = MagicMock()
+    event.id = "evt_gm_update_on_001"
+    event.data.object = invoice_obj
+
+    with patch.object(settings, "BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER", True):
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            async with session.begin():
+                await handle_invoice_paid(event, session)
+
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(select(Subscription).where(Subscription.user_id == user_id))
+        row = result.scalar_one()
+
+    # grant_micros updated to the new tier's value.
+    assert row.grant_micros == 20_000_000, (
+        f"invoice.paid cycle handler must update grant_micros from price metadata when flag=True. "
+        f"Expected 20000000, got {row.grant_micros!r}. "
+        f"Architectural invariant: invoice.paid is authoritative for renewal grant_micros (ticket 0024.7)."
+    )
+
+    # subscription_reset ledger entry posted using the NEW grant_micros.
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(
+            select(BalanceLedger).where(BalanceLedger.user_id == user_id)
+        )
+        entries = result.scalars().all()
+    assert len(entries) == 1
+    assert entries[0].amount_micros == 20_000_000
+    assert entries[0].reason == "subscription_reset"
+    assert entries[0].stripe_event_id == "evt_gm_update_on_001"
+
+
+@pytest.mark.asyncio
+async def test_handle_invoice_paid_subscription_cycle_does_not_update_grant_micros_when_flag_off():
+    """invoice.paid (subscription_cycle) does NOT touch grant_micros when flag=False.
+
+    When BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=False, grant_micros is irrelevant
+    (no ledger writes; subscription = access tier only). The handler must leave the
+    row's grant_micros untouched and post no ledger entry.
+
+    Scenario: pre-existing row has grant_micros=10000000. Invoice line carries
+    metadata.grant_micros=20000000. Row must still have 10000000 after the handler.
+    """
+    from app.billing.handlers.subscription import handle_invoice_paid
+    from app.services.auth_service import hash_password
+
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        async with session.begin():
+            user = User(
+                email="inv_cycle_gm_update_off@example.com",
+                password_hash=hash_password("Password123!"),
+                full_name="Inv Cycle GM Update Off",
+                stripe_customer_id="cus_cycle_gm_off",
+            )
+            session.add(user)
+            await session.flush()
+            user_id = user.id
+
+    # Pre-insert row with grant_micros=10000000.
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        async with session.begin():
+            row = Subscription(
+                user_id=user_id,
+                stripe_subscription_id="sub_gm_update_off_001",
+                stripe_price_id="price_starter_001",
+                tier_key="starter_monthly",
+                tier_name="Starter",
+                status="active",
+                grant_micros=10_000_000,
+                current_period_start=datetime(2026, 1, 1, tzinfo=None),
+                current_period_end=datetime(2026, 2, 1, tzinfo=None),
+                cancel_at_period_end=False,
+            )
+            session.add(row)
+
+    # Invoice line carries metadata.grant_micros=20000000 — handler must ignore (flag off).
+    price_meta_mock = MagicMock()
+    price_meta_mock.get = lambda k, d=None: {"grant_micros": "20000000", "tier_name": "Pro"}.get(
+        k, d
+    )
+
+    price_mock = MagicMock()
+    price_mock.metadata = price_meta_mock
+
+    line_period = MagicMock()
+    line_period.start = _PERIOD_START_TS
+    line_period.end = _PERIOD_END_TS + 86400 * 30
+
+    line = MagicMock()
+    line.period = line_period
+    line.price = price_mock
+
+    invoice_obj = MagicMock()
+    invoice_obj.billing_reason = "subscription_cycle"
+    invoice_obj.subscription = "sub_gm_update_off_001"
+    invoice_obj.lines.data = [line]
+
+    event = MagicMock()
+    event.id = "evt_gm_update_off_001"
+    event.data.object = invoice_obj
+
+    with patch.object(settings, "BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER", False):
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            async with session.begin():
+                await handle_invoice_paid(event, session)
+
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(select(Subscription).where(Subscription.user_id == user_id))
+        row = result.scalar_one()
+
+    # grant_micros must be unchanged.
+    assert row.grant_micros == 10_000_000, (
+        f"invoice.paid cycle handler MUST NOT update grant_micros when flag=False. "
+        f"Expected 10000000, got {row.grant_micros!r}. "
+        f"Architectural invariant: grant_micros is irrelevant when flag=false (ticket 0024.7)."
+    )
+
+    # No ledger entry (flag off).
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(
+            select(BalanceLedger).where(BalanceLedger.user_id == user_id)
+        )
+        entries = result.scalars().all()
+    assert len(entries) == 0

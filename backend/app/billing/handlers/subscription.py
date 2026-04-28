@@ -192,13 +192,18 @@ async def handle_subscription_created(event: stripe.Event, db: AsyncSession) -> 
         grant_micros = 0
 
     # Upsert subscriptions row keyed on user_id (one subscription per user).
-    # NOTE: current_period_* are included in values= for the INSERT case (rare out-of-band
-    # subscription created before subscribe endpoint runs) but intentionally omitted from
-    # set_= in the UPDATE case. The subscribe endpoint is the authoritative source of truth
-    # for initial period fields; invoice.paid (subscription_cycle) handles renewals.
-    # Keeping period writes here in the UPDATE path would overwrite the subscribe endpoint's
-    # correctly-extracted values with webhook-extracted values that are unreliable across
-    # Stripe API versions (the root cause of ticket 0024.5).
+    # NOTE: current_period_* and grant_micros are included in values= for the INSERT case
+    # (rare out-of-band subscription created before subscribe endpoint runs) but intentionally
+    # omitted from set_= in the UPDATE case.
+    #
+    # Sources of truth per field (Path B architectural model — tickets 0024.5, 0024.7):
+    # - current_period_*: subscribe endpoint (initial) + invoice.paid cycle handler (renewals).
+    # - grant_micros: subscribe endpoint (initial, flag-gated) + invoice.paid cycle handler
+    #   when BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=True (handles mid-subscription tier changes).
+    #
+    # Keeping these writes here in the UPDATE path would overwrite the subscribe endpoint's
+    # correctly flag-gated values with webhook-extracted values that ignore the chassis flag
+    # (root cause of ticket 0024.7 for grant_micros; ticket 0024.5 for period fields).
     stmt = (
         pg_insert(Subscription)
         .values(
@@ -221,10 +226,14 @@ async def handle_subscription_created(event: stripe.Event, db: AsyncSession) -> 
                 "tier_key": tier_key,
                 "tier_name": tier_name,
                 "status": status,
-                "grant_micros": grant_micros,
+                # grant_micros deliberately omitted: subscribe endpoint is authoritative at
+                # creation (writes 0 when flag=false; metadata value when flag=true); invoice.paid
+                # cycle handler updates on renewal when flag=true. This handler must not overwrite
+                # the endpoint's flag-gated value with the metadata value regardless of flag
+                # (root cause of ticket 0024.7).
                 # current_period_start and current_period_end deliberately omitted:
                 # subscribe endpoint (initial) and invoice.paid cycle handler (renewals)
-                # are authoritative. This handler does not overwrite period fields on update.
+                # are authoritative (ticket 0024.5).
                 "cancel_at_period_end": cancel_at_period_end,
             },
         )
@@ -316,7 +325,10 @@ async def handle_subscription_updated(event: stripe.Event, db: AsyncSession) -> 
         grant_micros, tier_name = price_meta
         row.tier_key = getattr(price_obj, "lookup_key", row.tier_key) or row.tier_key
         row.stripe_price_id = getattr(price_obj, "id", row.stripe_price_id) or row.stripe_price_id
-        row.grant_micros = grant_micros
+        # grant_micros deliberately NOT written here (ticket 0024.7 Path B):
+        # subscribe endpoint is authoritative at creation (flag-gated: 0 when flag=false,
+        # metadata value when flag=true); invoice.paid cycle handler updates on renewal
+        # when flag=true. This handler syncs status and cancel-flag only.
         row.tier_name = tier_name
 
     db.add(row)
@@ -456,6 +468,47 @@ async def handle_invoice_paid(event: stripe.Event, db: AsyncSession) -> None:
     if new_period_end is not None:
         row.current_period_end = new_period_end
 
+    # Update grant_micros from the invoice line-item's price metadata when grants are enabled.
+    # This is the authoritative renewal-time write for grant_micros (ticket 0024.7 Path B):
+    # captures mid-subscription tier changes (e.g., Starter → Pro changes grant_micros from
+    # 19990000 to 49990000; the next renewal invoice carries the new tier's metadata).
+    # When flag=false, grant_micros is irrelevant (no ledger writes); leave it untouched.
+    if settings.BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER and lines_data:
+        try:
+            line = lines_data[0]
+            # Use sentinel to distinguish "attribute exists but is None" from "attribute absent".
+            # The simple `getattr(..., None) or dict_fallback` pattern fires the dict fallback
+            # even when the attribute is explicitly None, producing wrong results with MagicMocks
+            # and any real Stripe object that has price=None (e.g., no line item price).
+            _absent = object()
+            _price = getattr(line, "price", _absent)
+            if _price is _absent:
+                price_obj = line.get("price") if hasattr(line, "get") else None
+            else:
+                price_obj = _price
+            if price_obj is not None:
+                _absent2 = object()
+                _meta = getattr(price_obj, "metadata", _absent2)
+                if _meta is _absent2:
+                    price_meta = price_obj.get("metadata") if hasattr(price_obj, "get") else None
+                else:
+                    price_meta = _meta
+                if price_meta is not None:
+                    raw_grant = (
+                        price_meta.get("grant_micros") if hasattr(price_meta, "get") else None
+                    )
+                    if raw_grant is not None:
+                        try:
+                            row.grant_micros = int(raw_grant)
+                        except (ValueError, TypeError):
+                            logger.warning(
+                                "handle_invoice_paid: invalid price.metadata.grant_micros=%r — keeping existing row value",
+                                raw_grant,
+                                extra={"event_id": event.id},
+                            )
+        except (AttributeError, IndexError, TypeError):
+            pass  # non-fatal; grant_micros update is best-effort; existing row value used for grant
+
     db.add(row)
 
     if not settings.BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER:
@@ -465,7 +518,7 @@ async def handle_invoice_paid(event: stripe.Event, db: AsyncSession) -> None:
         )
         return
 
-    # Grant new period's balance.
+    # Grant new period's balance using the (possibly updated) grant_micros.
     await grant(
         user_id=row.user_id,
         amount_micros=row.grant_micros,
