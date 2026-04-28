@@ -78,6 +78,7 @@ The Verification section exists because "tsc passes" and "lint passes" are neces
 | 0024.3 | paid actions opt-out of verified-gate (BILLING_REQUIRE_VERIFIED, default False) | open | medium |
 | 0024.4 | subscriptions.current_period_start/end extraction regression (introduced by 0024.2) | open | medium |
 | 0024.5 | webhook handlers stop overwriting period fields with NULL — architectural fix (Path B) | open | medium |
+| 0024.6 | subscribe idempotency key collides on retry with different payment_method_id (3DS, decline-retry) | open | medium |
 | 0020 | legal acceptance — ToS checkbox on /register + /legal/terms + /legal/privacy static pages | open | high |
 | 0021 | Stripe foundation (chassis) — balance ledger, billing primitives, webhook skeleton | resolved | medium |
 | 0022 | app-shell refactor (chassis) — left-rail sidebar + profile popover menu | resolved | medium |
