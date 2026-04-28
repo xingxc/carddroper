@@ -377,7 +377,7 @@ async def subscribe(
 
     sub = stripe.Subscription.create(
         **kwargs,
-        idempotency_key=f"subscribe:{user.id}:{body.price_lookup_key}",
+        idempotency_key=f"subscribe:{user.id}:{body.price_lookup_key}:{body.payment_method_id}",
     )
 
     sub_status = getattr(sub, "status", "incomplete") or "incomplete"

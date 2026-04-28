@@ -798,7 +798,7 @@ async def test_subscribe_attaches_pm_and_creates_subscription(client):
     assert kw["customer"] == "cus_full_flow"
     assert kw["items"][0]["price"] == price.id
     assert kw["metadata"]["user_id"] == str(user_id)
-    assert "subscribe:" in kw["idempotency_key"]
+    assert kw["idempotency_key"] == f"subscribe:{user_id}:starter_monthly:pm_fullflow"
 
     # subscriptions row upserted.
     async with AsyncSession(engine, expire_on_commit=False) as session:
@@ -860,6 +860,62 @@ async def test_subscribe_returns_requires_action_when_3ds_needed(client):
     body = resp.json()
     assert body["requires_action"] is True
     assert body["client_secret"] == "pi_3ds_secret"
+
+
+@pytest.mark.asyncio
+async def test_subscribe_idempotency_key_includes_payment_method_id(client):
+    """Regression test for 0024.6 — the idempotency key must include the
+    payment_method_id so retries with different PMs (e.g., 3DS-fail-then-retry,
+    decline-then-new-card) don't collide with Stripe's 24h idempotency window.
+
+    Same-PM double-submits still replay the original response (key is identical).
+    Different-PM retries become fresh Stripe calls (key differs on the PM segment).
+    """
+    mock_customer = MagicMock()
+    mock_customer.id = "cus_idem_pm"
+
+    with (
+        patch.object(settings, "BILLING_ENABLED", True),
+        patch("app.billing.primitives.stripe") as mock_p,
+    ):
+        mock_p.Customer.create.return_value = mock_customer
+        reg_resp, user_id = await _register_and_verify(client, "idem_pm@example.com")
+
+    access_token = reg_resp.get("access_token")
+
+    price = _mock_price()
+    mock_prices = MagicMock()
+    mock_prices.data = [price]
+    mock_prices.auto_paging_iter.return_value = iter([price])
+
+    mock_sub = _mock_subscription(sub_id="sub_idem_pm_001", status="active")
+
+    pm_id = "pm_idem_unique_card"
+    with (
+        patch.object(settings, "BILLING_ENABLED", True),
+        patch("app.routes.billing.stripe") as mock_stripe,
+        patch("app.billing.primitives.stripe"),
+    ):
+        mock_stripe.Price.list.return_value = mock_prices
+        mock_stripe.PaymentMethod.attach.return_value = MagicMock()
+        mock_stripe.Customer.modify.return_value = MagicMock()
+        mock_stripe.Subscription.create.return_value = mock_sub
+        resp = await client.post(
+            "/billing/subscribe",
+            json={"price_lookup_key": "starter_monthly", "payment_method_id": pm_id},
+            headers=_auth_headers(access_token),
+        )
+
+    assert resp.status_code == 200, resp.text
+
+    create_call = mock_stripe.Subscription.create.call_args
+    assert create_call is not None
+    _, kw = create_call
+    expected_key = f"subscribe:{user_id}:starter_monthly:{pm_id}"
+    assert kw["idempotency_key"] == expected_key, (
+        f"Idempotency key must include payment_method_id to prevent collision on "
+        f"retries with different PMs (0024.6). Got: {kw['idempotency_key']!r}"
+    )
 
 
 # ---------------------------------------------------------------------------

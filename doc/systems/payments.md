@@ -239,7 +239,7 @@ project-layer actions calling this primitive.
 1. Verified-gate posture (see §Verified-gate posture): permissive by default (`BILLING_REQUIRE_VERIFIED=false`); set `BILLING_REQUIRE_VERIFIED=true` to restore the verified-only gate.
 2. Attach `payment_method_id` to the Customer, set as default.
 3. Resolve Stripe Price from `lookup_key`. Read `metadata.tier_name` (always required). Read `metadata.grant_micros` only when `BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=true` (422 if missing in that mode; ignored when false).
-4. Create Stripe Subscription with `automatic_tax.enabled=STRIPE_TAX_ENABLED`.
+4. Create Stripe Subscription with `automatic_tax.enabled=STRIPE_TAX_ENABLED`. Idempotency key: `f"subscribe:{user.id}:{price_lookup_key}:{payment_method_id}"`. The PM is included deliberately: same-PM double-submits (network retries) replay the original Stripe response; retries with a different PM (3DS-fail-then-retry, decline-then-new-card, SetupIntent regeneration) produce a distinct key and become fresh Stripe calls, preventing the `IdempotencyError` that fires when the same key is reused with different params within Stripe's 24h window. (Fixed by 0024.6.)
 5. Upsert `subscriptions` row (keyed on `user_id`; one active subscription per user in v1).
 6. **When `BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=true`:** grant `subscription_grant`: `+grant_micros` ledger entry deferred to `customer.subscription.created` webhook. **When false:** subscription row is upserted; `balance_ledger` is not written.
 
