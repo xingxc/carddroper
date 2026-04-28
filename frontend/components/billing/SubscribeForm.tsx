@@ -80,10 +80,24 @@ function InnerSubscribeForm({
     onSubmitStart();
 
     // Step 1: confirm the SetupIntent to attach the payment method.
-    const setupResult = await stripe.confirmSetup({
-      elements,
-      redirect: "if_required",
-    });
+    // stripe.confirmSetup returns {error} for card errors but THROWS for
+    // structural failures (IntegrationError, etc.) — e.g., when Elements is
+    // mounted against a consumed SetupIntent. Catch the throw so the form
+    // resets to card_entry rather than staying stuck in "submitting" forever.
+    let setupResult;
+    try {
+      setupResult = await stripe.confirmSetup({
+        elements,
+        redirect: "if_required",
+      });
+    } catch {
+      // Structural Stripe.js error (IntegrationError, etc.). Surface as
+      // generic error and let the user retry. Once 0024.10 backend lands
+      // this should be unreachable in normal flows, but the defensive catch
+      // prevents future structural failures from bricking the form.
+      onError("Something went wrong, please try again.");
+      return;
+    }
 
     if (setupResult.error) {
       const stripeError = setupResult.error;
