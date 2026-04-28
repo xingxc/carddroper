@@ -337,11 +337,11 @@ async def subscribe(
                 f"Price {body.price_lookup_key!r} has invalid metadata.grant_micros={raw_grant!r}"
             )
     else:
-        # Flag OFF: grant_micros is not needed; store 0 as placeholder in the row.
-        try:
-            grant_micros = int(raw_grant) if raw_grant else 0
-        except (ValueError, TypeError):
-            grant_micros = 0
+        # Flag OFF: grant_micros is unused (no ledger writes); store 0 unconditionally
+        # regardless of whether Stripe Price metadata.grant_micros is set.
+        # Ticket 0024.8 closes a 0024.2 implementation hole where
+        # `int(raw_grant) if raw_grant else 0` leaked the metadata value when present.
+        grant_micros = 0
 
     tier_key = getattr(price, "lookup_key", "") or body.price_lookup_key
 

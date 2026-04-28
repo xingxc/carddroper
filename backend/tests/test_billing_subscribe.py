@@ -765,6 +765,7 @@ async def test_subscribe_attaches_pm_and_creates_subscription(client):
 
     with (
         patch.object(settings, "BILLING_ENABLED", True),
+        patch.object(settings, "BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER", True),
         patch("app.routes.billing.stripe") as mock_stripe,
         patch("app.billing.primitives.stripe"),
     ):
@@ -800,7 +801,7 @@ async def test_subscribe_attaches_pm_and_creates_subscription(client):
     assert kw["metadata"]["user_id"] == str(user_id)
     assert kw["idempotency_key"] == f"subscribe:{user_id}:starter_monthly:pm_fullflow"
 
-    # subscriptions row upserted.
+    # subscriptions row upserted. Flag=true branch: grant_micros read from Price metadata.
     async with AsyncSession(engine, expire_on_commit=False) as session:
         result = await session.execute(select(Subscription).where(Subscription.user_id == user_id))
         row = result.scalar_one()
@@ -808,7 +809,7 @@ async def test_subscribe_attaches_pm_and_creates_subscription(client):
     assert row.status == "active"
     assert row.tier_key == "starter_monthly"
     assert row.tier_name == "Starter"
-    assert row.grant_micros == 10_000_000
+    assert row.grant_micros == 10_000_000  # flag=true: reads int(metadata.grant_micros)
 
     # NO ledger entry yet (webhook does that).
     async with AsyncSession(engine, expire_on_commit=False) as session:
@@ -1825,6 +1826,82 @@ async def test_subscribe_does_not_require_grant_micros_when_grants_disabled(clie
     assert row.status == "active"
     assert row.tier_name == "Starter"
     assert row.grant_micros == 0  # stored as 0 when flag is OFF
+
+    # No ledger entry.
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(
+            select(BalanceLedger).where(BalanceLedger.user_id == user_id)
+        )
+        entries = result.scalars().all()
+    assert len(entries) == 0
+
+
+@pytest.mark.asyncio
+async def test_subscribe_stores_zero_grant_micros_when_flag_off_even_if_metadata_present(client):
+    """Flag=False, Price WITH grant_micros in metadata → grant_micros stored as 0, not the metadata value.
+
+    Regression test for ticket 0024.8: the buggy `int(raw_grant) if raw_grant else 0`
+    returned int(raw_grant)=19990000 when metadata.grant_micros was truthy. The fix
+    makes grant_micros=0 unconditionally when flag=false, regardless of metadata.
+    """
+    mock_customer = MagicMock()
+    mock_customer.id = "cus_flagoff_metadata_present"
+
+    with (
+        patch.object(settings, "BILLING_ENABLED", True),
+        patch.object(settings, "BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER", False),
+        patch("app.billing.primitives.stripe") as mock_p,
+    ):
+        mock_p.Customer.create.return_value = mock_customer
+        reg_resp, user_id = await _register_and_verify(
+            client, "sub_flagoff_metadata@example.com"
+        )
+
+    access_token = reg_resp.get("access_token")
+
+    # Price WITH grant_micros in metadata — truthy raw_grant exercises the bug.
+    price = MagicMock()
+    price.id = "price_flagoff_meta_001"
+    price.lookup_key = "starter_monthly"
+    price.metadata = {"grant_micros": "19990000", "tier_name": "Starter"}  # truthy raw_grant
+
+    mock_prices = MagicMock()
+    mock_prices.data = [price]
+    mock_prices.auto_paging_iter.return_value = iter([price])
+
+    mock_sub = _mock_subscription(sub_id="sub_flagoff_meta_001", status="active")
+
+    with (
+        patch.object(settings, "BILLING_ENABLED", True),
+        patch.object(settings, "BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER", False),
+        patch("app.routes.billing.stripe") as mock_stripe,
+        patch("app.billing.primitives.stripe"),
+    ):
+        mock_stripe.Price.list.return_value = mock_prices
+        mock_stripe.PaymentMethod.attach.return_value = MagicMock()
+        mock_stripe.Customer.modify.return_value = MagicMock()
+        mock_stripe.Subscription.create.return_value = mock_sub
+        resp = await client.post(
+            "/billing/subscribe",
+            json={
+                "price_lookup_key": "starter_monthly",
+                "payment_method_id": "pm_flagoff_meta",
+            },
+            headers=_auth_headers(access_token),
+        )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["subscription_id"] == "sub_flagoff_meta_001"
+    assert body["status"] == "active"
+
+    # Subscriptions row must have grant_micros=0, NOT 19990000.
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(
+            select(Subscription).where(Subscription.user_id == user_id)
+        )
+        row = result.scalar_one()
+    assert row.grant_micros == 0  # strict flag-gate: 0 regardless of Price metadata
 
     # No ledger entry.
     async with AsyncSession(engine, expire_on_commit=False) as session:
