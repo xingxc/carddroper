@@ -239,9 +239,35 @@ project-layer actions calling this primitive.
 1. Verified-gate posture (see §Verified-gate posture): permissive by default (`BILLING_REQUIRE_VERIFIED=false`); set `BILLING_REQUIRE_VERIFIED=true` to restore the verified-only gate.
 2. Attach `payment_method_id` to the Customer, set as default.
 3. Resolve Stripe Price from `lookup_key`. Read `metadata.tier_name` (always required). Read `metadata.grant_micros` only when `BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=true` (422 if missing in that mode; strictly ignored when false — `grant_micros` stored as 0 regardless of metadata presence).
-4. Create Stripe Subscription with `automatic_tax.enabled=STRIPE_TAX_ENABLED`. Idempotency key: `f"subscribe:{user.id}:{price_lookup_key}:{payment_method_id}"`. The PM is included deliberately: same-PM double-submits (network retries) replay the original Stripe response; retries with a different PM (3DS-fail-then-retry, decline-then-new-card, SetupIntent regeneration) produce a distinct key and become fresh Stripe calls, preventing the `IdempotencyError` that fires when the same key is reused with different params within Stripe's 24h window. (Fixed by 0024.6.)
-5. Upsert `subscriptions` row (keyed on `user_id`; one active subscription per user in v1).
-6. **When `BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=true`:** grant `subscription_grant`: `+grant_micros` ledger entry deferred to `customer.subscription.created` webhook. **When false:** subscription row is upserted; `balance_ledger` is not written.
+4. **Pre-existing incomplete row cleanup (defensive):** if a `subscriptions` row exists with `status` in `("incomplete", "incomplete_expired")`, it represents a prior failed attempt (first invoice declined or 3DS canceled). The chassis synchronously cancels the old Stripe subscription (idempotent — "no such subscription" / "already canceled" treated as success; generic 5xx logged as warning, cleanup is best-effort) and deletes the row, then continues as a fresh subscribe. This path handles zombie rows from before ticket 0024.9 and any edge case where synchronous cleanup during `Subscription.create` was bypassed. Stripe auto-cancels incomplete subscriptions at 23h as a backup.
+5. **409 ALREADY_SUBSCRIBED** if a `subscriptions` row exists with `status` in `("active", "trialing", "past_due")`. These statuses represent live subscriptions; a new subscription must not be created. Pre-existing `incomplete` / `incomplete_expired` rows are cleaned up in step 4 and do not block subscribe.
+6. Create Stripe Subscription with `automatic_tax.enabled=STRIPE_TAX_ENABLED`. Idempotency key: `f"subscribe:{user.id}:{price_lookup_key}:{payment_method_id}"`. The PM is included deliberately: same-PM double-submits (network retries) replay the original Stripe response; retries with a different PM (3DS-fail-then-retry, decline-then-new-card, SetupIntent regeneration) produce a distinct key and become fresh Stripe calls, preventing the `IdempotencyError` that fires when the same key is reused with different params within Stripe's 24h window. (Fixed by 0024.6.)
+7. **Three-way branch on `Subscription.create` outcome** (fixed by 0024.9 — previously the chassis conflated 3DS-required and declined by checking only `sub.status == "incomplete"`):
+
+   | Stripe state | `sub.status` | `latest_invoice.payment_intent.status` | Response |
+   |---|---|---|---|
+   | Active | `active` | `succeeded` | `200 {requires_action: false}` — row upserted |
+   | 3DS challenge | `incomplete` | `requires_action` | `200 {requires_action: true, client_secret}` — row upserted (pending 3DS) |
+   | Declined / terminal | `incomplete` | `requires_payment_method` (or other) | `402 INVOICE_PAYMENT_FAILED` — subscription canceled, NO row written |
+
+   For terminal failures: the chassis calls `stripe.Subscription.delete(sub.id)` (idempotent, best-effort) and raises `402 PAYMENT_REQUIRED` with `error_code="INVOICE_PAYMENT_FAILED"`, the Stripe decline message, and `decline_code` / `code` from `last_payment_error`. No `subscriptions` row is written — never-active subscriptions are discarded synchronously. Frontend on 402 should reset the SetupIntent and re-mount the payment form so the user can retry with a different card.
+
+8. Upsert `subscriptions` row (keyed on `user_id`; one active subscription per user in v1). **Only executed for `active` and 3DS-pending `incomplete` outcomes**; terminal failures skip the upsert.
+9. **When `BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=true`:** grant `subscription_grant`: `+grant_micros` ledger entry deferred to `customer.subscription.created` webhook. **When false:** subscription row is upserted; `balance_ledger` is not written.
+
+**Subscribe response contract (post-0024.9):**
+
+| Response | Meaning | Frontend action |
+|---|---|---|
+| `200 {status: "active", requires_action: false}` | Subscription created, first invoice paid | Show success |
+| `200 {status: "incomplete", requires_action: true, client_secret}` | 3DS challenge needed | Confirm via stripe.js |
+| `402 {error_code: "INVOICE_PAYMENT_FAILED", message, details}` | Card declined; subscription cleaned up | Reset SetupIntent, show error, retry |
+| `409 {error_code: "ALREADY_SUBSCRIBED"}` | User has active/trialing/past_due sub | Surface, redirect to manage |
+| `422 {...}` | Validation error (missing tier, bad PM, etc.) | Inline form error |
+
+The chassis no longer leaks Stripe-internal `incomplete` state for terminal failures — adopters can trust that `subscriptions` rows exist only for `active`, `trialing`, `past_due`, `canceled`, or `incomplete`-pending-3DS subscriptions. Failed-attempt subscriptions are synchronously discarded.
+
+**Scenario A vs B:** this flow covers Scenario A (subscription `incomplete`, never reached `active` — discardable). Scenario B (`past_due` renewal failures — active→past_due) preserves subscription continuity and is handled by Customer Portal (ticket 0025).
 
 ### 5. Subscription lifecycle (webhooks)
 

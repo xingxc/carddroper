@@ -281,20 +281,47 @@ def _mock_subscription(
     status: str = "active",
     price: Any = None,
     with_3ds: bool = False,
+    pi_status: str | None = None,
+    last_payment_error: dict | None = None,
     period_start: int | None = None,
     period_end: int | None = None,
 ) -> MagicMock:
-    """Build a mock Stripe Subscription object."""
+    """Build a mock Stripe Subscription object.
+
+    pi_status: the payment_intent.status value to set (e.g. "requires_action",
+               "requires_payment_method", "succeeded"). If omitted, inferred from
+               with_3ds / status for backwards compat.
+    last_payment_error: dict passed as payment_intent.last_payment_error (for decline tests).
+    """
     m = MagicMock()
     m.id = sub_id
     m.status = status
     m.cancel_at_period_end = False
     m.current_period_start = period_start or _PERIOD_START_TS
     m.current_period_end = period_end or _PERIOD_END_TS
-    if with_3ds:
+
+    # Infer pi_status when not explicitly set (backwards compat).
+    if pi_status is None:
+        if with_3ds:
+            pi_status = "requires_action"
+        elif status == "active":
+            pi_status = "succeeded"
+        else:
+            # Default for incomplete/canceled/etc — treat as terminal unless caller
+            # sets with_3ds=True or pi_status="requires_action" explicitly.
+            pi_status = "requires_payment_method"
+
+    m.latest_invoice.payment_intent.status = pi_status
+    if with_3ds or pi_status == "requires_action":
         m.latest_invoice.payment_intent.client_secret = "pi_3ds_secret"
     else:
         m.latest_invoice.payment_intent.client_secret = None
+
+    if last_payment_error is not None:
+        m.latest_invoice.payment_intent.last_payment_error = last_payment_error
+    else:
+        m.latest_invoice.payment_intent.last_payment_error = None
+
     return m
 
 
@@ -2894,3 +2921,421 @@ async def test_handle_invoice_paid_subscription_cycle_does_not_update_grant_micr
         )
         entries = result.scalars().all()
     assert len(entries) == 0
+
+
+# ---------------------------------------------------------------------------
+# POST /billing/subscribe — 3DS vs decline distinction (ticket 0024.9)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_subscribe_returns_402_when_first_invoice_declined(client):
+    """Subscription.create returns incomplete + requires_payment_method → 402 INVOICE_PAYMENT_FAILED.
+
+    Ticket 0024.9: the chassis must distinguish declined-incomplete from 3DS-incomplete.
+    Terminal failures are synchronously canceled and surface 402 (not 200 requires_action).
+    No subscriptions row should be written for a never-active subscription.
+    """
+    import stripe as real_stripe
+
+    mock_customer = MagicMock()
+    mock_customer.id = "cus_declined_0249"
+
+    with (
+        patch.object(settings, "BILLING_ENABLED", True),
+        patch("app.billing.primitives.stripe") as mock_p,
+    ):
+        mock_p.Customer.create.return_value = mock_customer
+        reg_resp, user_id = await _register_and_verify(client, "declined_0249@example.com")
+
+    access_token = reg_resp.get("access_token")
+
+    price = _mock_price()
+    mock_prices = MagicMock()
+    mock_prices.data = [price]
+    mock_prices.auto_paging_iter.return_value = iter([price])
+
+    last_err = {
+        "message": "Your card was declined.",
+        "decline_code": "insufficient_funds",
+        "code": "card_declined",
+    }
+    mock_sub = _mock_subscription(
+        sub_id="sub_declined_0249",
+        status="incomplete",
+        pi_status="requires_payment_method",
+        last_payment_error=last_err,
+    )
+
+    with (
+        patch.object(settings, "BILLING_ENABLED", True),
+        patch("app.routes.billing.stripe") as mock_stripe,
+        patch("app.billing.primitives.stripe"),
+    ):
+        mock_stripe.Price.list.return_value = mock_prices
+        mock_stripe.PaymentMethod.attach.return_value = MagicMock()
+        mock_stripe.Customer.modify.return_value = MagicMock()
+        mock_stripe.Subscription.create.return_value = mock_sub
+        mock_stripe.Subscription.delete.return_value = MagicMock()
+        # Expose error classes so _cancel_failed_subscription can catch them.
+        mock_stripe.error = real_stripe.error
+
+        resp = await client.post(
+            "/billing/subscribe",
+            json={"price_lookup_key": "starter_monthly", "payment_method_id": "pm_declined"},
+            headers=_auth_headers(access_token),
+        )
+
+    assert resp.status_code == 402, resp.text
+    body = resp.json()
+    assert body["error"]["code"] == "INVOICE_PAYMENT_FAILED"
+    assert "declined" in body["error"]["message"].lower()
+
+    # Stripe.Subscription.delete must have been called for the failed sub.
+    mock_stripe.Subscription.delete.assert_called_once_with("sub_declined_0249")
+
+    # No subscriptions row should exist for a never-active subscription.
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(
+            select(Subscription).where(Subscription.user_id == user_id)
+        )
+        row = result.scalar_one_or_none()
+    assert row is None, f"Expected no subscription row for declined payment; found {row!r}"
+
+
+@pytest.mark.asyncio
+async def test_subscribe_unchanged_for_3ds_required(client):
+    """Regression: incomplete + requires_action → 200 requires_action=True + client_secret.
+
+    Ticket 0024.9: ensures the 3DS path is unchanged by the three-way branch.
+    """
+    import stripe as real_stripe
+
+    mock_customer = MagicMock()
+    mock_customer.id = "cus_3ds_0249"
+
+    with (
+        patch.object(settings, "BILLING_ENABLED", True),
+        patch("app.billing.primitives.stripe") as mock_p,
+    ):
+        mock_p.Customer.create.return_value = mock_customer
+        reg_resp, user_id = await _register_and_verify(client, "3ds_0249@example.com")
+
+    access_token = reg_resp.get("access_token")
+
+    price = _mock_price()
+    mock_prices = MagicMock()
+    mock_prices.data = [price]
+    mock_prices.auto_paging_iter.return_value = iter([price])
+
+    mock_sub = _mock_subscription(
+        sub_id="sub_3ds_0249",
+        status="incomplete",
+        pi_status="requires_action",
+    )
+
+    with (
+        patch.object(settings, "BILLING_ENABLED", True),
+        patch("app.routes.billing.stripe") as mock_stripe,
+        patch("app.billing.primitives.stripe"),
+    ):
+        mock_stripe.Price.list.return_value = mock_prices
+        mock_stripe.PaymentMethod.attach.return_value = MagicMock()
+        mock_stripe.Customer.modify.return_value = MagicMock()
+        mock_stripe.Subscription.create.return_value = mock_sub
+        mock_stripe.error = real_stripe.error
+
+        resp = await client.post(
+            "/billing/subscribe",
+            json={"price_lookup_key": "starter_monthly", "payment_method_id": "pm_3ds_0249"},
+            headers=_auth_headers(access_token),
+        )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["requires_action"] is True
+    assert body["client_secret"] == "pi_3ds_secret"
+
+    # Subscription row IS upserted (incomplete, awaiting 3DS).
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(
+            select(Subscription).where(Subscription.user_id == user_id)
+        )
+        row = result.scalar_one_or_none()
+    assert row is not None, "Expected a subscription row for 3DS-pending state"
+    assert row.status == "incomplete"
+
+    # Subscription.delete must NOT have been called for a 3DS-pending sub.
+    mock_stripe.Subscription.delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_subscribe_unchanged_for_active(client):
+    """Regression: active subscription → 200 requires_action=False, row upserted active.
+
+    Ticket 0024.9: ensures the happy path is unchanged by the three-way branch.
+    """
+    import stripe as real_stripe
+
+    mock_customer = MagicMock()
+    mock_customer.id = "cus_active_0249"
+
+    with (
+        patch.object(settings, "BILLING_ENABLED", True),
+        patch("app.billing.primitives.stripe") as mock_p,
+    ):
+        mock_p.Customer.create.return_value = mock_customer
+        reg_resp, user_id = await _register_and_verify(client, "active_0249@example.com")
+
+    access_token = reg_resp.get("access_token")
+
+    price = _mock_price()
+    mock_prices = MagicMock()
+    mock_prices.data = [price]
+    mock_prices.auto_paging_iter.return_value = iter([price])
+
+    mock_sub = _mock_subscription(
+        sub_id="sub_active_0249",
+        status="active",
+        pi_status="succeeded",
+    )
+
+    with (
+        patch.object(settings, "BILLING_ENABLED", True),
+        patch("app.routes.billing.stripe") as mock_stripe,
+        patch("app.billing.primitives.stripe"),
+    ):
+        mock_stripe.Price.list.return_value = mock_prices
+        mock_stripe.PaymentMethod.attach.return_value = MagicMock()
+        mock_stripe.Customer.modify.return_value = MagicMock()
+        mock_stripe.Subscription.create.return_value = mock_sub
+        mock_stripe.error = real_stripe.error
+
+        resp = await client.post(
+            "/billing/subscribe",
+            json={"price_lookup_key": "starter_monthly", "payment_method_id": "pm_active_0249"},
+            headers=_auth_headers(access_token),
+        )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["requires_action"] is False
+    assert body["client_secret"] is None
+
+    # Row upserted with status='active'.
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(
+            select(Subscription).where(Subscription.user_id == user_id)
+        )
+        row = result.scalar_one_or_none()
+    assert row is not None
+    assert row.status == "active"
+    assert row.stripe_subscription_id == "sub_active_0249"
+
+
+@pytest.mark.asyncio
+async def test_subscribe_cleans_up_pre_existing_incomplete_row(client):
+    """Pre-existing incomplete row → old sub canceled on Stripe, old row deleted, new sub created.
+
+    Ticket 0024.9: defensive cleanup path for zombie incomplete rows (pre-fix data
+    or any edge case where sync cleanup was bypassed).
+    """
+    import stripe as real_stripe
+
+    mock_customer = MagicMock()
+    mock_customer.id = "cus_cleanup_0249"
+
+    with (
+        patch.object(settings, "BILLING_ENABLED", True),
+        patch("app.billing.primitives.stripe") as mock_p,
+    ):
+        mock_p.Customer.create.return_value = mock_customer
+        reg_resp, user_id = await _register_and_verify(client, "cleanup_0249@example.com")
+
+    access_token = reg_resp.get("access_token")
+
+    # Pre-insert an incomplete subscription row (zombie from before 0024.9 fix).
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        await _create_subscription_row(
+            session, user_id, status="incomplete", stripe_sub_id="sub_old_incomplete"
+        )
+
+    price = _mock_price()
+    mock_prices = MagicMock()
+    mock_prices.data = [price]
+    mock_prices.auto_paging_iter.return_value = iter([price])
+
+    mock_sub = _mock_subscription(sub_id="sub_new_after_cleanup", status="active")
+
+    with (
+        patch.object(settings, "BILLING_ENABLED", True),
+        patch("app.routes.billing.stripe") as mock_stripe,
+        patch("app.billing.primitives.stripe"),
+    ):
+        mock_stripe.Price.list.return_value = mock_prices
+        mock_stripe.PaymentMethod.attach.return_value = MagicMock()
+        mock_stripe.Customer.modify.return_value = MagicMock()
+        mock_stripe.Subscription.create.return_value = mock_sub
+        mock_stripe.Subscription.delete.return_value = MagicMock()
+        mock_stripe.error = real_stripe.error
+
+        resp = await client.post(
+            "/billing/subscribe",
+            json={"price_lookup_key": "starter_monthly", "payment_method_id": "pm_cleanup"},
+            headers=_auth_headers(access_token),
+        )
+
+    assert resp.status_code == 200, resp.text
+
+    # Old incomplete sub must have been canceled on Stripe.
+    mock_stripe.Subscription.delete.assert_called_once_with("sub_old_incomplete")
+
+    # Only the new row should exist; old row deleted.
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(
+            select(Subscription).where(Subscription.user_id == user_id)
+        )
+        row = result.scalar_one_or_none()
+    assert row is not None
+    assert row.stripe_subscription_id == "sub_new_after_cleanup"
+    assert row.status == "active"
+
+
+@pytest.mark.asyncio
+async def test_subscribe_pre_existing_incomplete_cleanup_idempotent_when_already_canceled(client):
+    """Pre-existing incomplete row + Stripe already canceled → cleanup is idempotent, subscribe proceeds.
+
+    Ticket 0024.9: _cancel_failed_subscription catches InvalidRequestError("No such subscription")
+    and treats it as success so the subscribe flow continues.
+    """
+    import stripe as real_stripe
+
+    mock_customer = MagicMock()
+    mock_customer.id = "cus_idem_cleanup_0249"
+
+    with (
+        patch.object(settings, "BILLING_ENABLED", True),
+        patch("app.billing.primitives.stripe") as mock_p,
+    ):
+        mock_p.Customer.create.return_value = mock_customer
+        reg_resp, user_id = await _register_and_verify(client, "idem_cleanup_0249@example.com")
+
+    access_token = reg_resp.get("access_token")
+
+    # Pre-insert an incomplete row.
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        await _create_subscription_row(
+            session, user_id, status="incomplete", stripe_sub_id="sub_already_gone"
+        )
+
+    price = _mock_price()
+    mock_prices = MagicMock()
+    mock_prices.data = [price]
+    mock_prices.auto_paging_iter.return_value = iter([price])
+
+    mock_sub = _mock_subscription(sub_id="sub_after_idem_cleanup", status="active")
+
+    with (
+        patch.object(settings, "BILLING_ENABLED", True),
+        patch("app.routes.billing.stripe") as mock_stripe,
+        patch("app.billing.primitives.stripe"),
+    ):
+        mock_stripe.Price.list.return_value = mock_prices
+        mock_stripe.PaymentMethod.attach.return_value = MagicMock()
+        mock_stripe.Customer.modify.return_value = MagicMock()
+        mock_stripe.Subscription.create.return_value = mock_sub
+        # Stripe already canceled the sub — simulates auto-cancel at 23h.
+        mock_stripe.Subscription.delete.side_effect = real_stripe.error.InvalidRequestError(
+            "No such subscription: sub_already_gone", param="id"
+        )
+        mock_stripe.error = real_stripe.error
+
+        resp = await client.post(
+            "/billing/subscribe",
+            json={"price_lookup_key": "starter_monthly", "payment_method_id": "pm_idem"},
+            headers=_auth_headers(access_token),
+        )
+
+    assert resp.status_code == 200, resp.text
+
+    # New row created; no exception bubbled.
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(
+            select(Subscription).where(Subscription.user_id == user_id)
+        )
+        row = result.scalar_one_or_none()
+    assert row is not None
+    assert row.stripe_subscription_id == "sub_after_idem_cleanup"
+
+
+@pytest.mark.asyncio
+async def test_subscribe_terminal_failure_cleanup_idempotent_when_stripe_5xx(client):
+    """Terminal failure + Stripe 5xx on cancel → 402 still returned (best-effort cleanup).
+
+    Ticket 0024.9: _cancel_failed_subscription catches generic StripeError and logs a warning
+    rather than re-raising, so the request continues to surface the original 402.
+    """
+    import stripe as real_stripe
+
+    mock_customer = MagicMock()
+    mock_customer.id = "cus_5xx_cleanup_0249"
+
+    with (
+        patch.object(settings, "BILLING_ENABLED", True),
+        patch("app.billing.primitives.stripe") as mock_p,
+    ):
+        mock_p.Customer.create.return_value = mock_customer
+        reg_resp, user_id = await _register_and_verify(client, "fivexx_cleanup_0249@example.com")
+
+    access_token = reg_resp.get("access_token")
+
+    price = _mock_price()
+    mock_prices = MagicMock()
+    mock_prices.data = [price]
+    mock_prices.auto_paging_iter.return_value = iter([price])
+
+    last_err = {
+        "message": "Your card was declined.",
+        "decline_code": "do_not_honor",
+        "code": "card_declined",
+    }
+    mock_sub = _mock_subscription(
+        sub_id="sub_5xx_0249",
+        status="incomplete",
+        pi_status="requires_payment_method",
+        last_payment_error=last_err,
+    )
+
+    with (
+        patch.object(settings, "BILLING_ENABLED", True),
+        patch("app.routes.billing.stripe") as mock_stripe,
+        patch("app.billing.primitives.stripe"),
+    ):
+        mock_stripe.Price.list.return_value = mock_prices
+        mock_stripe.PaymentMethod.attach.return_value = MagicMock()
+        mock_stripe.Customer.modify.return_value = MagicMock()
+        mock_stripe.Subscription.create.return_value = mock_sub
+        # Stripe returns a 5xx — cleanup fails but should not block the 402 response.
+        mock_stripe.Subscription.delete.side_effect = real_stripe.error.APIConnectionError(
+            "Failed to connect to Stripe API"
+        )
+        mock_stripe.error = real_stripe.error
+
+        resp = await client.post(
+            "/billing/subscribe",
+            json={"price_lookup_key": "starter_monthly", "payment_method_id": "pm_5xx"},
+            headers=_auth_headers(access_token),
+        )
+
+    # 402 must be returned regardless of the cleanup failure.
+    assert resp.status_code == 402, resp.text
+    body = resp.json()
+    assert body["error"]["code"] == "INVOICE_PAYMENT_FAILED"
+
+    # No subscriptions row written.
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(
+            select(Subscription).where(Subscription.user_id == user_id)
+        )
+        row = result.scalar_one_or_none()
+    assert row is None

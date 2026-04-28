@@ -21,7 +21,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -33,7 +33,7 @@ from app.billing.stripe_client import init_stripe, stripe
 from app.config import settings
 from app.database import AsyncSessionLocal, get_db
 from app.dependencies import get_current_user, require_billing_user
-from app.errors import conflict, not_found, validation_error
+from app.errors import conflict, not_found, payment_required, validation_error
 from app.models.stripe_event import StripeEvent
 from app.models.subscription import Subscription
 from app.routes.auth import (
@@ -41,6 +41,28 @@ from app.routes.auth import (
 )  # shared limiter instance (known chassis coupling — factor to app/rate_limit.py in 0018 audit)
 
 logger = logging.getLogger(__name__)
+
+
+def _cancel_failed_subscription(sub_id: str) -> None:
+    """Idempotent best-effort cancel of an incomplete subscription.
+
+    Catches "already canceled" / "no such subscription" as success.
+    Catches generic StripeError as warning (cleanup is best-effort; Stripe
+    auto-cancels incomplete subs at 23h as a backup).
+    """
+    try:
+        stripe.Subscription.delete(sub_id)
+    except stripe.error.InvalidRequestError as e:
+        if any(s in str(e).lower() for s in ("no such subscription", "already canceled")):
+            return
+        raise
+    except stripe.error.StripeError as e:
+        logger.warning(
+            "subscribe: failed to cancel incomplete subscription during cleanup",
+            extra={"sub_id": sub_id, "error": str(e)},
+        )
+        return
+
 
 router = APIRouter(prefix="/billing", tags=["billing"])
 
@@ -358,9 +380,19 @@ async def subscribe(
         invoice_settings={"default_payment_method": body.payment_method_id},
     )
 
-    # 4. Check for existing active subscription.
+    # 4. Check for existing subscription (clean up pre-existing incomplete rows first).
     result = await db.execute(select(Subscription).where(Subscription.user_id == user.id))
     existing = result.scalar_one_or_none()
+
+    # Pre-existing failed attempt: cancel on Stripe and delete the row so the
+    # 409 check below sees a clean state. Defensive against pre-fix data and any
+    # edge cases where sync cleanup was bypassed (e.g. Stripe 5xx during cancel).
+    if existing and existing.status in ("incomplete", "incomplete_expired"):
+        _cancel_failed_subscription(existing.stripe_subscription_id)
+        await db.execute(delete(Subscription).where(Subscription.id == existing.id))
+        await db.flush()
+        existing = None
+
     if existing and existing.status in ("active", "trialing", "past_due"):
         raise conflict(f"ALREADY_SUBSCRIBED: user already has a {existing.status!r} subscription")
 
@@ -400,7 +432,49 @@ async def subscribe(
     if raw_end:
         period_end = datetime.fromtimestamp(int(raw_end), tz=timezone.utc).replace(tzinfo=None)
 
-    # 6. Upsert subscriptions row. Balance grant deferred to webhook (subscription.created).
+    # 6. Three-way branch on subscription outcome; upsert only for success/3DS paths.
+    pi_status = getattr(sub.latest_invoice.payment_intent, "status", None)
+
+    if sub_status == "active":
+        # First invoice succeeded; no 3DS needed.
+        requires_action = False
+        client_secret = None
+
+    elif sub_status == "incomplete" and pi_status == "requires_action":
+        # 3DS challenge required; frontend confirms via stripe.confirmPayment.
+        requires_action = True
+        try:
+            client_secret = sub.latest_invoice.payment_intent.client_secret
+        except AttributeError:
+            client_secret = None
+
+    else:
+        # Terminal failure: declined, requires_payment_method, canceled, etc.
+        # Synchronously cancel the failed Stripe subscription and surface 402.
+        # Do NOT upsert — the row should not exist for never-active subscriptions.
+        _cancel_failed_subscription(sub.id)
+        last_pi = getattr(sub.latest_invoice, "payment_intent", None)
+        last_error = getattr(last_pi, "last_payment_error", None) if last_pi else None
+        if last_error and hasattr(last_error, "get"):
+            err_message = last_error.get("message") or "Your card was declined."
+            decline_code = last_error.get("decline_code")
+            err_code = last_error.get("code")
+        elif last_error:
+            err_message = getattr(last_error, "message", None) or "Your card was declined."
+            decline_code = getattr(last_error, "decline_code", None)
+            err_code = getattr(last_error, "code", None)
+        else:
+            err_message = "Your card was declined."
+            decline_code = None
+            err_code = None
+        raise payment_required(
+            error_code="INVOICE_PAYMENT_FAILED",
+            message=err_message,
+            details={"decline_code": decline_code, "code": err_code},
+        )
+
+    # Upsert subscriptions row (only reached for active / 3DS-required outcomes).
+    # Balance grant deferred to webhook (subscription.created).
     upsert_stmt = (
         pg_insert(Subscription)
         .values(
@@ -431,15 +505,6 @@ async def subscribe(
         )
     )
     await db.execute(upsert_stmt)
-
-    # 7. Determine if 3DS is required.
-    requires_action = sub_status == "incomplete"
-    client_secret = None
-    if requires_action:
-        try:
-            client_secret = sub.latest_invoice.payment_intent.client_secret
-        except AttributeError:
-            pass
 
     logger.info(
         "subscribe: created subscription",

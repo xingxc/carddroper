@@ -69,3 +69,17 @@ def validation_error(message: str, details: Optional[dict[str, Any]] = None) -> 
 
 def too_many_requests(message: str = "Too many attempts. Try again later.") -> AppError:
     return AppError(code="TOO_MANY_REQUESTS", message=message, status_code=429)
+
+
+def payment_required(
+    error_code: str,
+    message: str,
+    details: Optional[dict[str, Any]] = None,
+) -> AppError:
+    """402 PAYMENT_REQUIRED — payment-related failure (decline, etc.)."""
+    return AppError(
+        code=error_code,
+        message=message,
+        status_code=402,
+        details=details or {},
+    )
