@@ -58,6 +58,7 @@ interface InnerSubscribeFormProps {
   onError: (msg: string) => void;
   onRequiresAction: (clientSecret: string) => void;
   onConfirmedPolling: () => void;
+  onInvoiceDeclined: (msg: string) => void;
 }
 
 function InnerSubscribeForm({
@@ -67,6 +68,7 @@ function InnerSubscribeForm({
   onError,
   onRequiresAction,
   onConfirmedPolling,
+  onInvoiceDeclined,
 }: InnerSubscribeFormProps) {
   const stripe = useStripe();
   const elements = useElements();
@@ -122,6 +124,11 @@ function InnerSubscribeForm({
       if (err instanceof ApiError) {
         if (err.status === 401) {
           onError("Please log in again.");
+        } else if (err.status === 402 && err.code === "INVOICE_PAYMENT_FAILED") {
+          // Card declined on first invoice — backend cleaned up the incomplete
+          // subscription. Signal the parent to reset the form with a fresh
+          // SetupIntent so the user can enter a different card.
+          onInvoiceDeclined(err.message);
         } else if (err.status === 403) {
           onError("Please verify your email first.");
         } else if (err.status === 404) {
@@ -266,6 +273,48 @@ export function SubscribeForm({ lookupKeys, onSuccess }: SubscribeFormProps) {
     setPhase("card_entry");
   }
 
+  // ------------------------------------------------------------------
+  // 402 INVOICE_PAYMENT_FAILED: card declined on first invoice.
+  // Show the server-provided decline message, then fetch a fresh
+  // SetupIntent so the user can enter a different card. The new PM will
+  // produce a different idempotency key on the next subscribe call.
+  // ------------------------------------------------------------------
+  async function handleInvoiceDeclined(msg: string) {
+    // Show the decline message immediately; clear the stale client_secret
+    // so the Elements tree unmounts while we fetch a fresh one.
+    setError(msg);
+    setClientSecret(null);
+    setPhase("fetching_secret");
+
+    try {
+      const resp = await api.post<SetupIntentResponse>("/billing/setup-intent");
+      setClientSecret(resp.client_secret);
+      setPhase("card_entry");
+    } catch (err) {
+      if (err instanceof ApiError) {
+        if (err.status === 401) {
+          setError("Please log in again.");
+        } else if (err.status === 403) {
+          setError("Please verify your email first.");
+        } else if (err.status === 429) {
+          setError("Too many requests, please wait a moment.");
+        } else {
+          setError("Something went wrong, please try again.");
+        }
+      } else {
+        setError("Something went wrong, please try again.");
+      }
+      // On setup-intent failure after a decline, go back to tier selection
+      // so the user has a clean starting point.
+      setClientSecret(null);
+      setPhase("select");
+    }
+  }
+
+  function handleInvoiceDeclinedCallback(msg: string) {
+    void handleInvoiceDeclined(msg);
+  }
+
   function handleRequiresAction(actionClientSecret: string) {
     void handle3DSChallenge(actionClientSecret);
   }
@@ -326,10 +375,21 @@ export function SubscribeForm({ lookupKeys, onSuccess }: SubscribeFormProps) {
   }
 
   // ------------------------------------------------------------------
-  // Phase B — card entry (clientSecret is set, phase is card_entry or submitting)
+  // Phase B — card entry (selectedTier chosen; fetching or displaying card form)
+  //
+  // This block also handles the post-decline soft-reset path: when the
+  // backend returns 402 INVOICE_PAYMENT_FAILED, handleInvoiceDeclined sets
+  // error + clears clientSecret + sets phase="fetching_secret" while a new
+  // SetupIntent is fetched. The tier summary and inline error remain visible
+  // during the re-fetch so the user sees the decline message continuously.
   // ------------------------------------------------------------------
 
-  if (clientSecret && selectedTier && (phase === "card_entry" || phase === "submitting")) {
+  if (
+    selectedTier &&
+    (phase === "card_entry" ||
+      phase === "submitting" ||
+      (phase === "fetching_secret" && clientSecret === null))
+  ) {
     return (
       <div className="space-y-4">
         {/* Selected tier summary */}
@@ -346,19 +406,27 @@ export function SubscribeForm({ lookupKeys, onSuccess }: SubscribeFormProps) {
           </div>
         )}
 
-        <Elements
-          stripe={getStripe()}
-          options={{ clientSecret, appearance: { theme: "stripe" } }}
-        >
-          <InnerSubscribeForm
-            lookupKey={selectedTier.lookup_key}
-            submitting={phase === "submitting"}
-            onSubmitStart={handleSubmitStart}
-            onError={handleError}
-            onRequiresAction={handleRequiresAction}
-            onConfirmedPolling={handleConfirmedPolling}
-          />
-        </Elements>
+        {clientSecret ? (
+          <Elements
+            stripe={getStripe()}
+            options={{ clientSecret, appearance: { theme: "stripe" } }}
+          >
+            <InnerSubscribeForm
+              lookupKey={selectedTier.lookup_key}
+              submitting={phase === "submitting"}
+              onSubmitStart={handleSubmitStart}
+              onError={handleError}
+              onRequiresAction={handleRequiresAction}
+              onConfirmedPolling={handleConfirmedPolling}
+              onInvoiceDeclined={handleInvoiceDeclinedCallback}
+            />
+          </Elements>
+        ) : (
+          // clientSecret is null — we are re-fetching a fresh SetupIntent
+          // (post-decline soft reset). Show a loading indicator in place of
+          // the card form while we wait.
+          <p className="text-sm text-gray-500">Loading payment form…</p>
+        )}
 
         <button
           type="button"
