@@ -78,6 +78,16 @@ Three-tier model in `doc/operations/testing.md`:
 
 No ticket closes as `resolved` unless it satisfies the §Per-ticket checklist in testing.md (local tests for new behavior; smoke script if infra glue changed).
 
+**Composition tests** are required for tickets touching multiple endpoints, retry behavior, idempotency keys, or webhook handlers (see `doc/operations/testing.md` §Composition tests). The 0024.x billing arc retrospectively identified composition bugs as the dominant failure mode that unit tests miss.
+
+## Chassis discipline docs (read before scoping any billing/auth ticket)
+
+- `doc/operations/audit-template.md` — six-question audit template. Required for any ticket touching billing endpoints, webhook handlers, or idempotency keys. The audit answers gate the ticket's design decisions.
+- `doc/operations/idempotency-policy.md` — three-pattern classification (content-based / per-request / time-window) and consumable-resource catalog. Any new `idempotency_key=` argument must classify under one of the patterns; time-window keys for consumable resources are forbidden.
+- `doc/systems/payments.md` §Field ownership — single-source-of-truth matrix per column. Updates to `subscriptions` or `balance_ledger` must update the matrix in the same commit.
+
+These three documents are the discipline scaffold from the 0024.x arc retrospective. Audits that ignore them are likely to ship the same composition bugs the arc surfaced.
+
 ## Chassis contract (coupling rule)
 
 `doc/operations/chassis-contract.md` lists every invariant the chassis enforces at startup. It is a 1:1 mirror of the enforcement layer (pydantic validators on `Settings`, middleware requirements, other fail-loud checks).

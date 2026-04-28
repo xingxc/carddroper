@@ -305,6 +305,66 @@ This block is added to the CLAUDE.md dispatch template so orchestrators don't re
 
 ---
 
+## Composition tests
+
+Unit tests verify "this endpoint does what it says." **Composition tests** verify "the whole flow works under retry / concurrency / state interaction." Almost every billing-chassis bug shipped despite passing unit tests — the bugs lived in the *interaction* between endpoints, not in any single endpoint's behavior.
+
+### When required
+
+A composition test is required for any ticket that:
+- Introduces a new code path that touches more than one endpoint or webhook handler
+- Adds or modifies retry behavior (frontend or backend)
+- Adds or modifies idempotency keys
+- Implements failure recovery / cleanup
+- Touches a webhook handler that updates schema fields with multiple writers (see `doc/systems/payments.md` §Field ownership)
+
+### Pattern
+
+A composition test exercises the **full user journey** the ticket enables, from the user's first action through every endpoint, table write, and webhook the action triggers. Mock external dependencies (Stripe API) but DO NOT mock the chassis's own endpoints — those are exactly what the test is composing.
+
+Example skeleton:
+
+```python
+@pytest.mark.asyncio
+async def test_subscribe_decline_retry_uses_fresh_setup_intent(client, ...):
+    """Composition: after first-invoice decline, the soft-reset re-fetch must
+    yield a fresh SetupIntent — not replay the consumed one. If replay happens,
+    Stripe.js mounts PaymentElement against a consumed SI → IntegrationError.
+    """
+    # 1. SetupIntent #1 (initial fetch)
+    si1 = await client.post("/billing/setup-intent", ...)
+
+    # 2. Subscribe with PM from SI #1 — backend mocks decline, returns 402
+    mock_stripe.Subscription.create.return_value = _mock_sub_decline()
+    decline = await client.post("/billing/subscribe", json={...})
+    assert decline.status_code == 402
+
+    # 3. SetupIntent #2 (the soft-reset's re-fetch, simulated within same minute)
+    with freeze_time("2026-04-28 12:34:30"):
+        si2 = await client.post("/billing/setup-intent", ...)
+
+    # The composition invariant
+    assert si2.json()["client_secret"] != si1.json()["client_secret"]
+```
+
+### Naming convention
+
+Composition tests start with `test_<flow>_<invariant>` where the flow is the user journey and the invariant is what must hold under composition. Examples:
+
+- `test_subscribe_decline_retry_uses_fresh_setup_intent`
+- `test_webhook_then_subscribe_does_not_overwrite_flag_gated_grant_micros`
+- `test_renewal_invoice_paid_advances_period_and_grants_new_balance`
+
+The pattern `<flow>_<invariant>` makes the test's intent legible without reading the body — the invariant being asserted is in the name.
+
+### Where they live
+
+In the same `backend/tests/test_*.py` file as the unit tests for the surface. No separate `test_compositions/` directory — composition tests are part of normal pytest collection.
+
+### Origin
+
+Ticket 0024.10 retrospective. The 0024.x billing arc shipped 10 tickets in 2 weeks; 4 of them (0024.5, 0024.7, 0024.9, 0024.10) were composition bugs that unit tests missed. Adopting composition tests as a standard ticket deliverable is the highest-ROI testing discipline change identified in that retrospective.
+
 ## Open gaps
 
 1. **Frontend test runner not installed.** Playwright (E2E) or Vitest + React Testing Library (unit/component) — decide when the first real UI lands (ticket 0011's verify/reset pages). Track as a separate ticket.

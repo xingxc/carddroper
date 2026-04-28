@@ -127,6 +127,51 @@ stripe_events (
 );
 ```
 
+### Field ownership (single source of truth)
+
+The chassis follows a single-source-of-truth model: each subscription / ledger column has exactly one **authoritative writer**. Other code paths may have legitimate reasons to set the column (typically on INSERT for fresh rows), but they must NEVER overwrite the authoritative value on UPDATE. This prevents the architectural inconsistency that produced tickets 0024.5, 0024.7, and 0024.8 (each a different field being clobbered by a non-authoritative writer on UPDATE).
+
+**Writer rules:**
+- **Authoritative writer** sets the column on relevant events. Authoritative on both INSERT and UPDATE paths.
+- **Preserve-only writers** must NOT include the column in their UPDATE / `set_=` clauses. They MAY include it in INSERT / `values=` for fresh rows (defensive: better some value than NULL on a NOT NULL column).
+
+#### `subscriptions` table
+
+| Column | Authoritative writer | Preserve-only writers (INSERT-only OR no-touch) |
+|---|---|---|
+| `id` | DB autoincrement | n/a |
+| `user_id` | subscribe endpoint @ create | immutable after create |
+| `stripe_subscription_id` | subscribe endpoint @ create | immutable after create |
+| `stripe_price_id` | subscribe endpoint @ create; `customer.subscription.updated` (tier change) | n/a |
+| `tier_key` | subscribe endpoint @ create; `customer.subscription.updated` (tier change) | n/a |
+| `tier_name` | subscribe endpoint @ create; `customer.subscription.updated` (tier change) | n/a |
+| `status` | every webhook handler that observes a status change for that subscription | subscribe endpoint @ create only |
+| `grant_micros` | subscribe endpoint @ create (strict flag-gate); `invoice.paid` cycle handler @ renewal (when flag=true) | `customer.subscription.created` writes on INSERT only; `customer.subscription.updated` does NOT touch (Path B per 0024.7) |
+| `current_period_start` | subscribe endpoint @ create; `invoice.paid` cycle handler @ renewal | `customer.subscription.created` writes on INSERT only; `customer.subscription.updated` does NOT touch (Path B per 0024.5) |
+| `current_period_end` | subscribe endpoint @ create; `invoice.paid` cycle handler @ renewal | same as current_period_start |
+| `cancel_at_period_end` | `customer.subscription.updated` (this is its job) | other handlers preserve |
+| `created_at` | DB default | n/a |
+| `updated_at` | DB on every UPDATE | n/a |
+
+#### `balance_ledger` table
+
+Append-only. Every write goes through the `grant()` chassis primitive — there is no UPDATE path. New rows only.
+
+| Column | Writer |
+|---|---|
+| All columns | `app/billing/primitives.py::grant()` — exclusive writer |
+
+The append-only model means there are no preserve-vs-overwrite questions for the ledger. The single source of truth is the helper itself; project code calls it through the chassis interface.
+
+#### Adding a new column or write path
+
+When introducing a new subscription column or a new code path that writes to existing columns:
+1. Update the matrix above with the new column (or new writer for existing column).
+2. The "authoritative writer" cell must have exactly one entry (or one + per-event when state-machine writers like `status` legitimately have multiple).
+3. If a preserve-only writer is being added, document the INSERT-only / no-touch posture explicitly.
+
+This keeps the architectural contract trustworthy and prevents future Path B regressions. See ticket 0024.5's resolution for the original Path B framing.
+
 ### Reason vocabulary (chassis-closed)
 
 `balance_ledger.reason` is a closed set. Project layers **do not** add reason

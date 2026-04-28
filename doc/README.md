@@ -35,8 +35,10 @@ Running, deploying, and evolving carddroper.
 | [operations/environments.md](operations/environments.md) | dev / staging / prod layout, promotion path, secret strategy. |
 | [operations/deployment.md](operations/deployment.md) | GCP Cloud Run + Cloud SQL + Cloud Build playbook (filled as we stand each env up). |
 | [operations/gcp-deployment-tutorial.md](operations/gcp-deployment-tutorial.md) | Narrative walkthrough for chassis adopters — clone-to-live in one document, with commands + gotchas. |
-| [operations/testing.md](operations/testing.md) | Three-tier testing policy — local / staging / prod — with per-ticket coverage checklist and smoke-script pattern. |
+| [operations/testing.md](operations/testing.md) | Three-tier testing policy — local / staging / prod — with per-ticket coverage checklist, smoke-script pattern, and composition-test guidance. |
 | [operations/chassis-contract.md](operations/chassis-contract.md) | Chassis invariants enforced at startup — the contract adopters must honor. |
+| [operations/audit-template.md](operations/audit-template.md) | Six-question audit template for chassis tickets. Required for any ticket touching billing endpoints, webhook handlers, or idempotency keys. |
+| [operations/idempotency-policy.md](operations/idempotency-policy.md) | Three-pattern classification (content-based / per-request / time-window) for Stripe idempotency keys, plus consumable-resource catalog. |
 
 ## Legal
 
