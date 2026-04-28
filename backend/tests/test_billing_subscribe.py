@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+from freezegun import freeze_time
+
 import httpx
 import pytest
 from sqlalchemy import select
@@ -3339,3 +3341,153 @@ async def test_subscribe_terminal_failure_cleanup_idempotent_when_stripe_5xx(cli
         )
         row = result.scalar_one_or_none()
     assert row is None
+
+
+# ---------------------------------------------------------------------------
+# POST /billing/setup-intent — idempotency regression (ticket 0024.10)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_subscribe_decline_retry_uses_fresh_setup_intent(client):
+    """Composition test: decline → 402 → re-fetch setup-intent (within same minute) returns fresh SI.
+
+    Ticket 0024.10: the setup-intent endpoint previously used a time-window idempotency key
+    (f"setup:{user.id}:{int(time.time() // 60)}"). When the soft-reset (0024.9) re-fetched a
+    SetupIntent within the same wall-clock minute as the original fetch, Stripe's idempotency
+    cache replayed the already-consumed SetupIntent → PaymentElement mounted against a dead SI →
+    IntegrationError → form stuck.
+
+    Fix: drop the idempotency_key entirely (per-request pattern). Each call to SetupIntent.create
+    produces a fresh SI regardless of timing.
+
+    This test simulates Stripe's idempotency cache: the mock's side_effect checks whether
+    idempotency_key is in kwargs. If present (the bug), it replays the same SI for the same key.
+    If absent (the fix), it returns a fresh SI on each call. Freezegun pins wall-clock time so
+    the minute-window key is identical across both calls when the bug is present.
+
+    The test would FAIL with the buggy time-window key (same key → same replay response).
+    It PASSES with the fix (no key → fresh SI on each call).
+    """
+    import stripe as real_stripe
+
+    mock_customer = MagicMock()
+    mock_customer.id = "cus_0024_10"
+
+    with (
+        patch.object(settings, "BILLING_ENABLED", True),
+        patch("app.billing.primitives.stripe") as mock_p,
+    ):
+        mock_p.Customer.create.return_value = mock_customer
+        reg_resp, user_id = await _register_and_verify(client, "retry_fresh_si_0024_10@example.com")
+
+    access_token = reg_resp.get("access_token")
+
+    # Two distinct SetupIntent mocks to return on successive create calls.
+    mock_si_1 = MagicMock()
+    mock_si_1.id = "seti_first_0024_10"
+    mock_si_1.client_secret = "seti_secret_first_0024_10"
+
+    mock_si_2 = MagicMock()
+    mock_si_2.id = "seti_second_0024_10"
+    mock_si_2.client_secret = "seti_secret_second_0024_10"
+
+    # Simulate Stripe idempotency cache: if idempotency_key kwarg is present, replay the
+    # cached response for the same key; if absent, return a fresh SI each time.
+    _si_cache: dict = {}
+    _si_sequence = iter([mock_si_1, mock_si_2])
+
+    def _setup_intent_create_side_effect(*args, **kwargs):
+        idem_key = kwargs.get("idempotency_key")
+        if idem_key is not None:
+            # Bug path: same key within the minute → Stripe replays the first response.
+            if idem_key not in _si_cache:
+                _si_cache[idem_key] = next(_si_sequence)
+            return _si_cache[idem_key]
+        # Fix path: no idempotency_key → always return the next fresh SI.
+        return next(_si_sequence)
+
+    price = _mock_price()
+    mock_prices = MagicMock()
+    mock_prices.data = [price]
+    mock_prices.auto_paging_iter.return_value = iter([price])
+
+    last_err = {
+        "message": "Your card was declined.",
+        "decline_code": "insufficient_funds",
+        "code": "card_declined",
+    }
+    mock_sub_declined = _mock_subscription(
+        sub_id="sub_declined_0024_10",
+        status="incomplete",
+        pi_status="requires_payment_method",
+        last_payment_error=last_err,
+    )
+
+    # Pin time so the minute-window key is identical for both setup-intent calls.
+    with freeze_time("2026-04-27 12:00:30"):
+        with (
+            patch.object(settings, "BILLING_ENABLED", True),
+            patch("app.routes.billing.stripe") as mock_stripe,
+            patch("app.billing.primitives.stripe"),
+        ):
+            mock_stripe.SetupIntent.create.side_effect = _setup_intent_create_side_effect
+            mock_stripe.Price.list.return_value = mock_prices
+            mock_stripe.PaymentMethod.attach.return_value = MagicMock()
+            mock_stripe.Customer.modify.return_value = MagicMock()
+            mock_stripe.Subscription.create.return_value = mock_sub_declined
+            mock_stripe.Subscription.delete.return_value = MagicMock()
+            mock_stripe.error = real_stripe.error
+
+            # Call #1 — initial setup-intent fetch (simulates step 2 in the flow).
+            resp1 = await client.post(
+                "/billing/setup-intent",
+                headers=_auth_headers(access_token),
+            )
+            assert resp1.status_code == 200, resp1.text
+            secret1 = resp1.json()["client_secret"]
+            call1_kwargs = mock_stripe.SetupIntent.create.call_args_list[0][1]
+
+            # Subscribe → 402 (card declined, simulates step 4 in the flow).
+            resp_sub = await client.post(
+                "/billing/subscribe",
+                json={
+                    "price_lookup_key": "starter_monthly",
+                    "payment_method_id": "pm_declined_0024_10",
+                },
+                headers=_auth_headers(access_token),
+            )
+            assert resp_sub.status_code == 402, resp_sub.text
+
+            # 5 seconds later — still within the same wall-clock minute.
+            # With the bug: the minute-window key is identical → Stripe replay → same SI.
+            # With the fix: no key → fresh SI created.
+            with freeze_time("2026-04-27 12:00:35"):
+                # Call #2 — soft-reset re-fetch (simulates step 5d in the flow).
+                resp2 = await client.post(
+                    "/billing/setup-intent",
+                    headers=_auth_headers(access_token),
+                )
+                assert resp2.status_code == 200, resp2.text
+                secret2 = resp2.json()["client_secret"]
+                call2_kwargs = mock_stripe.SetupIntent.create.call_args_list[1][1]
+
+    # The two client_secrets must differ — a replay would have returned the same one.
+    assert secret1 != secret2, (
+        f"setup-intent returned identical client_secret on both calls ({secret1!r}). "
+        "This indicates time-window idempotency replay: the soft-reset received a "
+        "consumed SetupIntent instead of a fresh one. Drop idempotency_key from "
+        "stripe.SetupIntent.create (ticket 0024.10)."
+    )
+
+    # Confirm neither call carried an idempotency_key kwarg (the fix).
+    assert "idempotency_key" not in call1_kwargs, (
+        f"Call #1 unexpectedly carried idempotency_key={call1_kwargs['idempotency_key']!r}. "
+        "The setup-intent endpoint must not pass an idempotency_key to Stripe.SetupIntent.create "
+        "(per chassis idempotency-policy.md: SetupIntent is consumable, time-window keys forbidden)."
+    )
+    assert "idempotency_key" not in call2_kwargs, (
+        f"Call #2 unexpectedly carried idempotency_key={call2_kwargs['idempotency_key']!r}. "
+        "The setup-intent endpoint must not pass an idempotency_key to Stripe.SetupIntent.create "
+        "(per chassis idempotency-policy.md: SetupIntent is consumable, time-window keys forbidden)."
+    )

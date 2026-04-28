@@ -277,7 +277,10 @@ async def setup_intent(
     user has none. Returns a client_secret for the frontend to confirm via Stripe
     Elements.
 
-    Idempotency: one SetupIntent per user per minute (minute-window key).
+    Idempotency: per-request (none) — each call creates a fresh SetupIntent.
+    Per chassis idempotency-policy.md: SetupIntent is consumable; time-window
+    keys are forbidden. Frontend submitting-state and backend rate limits
+    provide deduplication.
     """
     init_stripe()
 
@@ -287,13 +290,10 @@ async def setup_intent(
         user.stripe_customer_id = customer_id
         await db.flush()
 
-    idempotency_key = f"setup:{user.id}:{int(time.time() // 60)}"
-
     si = stripe.SetupIntent.create(
         customer=user.stripe_customer_id,
         payment_method_types=["card"],
         usage="off_session",
-        idempotency_key=idempotency_key,
     )
 
     return SetupIntentResponse(client_secret=si.client_secret)

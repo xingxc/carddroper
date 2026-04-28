@@ -407,7 +407,7 @@ vocabulary, idempotency).
 ## Chassis-exposed HTTP endpoints
 
 - `GET /billing/balance` — returns `{balance_micros: int, formatted: str}`. Authed.
-- `POST /billing/setup-intent` — creates Stripe SetupIntent for collecting a payment method. Returns `{client_secret: str}`. Verified user only. Lazily creates Stripe Customer. Idempotency: one per user per minute.
+- `POST /billing/setup-intent` — creates Stripe SetupIntent for collecting a payment method. Returns `{client_secret: str}`. Verified user only. Lazily creates Stripe Customer. Idempotency: per-request (none) — each call creates a fresh SetupIntent. Per chassis `idempotency-policy.md`: SetupIntent is consumable; time-window keys are forbidden. Frontend submitting-state and backend rate limits provide deduplication. (Fixed by 0024.10.)
 - `POST /billing/topup` — returns Stripe `client_secret`. Verified user only.
 - `POST /billing/subscribe` — creates subscription. Verified user only. Rate-limited.
 - `GET /billing/subscription` — returns subscription state `{has_subscription, tier_key, tier_name, status, current_period_end, cancel_at_period_end}`. Authed (not verified-gated).
