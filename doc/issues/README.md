@@ -81,6 +81,7 @@ The Verification section exists because "tsc passes" and "lint passes" are neces
 | 0024.6 | subscribe idempotency key collides on retry with different payment_method_id (3DS, decline-retry) | open | medium |
 | 0024.7 | webhook handlers stop overwriting subscriptions.grant_micros — apply Path B to grant_micros | open | medium |
 | 0024.8 | subscribe endpoint stores 0 in grant_micros when flag=false (strict flag-gate, regardless of metadata) | open | medium |
+| 0024.9 | subscribe failure recovery — distinguish 3DS from decline; sync-cancel terminal failures; clean up incomplete rows | open | medium |
 | 0020 | legal acceptance — ToS checkbox on /register + /legal/terms + /legal/privacy static pages | open | high |
 | 0021 | Stripe foundation (chassis) — balance ledger, billing primitives, webhook skeleton | resolved | medium |
 | 0022 | app-shell refactor (chassis) — left-rail sidebar + profile popover menu | resolved | medium |
