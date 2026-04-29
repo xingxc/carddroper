@@ -1,0 +1,7 @@
+{
+  "_README": "Copy this file to backend/.test-clock-fixture.local and fill in the values. See doc/operations/stripe-side-tests.md §Tier B for setup steps. The .local file is gitignored.",
+  "customer_id": "cus_REPLACE_ME",
+  "clock_id": "clock_REPLACE_ME",
+  "user_id": 0,
+  "subscription_id": "sub_REPLACE_ME"
+}

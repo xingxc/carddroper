@@ -131,6 +131,19 @@ stripe customers create --test-clock=clock_<id> \
 
 The test customer/clock pair becomes a permanent test fixture. Document the IDs in a gitignored file (`backend/.test-clock-fixture.local`) so future runs can use them.
 
+```bash
+# 6. Save the IDs in backend/.test-clock-fixture.local (template: .test-clock-fixture.local.example).
+cp backend/.test-clock-fixture.local.example backend/.test-clock-fixture.local
+# Edit the file and fill in customer_id, clock_id, user_id, subscription_id.
+
+# 7. Run python backend/scripts/test_renewal.py to verify the renewal cycle behavior.
+#    The script will advance the test clock by 31 days, wait for webhooks, capture
+#    pre/post DB state, and assert the chassis renewal behavior is correct.
+#    It is the canonical Tier B1 test for any future ticket touching the
+#    handle_invoice_paid subscription_cycle branch.
+python backend/scripts/test_renewal.py
+```
+
 ### B1. Advance through one renewal
 
 ```bash

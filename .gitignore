@@ -27,5 +27,9 @@ desktop.ini
 # Local Claude Code overrides (settings.json IS committed; .local is not)
 .claude/settings.local.json
 
+# Stripe test-clock fixture — contains test-mode Stripe IDs; gitignored by discipline.
+# The .example template IS committed; the .local fill-in is NOT.
+backend/.test-clock-fixture.local
+
 # Logs
 *.log
