@@ -1,12 +1,13 @@
 """Billing routes.
 
-POST /billing/webhook      — Stripe webhook receiver (signature-verified, idempotent).
-POST /billing/topup        — Create Stripe PaymentIntent for a PAYG topup.
-GET  /billing/balance      — Return current balance for the authenticated user.
-POST /billing/setup-intent — Create Stripe SetupIntent for collecting a payment method.
-POST /billing/subscribe    — Create a Stripe Subscription for the authenticated user.
-GET  /billing/subscription — Return current subscription state for the authenticated user.
-GET  /billing/tiers        — Return enriched tier envelopes for the given lookup_keys (CSV).
+POST /billing/webhook        — Stripe webhook receiver (signature-verified, idempotent).
+POST /billing/topup          — Create Stripe PaymentIntent for a PAYG topup.
+GET  /billing/balance        — Return current balance for the authenticated user.
+POST /billing/setup-intent   — Create Stripe SetupIntent for collecting a payment method.
+POST /billing/subscribe      — Create a Stripe Subscription for the authenticated user.
+GET  /billing/subscription   — Return current subscription state for the authenticated user.
+GET  /billing/tiers          — Return enriched tier envelopes for the given lookup_keys (CSV).
+POST /billing/portal-session — Create a Stripe Customer Portal session URL.
 
 Note: do NOT add `from __future__ import annotations` — it breaks FastAPI's
 Pydantic body-type resolution at runtime.
@@ -121,6 +122,14 @@ class TierEnvelope(BaseModel):
     interval: str
     interval_count: int
     grant_micros: int
+
+
+class PortalSessionRequest(BaseModel):
+    return_url: Optional[str] = None
+
+
+class PortalSessionResponse(BaseModel):
+    url: str
 
 
 # ---------------------------------------------------------------------------
@@ -663,3 +672,61 @@ async def list_tiers(
     # Preserve input order — Stripe does not guarantee ordering.
     by_key = {e.lookup_key: e for e in envelopes}
     return [by_key[k] for k in keys if k in by_key]
+
+
+@router.post("/portal-session", response_model=PortalSessionResponse)
+async def portal_session(
+    request: Request,
+    body: PortalSessionRequest,
+    user=Depends(require_billing_user),
+    db: AsyncSession = Depends(get_db),
+) -> PortalSessionResponse:
+    """Create a Stripe Customer Portal session URL for the authenticated user.
+
+    Uses require_billing_user dep: any authed user can open the Portal by default
+    (BILLING_REQUIRE_VERIFIED=False). Lazily creates a Stripe Customer if the user
+    has none (matches setup-intent + subscribe + topup pattern).
+
+    Security: return_url is validated against FRONTEND_BASE_URL to prevent
+    open-redirect attacks. Invalid return_url → 422.
+
+    If return_url is absent, falls back to {FRONTEND_BASE_URL}/app/subscribe.
+
+    BILLING_PORTAL_CONFIGURATION_ID: when set (bpc_<id>), passes a specific
+    Portal configuration to Stripe. When empty (default), uses the Stripe account's
+    default Portal configuration.
+    """
+    init_stripe()
+
+    # Lazy-create customer (matches setup-intent + subscribe pattern)
+    if user.stripe_customer_id is None:
+        customer_id = await create_customer(user, db)
+        user.stripe_customer_id = customer_id
+        await db.commit()
+
+    # Resolve return URL with prefix validation
+    return_url = body.return_url or f"{settings.FRONTEND_BASE_URL}/app/subscribe"
+    if not return_url.startswith(settings.FRONTEND_BASE_URL):
+        raise validation_error(
+            f"return_url must be on our domain ({settings.FRONTEND_BASE_URL})"
+        )
+
+    # Build kwargs; pass configuration only if env var is set
+    kwargs = {
+        "customer": user.stripe_customer_id,
+        "return_url": return_url,
+    }
+    if settings.BILLING_PORTAL_CONFIGURATION_ID:
+        kwargs["configuration"] = settings.BILLING_PORTAL_CONFIGURATION_ID
+
+    try:
+        session = stripe.billing_portal.Session.create(**kwargs)
+    except stripe.error.InvalidRequestError as exc:
+        if "portal configuration" in str(exc).lower():
+            raise validation_error(
+                "Stripe Customer Portal is not configured. "
+                "Configure at Stripe Dashboard → Settings → Billing → Customer portal."
+            )
+        raise
+
+    return PortalSessionResponse(url=session.url)

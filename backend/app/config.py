@@ -239,6 +239,10 @@ class Settings(BaseSettings):
     # Adopters with regulatory or anti-abuse posture flip True to restore the
     # verified-gate. See doc/systems/payments.md §Verified-gate posture.
 
+    BILLING_PORTAL_CONFIGURATION_ID: str = ""
+    # chassis-tunable; default empty = use Stripe account default Portal config;
+    # set to bpc_<id> to use a specific configuration.
+
     @model_validator(mode="after")
     def validate_stripe_secret_key(self) -> "Settings":
         """Refuse to construct when BILLING_ENABLED=True but STRIPE_SECRET_KEY is unset.

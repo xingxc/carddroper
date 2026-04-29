@@ -63,7 +63,7 @@ steps:
       - --service-account=carddroper-runtime@carddroper-staging.iam.gserviceaccount.com
       - --add-cloudsql-instances=$PROJECT_ID:us-west1:carddroper-staging-db
       - --set-secrets=DATABASE_URL=carddroper-database-url:latest,JWT_SECRET=carddroper-jwt-secret:latest,SENDGRID_API_KEY=carddroper-sendgrid-api-key:latest,SENDGRID_TEMPLATE_VERIFY_EMAIL=carddroper-sendgrid-template-verify-email:latest,SENDGRID_TEMPLATE_RESET_PASSWORD=carddroper-sendgrid-template-reset-password:latest,SENDGRID_TEMPLATE_CHANGE_EMAIL=carddroper-sendgrid-template-change-email:latest,SENDGRID_TEMPLATE_EMAIL_CHANGED=carddroper-sendgrid-template-email-changed:latest,SENDGRID_TEMPLATE_CREDITS_PURCHASED=carddroper-sendgrid-template-credits-purchased:latest,STRIPE_SECRET_KEY=carddroper-stripe-secret-key:latest,STRIPE_WEBHOOK_SECRET=carddroper-stripe-webhook-secret:latest
-      - --set-env-vars=SENDGRID_SANDBOX=false,FROM_EMAIL=noreply@carddroper.com,FROM_NAME=Carddroper,FRONTEND_BASE_URL=https://staging.carddroper.com,CORS_ORIGINS=https://staging.carddroper.com,COOKIE_DOMAIN=.staging.carddroper.com,BILLING_ENABLED=true,BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=true,BILLING_REQUIRE_VERIFIED=false
+      - --set-env-vars=SENDGRID_SANDBOX=false,FROM_EMAIL=noreply@carddroper.com,FROM_NAME=Carddroper,FRONTEND_BASE_URL=https://staging.carddroper.com,CORS_ORIGINS=https://staging.carddroper.com,COOKIE_DOMAIN=.staging.carddroper.com,BILLING_ENABLED=true,BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=true,BILLING_REQUIRE_VERIFIED=false,BILLING_PORTAL_CONFIGURATION_ID=
       - --min-instances=0
       - --max-instances=3
       - --allow-unauthenticated

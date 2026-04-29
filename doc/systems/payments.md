@@ -417,7 +417,7 @@ vocabulary, idempotency).
 - `POST /billing/subscribe` — creates subscription. Verified user only. Rate-limited.
 - `GET /billing/subscription` — returns subscription state `{has_subscription, tier_key, tier_name, status, current_period_end, cancel_at_period_end}`. Authed (not verified-gated).
 - `GET /billing/tiers` — returns enriched `TierEnvelope[]` for a CSV `lookup_keys` query param. Calls `stripe.Price.list(lookup_keys=..., active=True, expand=["data.product"])` in one round-trip. Prices missing required metadata are silently skipped. Non-USD logs warning; `$` prefix used as fallback. Response order matches input order. Authed (not verified-gated).
-- `POST /billing/portal-session` — returns Stripe Customer Portal URL. Authed.
+- `POST /billing/portal-session` — creates and returns a one-shot Stripe Customer Portal session URL. Authed (not verified-gated). Request body: `{return_url?: string}` (optional; defaults to `{FRONTEND_BASE_URL}/app/subscribe`). Response: `{url: string}`. Security: `return_url` must start with `FRONTEND_BASE_URL` or the endpoint returns 422 (open-redirect prevention). Lazily creates a Stripe Customer if `user.stripe_customer_id` is absent (same pattern as setup-intent / subscribe / topup). When `BILLING_PORTAL_CONFIGURATION_ID` is set, passes it to Stripe; when empty (default), uses the Stripe account's default Portal configuration. Portal Sessions are ephemeral one-shot URLs; no idempotency key is used (per chassis idempotency-policy.md, Portal Sessions are not consumable in the deduplication sense — each call always creates a fresh URL).
 - `POST /billing/webhook` — Stripe webhook handler. Signature-verified; no auth dep.
 
 ## Verified-gate posture
