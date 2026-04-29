@@ -87,7 +87,7 @@ The Verification section exists because "tsc passes" and "lint passes" are neces
 | 0024.12 | basil API moved invoice.subscription field; stripe_extractors module + 3DS-fail UX symmetry with decline | resolved | high |
 | 0024.13 | handle_subscription_created INSERT path must flag-gate grant_micros; adds cross-writer audit discipline (Q3.5) | resolved | medium-high |
 | 0024.14 | renewal cycle test-clock verification — script + fixture template + setup docs | resolved | medium |
-| 0024.15 | renewal failure test-clock verification — extend test_renewal.py with --simulate-decline; assert past_due + Path B | open | medium |
+| 0024.15 | renewal failure test-clock verification — extend test_renewal.py with --simulate-decline; assert past_due + Path B | resolved | medium |
 | 0020 | legal acceptance — ToS checkbox on /register + /legal/terms + /legal/privacy static pages | open | high |
 | 0021 | Stripe foundation (chassis) — balance ledger, billing primitives, webhook skeleton | resolved | medium |
 | 0022 | app-shell refactor (chassis) — left-rail sidebar + profile popover menu | resolved | medium |

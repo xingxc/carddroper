@@ -132,9 +132,31 @@ Required for any ticket where the agent's work is non-trivial enough that "did t
 - Tickets that require removing a deprecated comment, function, or code block (verify removal)
 - Tickets that mandate a specific test fixture pattern (e.g., `spec=`-restricted MagicMock)
 
+### Smoke-run check (for tickets producing executable scripts)
+
+When a ticket produces or modifies an executable script (e.g., `backend/scripts/*.py`), Phase 0c grep checks alone are insufficient — they verify structure but not runtime behavior. **Add a smoke-run step** that exercises the script's startup and argument parsing:
+
+```bash
+# Confirm the script's --help works and lists the expected new flags
+.venv/bin/python scripts/<name>.py --help
+
+# If the script has a --dry-run mode that exits early, run it (no real side effects)
+.venv/bin/python scripts/<name>.py --dry-run
+```
+
+The smoke-run catches a class of bugs that grep misses:
+
+- **Stale closure / type-mismatch bugs at runtime** — e.g., assuming `pydantic.SecretStr` when the field is plain `str` (0024.14 Phase 1 surface).
+- **API-quirk bugs** — e.g., Stripe `pm_card_*` shortcut tokens accepted by `PaymentMethod.attach` but rejected by `Subscription.modify` (0024.15 Phase 1 surface).
+- **Path-derivation bugs** — e.g., `_target_frozen_time` computing from real wall-clock instead of the test clock's frozen state, breaking on second-run fixtures (0024.15 Phase 1 surface).
+
+The grep-only Phase 0c audit declared each of those tickets "all checks pass" while the script crashed on first real invocation. The smoke-run catches them at audit time.
+
+For scripts that REQUIRE real fixtures or external services (e.g., `test_renewal.py` needs a test-clock customer), the smoke-run is `--dry-run` or `--help` — both should succeed without hitting external dependencies. If neither flag exists, add one as part of the script's design.
+
 ### Origin
 
-Ticket 0024.12 retrospective. The Phase 0c pattern was introduced there and applied successfully to 0024.13. Both tickets caught spec deviations the agent's report didn't surface.
+Ticket 0024.12 retrospective established the Phase 0c grep pattern (applied successfully to 0024.13). Tickets 0024.14 and 0024.15 retrospectives extended it with the smoke-run check after both tickets shipped scripts with runtime bugs that passed all grep checks. The pattern: structural correctness ≠ runtime correctness for scripts.
 
 ## When to skip
 

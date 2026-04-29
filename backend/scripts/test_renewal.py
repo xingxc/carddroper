@@ -19,7 +19,6 @@ import asyncio
 import json
 import os
 import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -201,9 +200,24 @@ def _setup_stripe() -> None:
     stripe.api_key = secret_key
 
 
-def _target_frozen_time(days: int) -> int:
-    """Return Unix timestamp 'days' days from now (UTC)."""
-    return int(time.time()) + days * 86400
+def _target_frozen_time(clock_id: str, days: int) -> int:
+    """Return Unix timestamp 'days' days from the test clock's CURRENT frozen_time.
+
+    Bug fix from initial 0024.14/0024.15 runs: the original implementation used
+    real wall-clock time (`int(time.time()) + days * 86400`) which is wrong once
+    the clock has been advanced past real-now (i.e., on the second or later run
+    against the same fixture). Stripe's TestClock.advance requires a frozen_time
+    strictly greater than the clock's current frozen_time, AND we want to trigger
+    the next billing cycle which is anchored to the clock's current state, not
+    to real-now.
+
+    Compute target from the clock's frozen_time so successive runs each advance
+    by `days` regardless of how many prior advances happened.
+    """
+    import stripe
+
+    clock = stripe.test_helpers.TestClock.retrieve(clock_id)
+    return int(clock.frozen_time) + days * 86400
 
 
 def _advance_clock(clock_id: str, frozen_time: int) -> None:
@@ -467,7 +481,7 @@ async def _run_success_path(
         )
 
     if args.dry_run:
-        target_ts = _target_frozen_time(args.days)
+        target_ts = _target_frozen_time(clock_id, args.days)
         target_dt = datetime.fromtimestamp(target_ts, tz=timezone.utc)
         print(
             _yellow(
@@ -481,7 +495,7 @@ async def _run_success_path(
     # ------------------------------------------------------------------
     # 2. Advance the test clock
     # ------------------------------------------------------------------
-    target_ts = _target_frozen_time(args.days)
+    target_ts = _target_frozen_time(clock_id, args.days)
     target_dt = datetime.fromtimestamp(target_ts, tz=timezone.utc)
     print(f"\nAdvancing test clock by {args.days} days...")
     print(f"  Target time: {target_dt.isoformat()} (Unix: {target_ts})")
@@ -629,25 +643,31 @@ async def _run_decline_path(
         # Attach the fail PM to the test customer
         print(f"\nAttaching {FAIL_PM} to customer {customer_id}...")
         try:
-            await asyncio.to_thread(
+            # Stripe's pm_card_* shortcut tokens (e.g., pm_card_chargeCustomerFail) work as
+            # the FIRST argument to PaymentMethod.attach but Stripe converts them to real
+            # PM IDs (e.g., pm_1ABC...). Subscription.modify(default_payment_method=...)
+            # requires the REAL ID — the shortcut token is rejected with "No such PaymentMethod".
+            # Capture the attached PM's real id and use it for the modify below.
+            attached_pm = await asyncio.to_thread(
                 stripe.PaymentMethod.attach,
                 FAIL_PM,
                 customer=customer_id,
             )
-            print(f"  Attached {FAIL_PM} successfully.")
+            attached_pm_id = attached_pm.id
+            print(f"  Attached {FAIL_PM} successfully. Real PM id: {attached_pm_id}")
         except Exception as exc:
             print(_red(f"ERROR attaching {FAIL_PM}: {exc}"), file=sys.stderr)
             return 1
 
-        # Set the fail PM as the subscription's default
-        print(f"\nSetting subscription default_payment_method to {FAIL_PM}...")
+        # Set the (now real-id) fail PM as the subscription's default
+        print(f"\nSetting subscription default_payment_method to {attached_pm_id}...")
         try:
             await asyncio.to_thread(
                 stripe.Subscription.modify,
                 subscription_id,
-                default_payment_method=FAIL_PM,
+                default_payment_method=attached_pm_id,
             )
-            print(f"  Subscription default_payment_method → {FAIL_PM}")
+            print(f"  Subscription default_payment_method → {attached_pm_id}")
         except Exception as exc:
             print(
                 _red(f"ERROR modifying subscription default_payment_method: {exc}"),
@@ -690,7 +710,7 @@ async def _run_decline_path(
             )
 
         if args.dry_run:
-            target_ts = _target_frozen_time(args.days)
+            target_ts = _target_frozen_time(clock_id, args.days)
             target_dt = datetime.fromtimestamp(target_ts, tz=timezone.utc)
             print(
                 _yellow(
@@ -704,7 +724,7 @@ async def _run_decline_path(
         # ------------------------------------------------------------------
         # 4. Advance the test clock
         # ------------------------------------------------------------------
-        target_ts = _target_frozen_time(args.days)
+        target_ts = _target_frozen_time(clock_id, args.days)
         target_dt = datetime.fromtimestamp(target_ts, tz=timezone.utc)
         print(f"\nAdvancing test clock by {args.days} days (charge will fail)...")
         print(f"  Target time: {target_dt.isoformat()} (Unix: {target_ts})")
