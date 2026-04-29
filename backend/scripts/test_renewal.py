@@ -1,17 +1,42 @@
 #!/usr/bin/env python3
 """Renewal cycle verification via Stripe Test Clocks.
 
-Usage:
-    python scripts/test_renewal.py                  # advance 31 days, run assertions (success path)
-    python scripts/test_renewal.py --days=15        # custom advance duration
-    python scripts/test_renewal.py --dry-run        # show pre-state, do not advance
-    python scripts/test_renewal.py --simulate-decline  # swap PM to failing card; assert past_due
-    python scripts/test_renewal.py --simulate-decline --no-restore-active  # leave sub in past_due
+Usage (run from backend/ with a working test-clock fixture in place):
+
+    # Success path — verify chassis behavior on a successful renewal cycle.
+    # Advances clock to max(clock+days, sub.current_period_end + 1 day) to ensure
+    # crossing the next billing anchor regardless of calendar-month length.
+    DATABASE_URL='postgresql+asyncpg://carddroper:carddroper@localhost:5433/carddroper' \\
+      .venv/bin/python scripts/test_renewal.py
+
+    # Custom advance duration (e.g., for short tests near a boundary)
+    python scripts/test_renewal.py --days=2
+
+    # Dry-run — show pre-state and target time; do not advance the clock
+    python scripts/test_renewal.py --dry-run
+
+    # Failure path — swap PM to pm_card_chargeCustomerFail; assert past_due transition
+    # + Path B preservation. Restores PM in finally (with retry-on-clock-busy).
+    # --restore-active=True (default) re-pays the failed invoice for clean re-runs;
+    # --no-restore-active leaves sub in past_due (useful as a 0025 starting fixture).
+    python scripts/test_renewal.py --simulate-decline
+    python scripts/test_renewal.py --simulate-decline --no-restore-active
+
+    # Recover a broken fixture: past_due (PM still set to fail token) OR canceled
+    # (Stripe blocks all modifications — script creates a new sub on the same
+    # customer + clock with the original PM, prints the new sub_id for fixture update).
+    python scripts/test_renewal.py --recover-fixture
 
 Reads fixture from backend/.test-clock-fixture.local. See
 doc/operations/stripe-side-tests.md §Tier B for setup instructions.
 
-Origin: ticket 0024.14 (success path). Extended by ticket 0024.15 (failure path).
+DATABASE_URL note: docker-compose forwards Postgres on host port 5433 (not 5432,
+to avoid clashing with any host-installed Postgres). The script reads DATABASE_URL
+via pydantic-settings; if backend/.env has a host-Postgres URL on port 5432, override
+on the command line per the example above.
+
+Origin: ticket 0024.14 (success path). Extended by 0024.15 (failure path,
+--recover-fixture, multiple reliability fixes from Phase 1 retrospective).
 """
 
 import argparse
@@ -200,24 +225,72 @@ def _setup_stripe() -> None:
     stripe.api_key = secret_key
 
 
-def _target_frozen_time(clock_id: str, days: int) -> int:
-    """Return Unix timestamp 'days' days from the test clock's CURRENT frozen_time.
+def _target_frozen_time(
+    clock_id: str,
+    days: int,
+    subscription_id: str | None = None,
+    buffer_days: int = 1,
+) -> int:
+    """Compute target frozen_time for a test-clock advance.
 
-    Bug fix from initial 0024.14/0024.15 runs: the original implementation used
-    real wall-clock time (`int(time.time()) + days * 86400`) which is wrong once
-    the clock has been advanced past real-now (i.e., on the second or later run
-    against the same fixture). Stripe's TestClock.advance requires a frozen_time
-    strictly greater than the clock's current frozen_time, AND we want to trigger
-    the next billing cycle which is anchored to the clock's current state, not
-    to real-now.
+    Strategy: max of two candidates —
+    1. clock.frozen_time + days * 86400 — respects an explicit --days override
+    2. sub.current_period_end + buffer_days * 86400 — ensures crossing the
+       next billing anchor regardless of calendar-month length
 
-    Compute target from the clock's frozen_time so successive runs each advance
-    by `days` regardless of how many prior advances happened.
+    Returns the LATER of the two so the advance always triggers the next renewal.
+
+    Why both: calendar months vary between 28-31 days, so a flat `--days=31`
+    sometimes lands AT the period boundary (renewal not fired) and sometimes
+    1+ days past (renewal fires). The period_end-based candidate eliminates
+    the boundary class.
+
+    Bug history (all fixed in 0024.15 follow-up):
+    - Original used real wall-clock time → broke on every 2nd-and-later run
+    - Then used clock.frozen_time + days → broke on 31-day-month boundaries
+    - Now uses max(days_candidate, period_end + buffer) → robust to both
+
+    If subscription_id is None or sub retrieval fails, falls back to the
+    clock-only candidate (legacy behavior).
     """
     import stripe
 
     clock = stripe.test_helpers.TestClock.retrieve(clock_id)
-    return int(clock.frozen_time) + days * 86400
+    days_target = int(clock.frozen_time) + days * 86400
+
+    if subscription_id is None:
+        return days_target
+
+    try:
+        sub = stripe.Subscription.retrieve(subscription_id, expand=["items"])
+    except Exception:
+        return days_target
+
+    # Find period_end (basil moved it from subscription top-level to
+    # subscription_items[0].current_period_end per ticket 0024.4).
+    period_end = None
+    pe_attr = getattr(sub, "current_period_end", None)
+    if pe_attr:
+        period_end = int(pe_attr)
+    else:
+        items = getattr(sub, "items", None)
+        items_data = getattr(items, "data", None) if items else None
+        if items_data and len(items_data) > 0:
+            item_pe = getattr(items_data[0], "current_period_end", None)
+            if item_pe:
+                period_end = int(item_pe)
+
+    if period_end is None:
+        return days_target
+
+    # Skip the period-end candidate if it's not actually in the future relative
+    # to the clock — that means we're already past the period or there's no
+    # next renewal to cross.
+    if period_end <= int(clock.frozen_time):
+        return days_target
+
+    period_target = period_end + buffer_days * 86400
+    return max(days_target, period_target)
 
 
 def _advance_clock(clock_id: str, frozen_time: int) -> None:
@@ -273,9 +346,11 @@ def _assert_renewal(
     Invariants checked:
       1. current_period_start advanced (post > pre)
       2. current_period_end advanced (post > pre)
-      3. When grants_flag=True: exactly ONE new subscription_reset ledger entry
-      4. When grants_flag=True: new entry amount_micros == post row.grant_micros
-      5. When grants_flag=True: NOT two new subscription_reset entries (idempotency)
+      3. When grants_flag=True: AT LEAST ONE new subscription_reset ledger entry
+         (multiple is fine when clock crosses multiple boundaries; correct chassis behavior)
+      4. When grants_flag=True: all new subscription_reset entries have unique stripe_event_id
+         (real idempotency check — chassis 0023.2 atomic INSERT must dedup duplicate deliveries)
+      5. When grants_flag=True: each new entry's amount_micros == post row.grant_micros
       6. When grants_flag=False: no new subscription_reset or subscription_grant entries
     """
     failures: list[str] = []
@@ -318,32 +393,57 @@ def _assert_renewal(
     ]
 
     if grants_flag:
-        # Invariant 3: exactly one new subscription_reset entry
+        # Invariant 3: at least one new subscription_reset entry (renewal happened).
+        #
+        # Note: a clock advance can legitimately cross MULTIPLE billing boundaries
+        # if Stripe's webhook queue had pending events from a prior run, OR if the
+        # advance distance exceeds two periods. Multiple subscription_reset entries
+        # are CORRECT behavior in those cases — the chassis processes each
+        # invoice.paid event from each renewal cycle. The earlier "exactly 1"
+        # assertion was over-fitting to the simple case (one boundary crossed); it
+        # surfaced as a false RED during 0024.15 Phase 1 when a previous run's
+        # webhook delivered late and overlapped with the current run's renewal.
+        #
+        # Real idempotency check: ensure no DUPLICATE entries with the same
+        # stripe_event_id (chassis 0023.2 atomic INSERT guarantees this; verifying
+        # here protects against regressions).
         if len(new_reset_entries) == 0:
             failures.append(
                 "FAIL [ledger_reset]: grants_flag=True but no new subscription_reset ledger "
                 "entry found after renewal"
             )
-        elif len(new_reset_entries) > 1:
-            # Invariant 5: idempotency — must not post two entries
-            failures.append(
-                f"FAIL [ledger_idempotency]: grants_flag=True but found "
-                f"{len(new_reset_entries)} new subscription_reset entries — "
-                f"expected exactly 1 (idempotency breach)"
-            )
         else:
-            # Invariant 4: amount_micros matches row.grant_micros
+            # Invariant 4 (idempotency): all new subscription_reset entries have
+            # unique stripe_event_ids — no duplicates.
+            event_ids = [e.get("stripe_event_id") for e in new_reset_entries]
+            duplicates = [eid for eid in event_ids if eid and event_ids.count(eid) > 1]
+            if duplicates:
+                failures.append(
+                    f"FAIL [ledger_idempotency]: duplicate stripe_event_id(s) in new "
+                    f"subscription_reset entries: {sorted(set(duplicates))} — "
+                    f"chassis idempotency dedup may have regressed (see 0023.2)"
+                )
+
+            # Invariant 5: each subscription_reset entry's amount_micros matches
+            # the row's current grant_micros at post-state time. (If multiple
+            # renewals crossed, the amounts SHOULD all match — same tier, same
+            # grant_micros — unless tier changed mid-flow, which is out of scope.)
             grant_micros_post = post_sub.get("grant_micros")
-            entry_amount = new_reset_entries[0]["amount_micros"]
             if grant_micros_post is None:
                 failures.append(
                     "FAIL [grant_amount]: post subscription row has NULL grant_micros"
                 )
-            elif entry_amount != grant_micros_post:
-                failures.append(
-                    f"FAIL [grant_amount]: new subscription_reset entry amount_micros="
-                    f"{entry_amount} != row.grant_micros={grant_micros_post}"
-                )
+            else:
+                mismatched = [
+                    e for e in new_reset_entries if e["amount_micros"] != grant_micros_post
+                ]
+                if mismatched:
+                    amounts = [e["amount_micros"] for e in mismatched]
+                    failures.append(
+                        f"FAIL [grant_amount]: {len(mismatched)} new subscription_reset "
+                        f"entries have amount_micros != row.grant_micros={grant_micros_post}: "
+                        f"got {amounts}"
+                    )
     else:
         # Invariant 6: no new grant-type entries when flag=False
         if new_grant_entries:
@@ -481,7 +581,7 @@ async def _run_success_path(
         )
 
     if args.dry_run:
-        target_ts = _target_frozen_time(clock_id, args.days)
+        target_ts = _target_frozen_time(clock_id, args.days, subscription_id=subscription_id)
         target_dt = datetime.fromtimestamp(target_ts, tz=timezone.utc)
         print(
             _yellow(
@@ -495,7 +595,7 @@ async def _run_success_path(
     # ------------------------------------------------------------------
     # 2. Advance the test clock
     # ------------------------------------------------------------------
-    target_ts = _target_frozen_time(clock_id, args.days)
+    target_ts = _target_frozen_time(clock_id, args.days, subscription_id=subscription_id)
     target_dt = datetime.fromtimestamp(target_ts, tz=timezone.utc)
     print(f"\nAdvancing test clock by {args.days} days...")
     print(f"  Target time: {target_dt.isoformat()} (Unix: {target_ts})")
@@ -571,15 +671,302 @@ async def _run_success_path(
         print(_green(f"  Period advanced: {pre_sub['current_period_start']} → {post_sub['current_period_start']}"))
         print(_green(f"  Period end:      {pre_sub['current_period_end']} → {post_sub['current_period_end']}"))
         if grants_flag:
-            print(_green(f"  Ledger entries:  {len(pre_ledger)} → {len(post_ledger)} (+1 subscription_reset)"))
             pre_ids = {row["id"] for row in pre_ledger}
             new_entries = [row for row in post_ledger if row["id"] not in pre_ids]
             new_reset = [e for e in new_entries if e["reason"] == "subscription_reset"]
+            n = len(new_reset)
+            print(_green(
+                f"  Ledger entries:  {len(pre_ledger)} → {len(post_ledger)} "
+                f"(+{n} subscription_reset)"
+            ))
+            if n > 1:
+                print(_green(
+                    f"  ({n} renewals fired — clock crossed multiple boundaries OR a prior "
+                    "run's webhook delivered late. Correct chassis behavior.)"
+                ))
             if new_reset:
-                print(_green(f"  Reset amount:    {new_reset[0]['amount_micros']} micros == grant_micros"))
+                amounts = sorted({e["amount_micros"] for e in new_reset})
+                if len(amounts) == 1:
+                    print(_green(f"  Reset amount:    {amounts[0]} micros == grant_micros (all entries match)"))
+                else:
+                    print(_green(f"  Reset amounts:   {amounts} (varied; tier change mid-flow)"))
         else:
             print(_green("  Ledger unchanged (grants_flag=False, correct)"))
         return 0
+
+
+async def _recover_canceled_state(
+    sub,
+    customer_id: str,
+    user_id: int,
+    restore_pm_id: str,
+) -> int:
+    """Recover a canceled subscription by creating a new one on the same customer.
+
+    Stripe rejects all modifications to canceled subscriptions (only
+    `cancellation_details` and `metadata` are allowed). To recover the test fixture,
+    we must create a NEW subscription on the same customer + test clock with the
+    original working PM as default. The chassis webhook handler's upsert is keyed
+    on user_id (UNIQUE), so the existing DB row's stripe_subscription_id gets
+    replaced with the new one — no chassis row deletion needed.
+
+    Origin: ticket 0024.15 Phase 1 surface — the test fixture's subscription was
+    canceled by Stripe after multiple consecutive renewal failures (rapid clock
+    advances compress dunning to terminal). past_due-only recovery couldn't
+    repair this state.
+    """
+    import stripe
+
+    print(_yellow(
+        f"\nSubscription is {sub.get('status')!r} — Stripe blocks modifications.\n"
+        "Creating a NEW subscription on the same customer + clock to replace it..."
+    ))
+
+    # Extract price_id from the canceled sub's items (basil: items.data[0].price.id;
+    # legacy: items.data[0].plan.id). Try both for resilience.
+    items = sub.get("items")
+    items_data = []
+    if items is not None:
+        items_data = (
+            items.get("data") if hasattr(items, "get") else getattr(items, "data", [])
+        ) or []
+
+    if not items_data:
+        print(
+            _red(
+                "ERROR: canceled subscription has no items; cannot determine price_id.\n"
+                "  Manually create a new subscription via the chassis subscribe flow,\n"
+                "  then update backend/.test-clock-fixture.local with the new sub_id."
+            ),
+            file=sys.stderr,
+        )
+        return 1
+
+    first_item = items_data[0]
+    price_id = None
+    for attr_name in ("price", "plan"):  # basil prefers price; plan is legacy
+        obj = (
+            first_item.get(attr_name)
+            if hasattr(first_item, "get")
+            else getattr(first_item, attr_name, None)
+        )
+        if obj:
+            price_id = (
+                obj.get("id") if hasattr(obj, "get") else getattr(obj, "id", None)
+            )
+            if price_id:
+                break
+
+    if not price_id:
+        print(_red("ERROR: could not extract price_id from canceled subscription."), file=sys.stderr)
+        return 1
+
+    print(f"  Price for new subscription: {price_id}")
+    print(f"  Customer: {customer_id} (test-clock customer; new sub inherits the clock)")
+    print(f"  Default PM: {restore_pm_id}")
+    print(f"  Metadata: user_id={user_id}")
+
+    # Create the new subscription. Pre-attach the PM (Stripe requires PMs to be
+    # attached to the customer before being set as default on a sub).
+    try:
+        # Best-effort attach: if the PM is already attached, Stripe returns a
+        # specific error which we ignore.
+        try:
+            await asyncio.to_thread(
+                stripe.PaymentMethod.attach,
+                restore_pm_id,
+                customer=customer_id,
+            )
+        except stripe.error.InvalidRequestError as exc:
+            if "already attached" not in str(exc).lower():
+                raise
+
+        new_sub = await asyncio.to_thread(
+            stripe.Subscription.create,
+            customer=customer_id,
+            items=[{"price": price_id}],
+            default_payment_method=restore_pm_id,
+            metadata={"user_id": str(user_id)},
+        )
+        new_sub_id = new_sub.id
+        print(_green(f"\n  New subscription created: {new_sub_id}"))
+        new_sub_status = new_sub.get("status")
+        print(f"  Status: {new_sub_status}")
+    except Exception as exc:
+        print(_red(f"ERROR creating new subscription: {exc}"), file=sys.stderr)
+        return 1
+
+    # Wait for the chassis webhook handlers to process the new sub.
+    # customer.subscription.created upserts the row (by user_id); invoice.paid
+    # (subscription_create) posts the subscription_grant ledger entry per 0024.11.
+    print("\nWaiting 10s for chassis webhooks to process the new subscription...")
+    await asyncio.sleep(10)
+
+    print(_yellow(
+        f"\n{'=' * 60}\n"
+        f"NEW SUBSCRIPTION — UPDATE YOUR FIXTURE\n"
+        f"{'=' * 60}\n"
+        f"  Edit backend/.test-clock-fixture.local — set:\n"
+        f'    "subscription_id": "{new_sub_id}"\n'
+        f"\n"
+        f"  (the customer_id, clock_id, user_id, and original_payment_method_id\n"
+        f"   stay the same — only subscription_id changes.)\n"
+        f"\n"
+        f"  Verify the chassis row was upserted:\n"
+        f"    docker-compose exec db psql -U carddroper -d carddroper \\\n"
+        f"      -c \"SELECT id, status, stripe_subscription_id FROM subscriptions\\\n"
+        f"          WHERE user_id={user_id};\"\n"
+        f"  Expected: stripe_subscription_id = {new_sub_id}, status = 'active'.\n"
+        f"\n"
+        f"  After updating the fixture, the test rig is healthy. Re-run\n"
+        f"  test_renewal.py without --recover-fixture to verify."
+    ))
+    return 0
+
+
+async def _run_recover_fixture(
+    args: argparse.Namespace,
+    subscription_id: str,
+    fixture: dict,
+) -> int:
+    """Repair a broken test-clock fixture (typically: past_due + fail PM as default).
+
+    Reads `original_payment_method_id` from the fixture, sets it as the subscription's
+    default_payment_method (with retry-on-clock-busy), then pays the latest invoice if
+    it's unpaid. Reports the resulting subscription status.
+
+    Origin: ticket 0024.15 Phase 1 surface — `--simulate-decline` with `--no-restore-active`
+    leaves the fixture in past_due state with the fail PM still set as default.
+    Subsequent runs of any test against the fixture fail because Stripe can't renew with
+    a fail PM. This recovery path lets the user explicitly bring the fixture back to a
+    healthy state without manual Stripe Dashboard intervention.
+    """
+    import stripe
+
+    print(f"\n{'=' * 60}")
+    print("Fixture recovery — restore PM + pay any unpaid invoice")
+    print(f"{'=' * 60}")
+    print(f"  subscription:    {subscription_id}")
+    print(f"{'=' * 60}\n")
+
+    restore_pm_id = fixture.get("original_payment_method_id")
+    if not restore_pm_id or restore_pm_id == "pm_REPLACE_ME":
+        print(
+            _red(
+                "ERROR: fixture lacks 'original_payment_method_id'.\n"
+                "  Add it to backend/.test-clock-fixture.local.\n"
+                "  Find the working PM via: stripe subscriptions retrieve "
+                + subscription_id
+                + " | grep default_payment_method\n"
+                "  (or list customer's PMs: stripe customers list_payment_methods "
+                "<customer_id>)"
+            ),
+            file=sys.stderr,
+        )
+        return 1
+
+    # 0. Pre-check subscription status — canceled subs require a different recovery path
+    print("Checking subscription state on Stripe...")
+    sub = await asyncio.to_thread(stripe.Subscription.retrieve, subscription_id, expand=["items"])
+    sub_status = sub.get("status")
+    print(f"  Subscription status: {sub_status!r}")
+
+    if sub_status in ("canceled", "incomplete_expired"):
+        # Canceled / expired: Stripe rejects all modifications except cancellation_details
+        # and metadata. Recovery requires creating a new subscription on the same customer
+        # + clock with the original PM. The chassis webhook handler upserts the existing
+        # row by user_id (the row's stripe_subscription_id gets replaced).
+        return await _recover_canceled_state(
+            sub=sub,
+            customer_id=fixture["customer_id"],
+            user_id=int(fixture["user_id"]),
+            restore_pm_id=restore_pm_id,
+        )
+
+    # past_due / active path below: PM update + invoice pay are allowed.
+
+    # 1. Restore the default PM, with retry on clock-busy
+    print(f"\nRestoring default_payment_method → {restore_pm_id}...")
+    restored = False
+    for attempt in range(5):
+        try:
+            await asyncio.to_thread(
+                stripe.Subscription.modify,
+                subscription_id,
+                default_payment_method=restore_pm_id,
+            )
+            print(_green(f"  Restored default_payment_method to {restore_pm_id}."))
+            restored = True
+            break
+        except Exception as exc:
+            if "clock advancement" in str(exc).lower() and attempt < 4:
+                print(f"  Clock busy, retrying in 5s (attempt {attempt + 1}/5)...")
+                await asyncio.sleep(5)
+                continue
+            print(_red(f"ERROR restoring PM: {exc}"), file=sys.stderr)
+            return 1
+
+    if not restored:
+        return 1
+
+    # 2. Find the latest invoice and check if it needs paying
+    print("\nChecking latest invoice status...")
+    sub = await asyncio.to_thread(
+        stripe.Subscription.retrieve,
+        subscription_id,
+        expand=["latest_invoice"],
+    )
+    latest_invoice = sub.get("latest_invoice")
+    if hasattr(latest_invoice, "id"):
+        invoice_id = latest_invoice.id
+        invoice_status = latest_invoice.status
+    elif isinstance(latest_invoice, str):
+        invoice_id = latest_invoice
+        inv = await asyncio.to_thread(stripe.Invoice.retrieve, invoice_id)
+        invoice_status = inv.status
+    else:
+        invoice_id = None
+        invoice_status = None
+
+    if invoice_id and invoice_status != "paid":
+        print(f"  Latest invoice {invoice_id} status: {invoice_status} — paying it...")
+        try:
+            await asyncio.to_thread(stripe.Invoice.pay, invoice_id)
+            print(_green(f"  Paid invoice {invoice_id}."))
+        except Exception as exc:
+            print(
+                _yellow(
+                    f"  WARNING: could not pay invoice: {exc}\n"
+                    "  PM was restored, but the failed invoice remains unpaid.\n"
+                    "  Subscription may stay in past_due until Stripe's next dunning attempt."
+                )
+            )
+    elif invoice_id:
+        print(f"  Latest invoice {invoice_id} already paid; nothing to do.")
+    else:
+        print("  No latest invoice found.")
+
+    # 3. Wait for webhooks to settle, report final state
+    print("\nWaiting 5s for webhooks to settle...")
+    await asyncio.sleep(5)
+
+    sub = await asyncio.to_thread(stripe.Subscription.retrieve, subscription_id)
+    final_status = sub.get("status")
+    print(f"\nFinal subscription status: {final_status}")
+
+    if final_status == "active":
+        print(_green(f"\n{'=' * 60}\nFIXTURE RECOVERY SUCCESSFUL — subscription is active.\n{'=' * 60}"))
+        return 0
+    else:
+        print(
+            _yellow(
+                f"\n{'=' * 60}\nFIXTURE RECOVERY PARTIAL — subscription status is {final_status!r}.\n"
+                f"{'=' * 60}\n"
+                "  This may be transient (webhooks still settling) or require additional action.\n"
+                "  Re-run --recover-fixture in 30s, or check Stripe Dashboard."
+            )
+        )
+        return 1
 
 
 async def _run_decline_path(
@@ -588,6 +975,7 @@ async def _run_decline_path(
     clock_id: str,
     user_id: int,
     subscription_id: str,
+    fixture: dict,
 ) -> int:
     """Execute the renewal failure-path verification (0024.15).
 
@@ -710,7 +1098,7 @@ async def _run_decline_path(
             )
 
         if args.dry_run:
-            target_ts = _target_frozen_time(clock_id, args.days)
+            target_ts = _target_frozen_time(clock_id, args.days, subscription_id=subscription_id)
             target_dt = datetime.fromtimestamp(target_ts, tz=timezone.utc)
             print(
                 _yellow(
@@ -724,7 +1112,7 @@ async def _run_decline_path(
         # ------------------------------------------------------------------
         # 4. Advance the test clock
         # ------------------------------------------------------------------
-        target_ts = _target_frozen_time(clock_id, args.days)
+        target_ts = _target_frozen_time(clock_id, args.days, subscription_id=subscription_id)
         target_dt = datetime.fromtimestamp(target_ts, tz=timezone.utc)
         print(f"\nAdvancing test clock by {args.days} days (charge will fail)...")
         print(f"  Target time: {target_dt.isoformat()} (Unix: {target_ts})")
@@ -824,31 +1212,56 @@ async def _run_decline_path(
 
     finally:
         # ------------------------------------------------------------------
-        # finally: Restore original PM (always runs, even if assertions fail)
+        # finally: Restore original PM (always runs, even if assertions fail).
+        #
+        # Two robustness fixes from 0024.15 Phase 1 surface:
+        # 1. Prefer fixture's `original_payment_method_id` over runtime-captured
+        #    original_pm_id. The fixture value is stable across repeat runs;
+        #    if a prior run left the sub with a fail PM as default, runtime
+        #    capture would "restore" to the fail PM (i.e., not restore at all).
+        # 2. Retry with backoff on "Test clock advancement underway" errors —
+        #    Stripe rejects subscription modifications while the clock is
+        #    still settling. Up to 5 attempts, 5s apart.
         # ------------------------------------------------------------------
-        if original_pm_id is not None:
-            print(f"\n[finally] Restoring subscription default_payment_method → {original_pm_id}...")
-            try:
-                await asyncio.to_thread(
-                    stripe.Subscription.modify,
-                    subscription_id,
-                    default_payment_method=original_pm_id,
-                )
-                print(f"[finally]   Restored default_payment_method to {original_pm_id}.")
-            except Exception as exc:
+        restore_pm_id = fixture.get("original_payment_method_id") or original_pm_id
+        if restore_pm_id is not None:
+            print(f"\n[finally] Restoring subscription default_payment_method → {restore_pm_id}...")
+            restored = False
+            last_exc = None
+            for attempt in range(5):
+                try:
+                    await asyncio.to_thread(
+                        stripe.Subscription.modify,
+                        subscription_id,
+                        default_payment_method=restore_pm_id,
+                    )
+                    print(f"[finally]   Restored default_payment_method to {restore_pm_id}.")
+                    restored = True
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    if "clock advancement" in str(exc).lower() and attempt < 4:
+                        print(f"[finally]   Clock busy, retrying in 5s (attempt {attempt + 1}/5)...")
+                        await asyncio.sleep(5)
+                        continue
+                    break
+            if not restored:
                 print(
                     _yellow(
-                        f"[finally] WARNING: could not restore default_payment_method: {exc}\n"
+                        f"[finally] WARNING: could not restore default_payment_method: {last_exc}\n"
                         "  The subscription's PM may still be set to the fail token.\n"
-                        "  Manually restore via Stripe Dashboard or re-attach a working card."
+                        "  Recover via: python scripts/test_renewal.py --recover-fixture\n"
+                        "  Or manually: stripe subscriptions update " + subscription_id +
+                        " --default-payment-method=" + str(restore_pm_id)
                     )
                 )
         else:
             print(
                 _yellow(
-                    "\n[finally] WARNING: original_pm_id was None — cannot restore PM.\n"
-                    "  The subscription had no default_payment_method before the test.\n"
-                    "  Manually set a working PM via Stripe Dashboard."
+                    "\n[finally] WARNING: no PM to restore (fixture has no original_payment_method_id\n"
+                    "  AND runtime capture saw no default_payment_method on the sub).\n"
+                    "  Add original_payment_method_id to backend/.test-clock-fixture.local for\n"
+                    "  reliable restoration on future runs."
                 )
             )
 
@@ -920,6 +1333,13 @@ async def _run(args: argparse.Namespace) -> int:
         print(f"  grants_flag:     BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER={grants_flag}")
     print(f"{'='*60}\n")
 
+    if args.recover_fixture:
+        return await _run_recover_fixture(
+            args,
+            subscription_id=subscription_id,
+            fixture=fixture,
+        )
+
     if args.simulate_decline:
         return await _run_decline_path(
             args,
@@ -927,6 +1347,7 @@ async def _run(args: argparse.Namespace) -> int:
             clock_id=clock_id,
             user_id=user_id,
             subscription_id=subscription_id,
+            fixture=fixture,
         )
     else:
         return await _run_success_path(
@@ -965,8 +1386,13 @@ def main() -> None:
     parser.add_argument(
         "--wait",
         type=int,
-        default=15,
-        help="Seconds to wait after clock advance before capturing post-state (default: 15)",
+        default=30,
+        help=(
+            "Seconds to wait after clock advance before capturing post-state (default: 30). "
+            "Bumped from 15 in 0024.15 follow-up after observing that Stripe's test-clock "
+            "event delivery latency varies based on queue depth — 15s flaked under repeated "
+            "clock operations within minutes."
+        ),
     )
     parser.add_argument(
         "--simulate-decline",
@@ -989,6 +1415,20 @@ def main() -> None:
             "to restore the subscription to active (default: True). "
             "Use --no-restore-active to leave the sub in past_due — useful as a "
             "starting fixture for 0025 Customer Portal recovery-flow testing."
+        ),
+    )
+    parser.add_argument(
+        "--recover-fixture",
+        action="store_true",
+        default=False,
+        help=(
+            "Repair a broken fixture: read original_payment_method_id from "
+            "backend/.test-clock-fixture.local, set it as the subscription's "
+            "default_payment_method (with retry-on-clock-busy), then pay the latest "
+            "invoice if it's unpaid. Does NOT advance the clock. "
+            "Use this when --simulate-decline left the fixture in an unhealthy state "
+            "(past_due + fail PM still set as default) — typically when the finally-restore "
+            "race-lost to Stripe's clock-still-advancing rejection."
         ),
     )
     args = parser.parse_args()

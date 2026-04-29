@@ -271,6 +271,38 @@ docker-compose logs --tail=50 backend | grep "invoice.payment_failed\|past_due"
 
 **Origin:** ticket 0024.15. Counterpart to B1 (success path). These two together give the chassis full real-Stripe-event coverage across both renewal outcomes.
 
+### B4. Fixture recovery — `--recover-fixture`
+
+When a test rig fixture lands in a broken state (typically: `--simulate-decline --no-restore-active` left the sub in `past_due` with the fail PM as default; OR rapid clock advances pushed the sub all the way to `canceled`), use `--recover-fixture` to restore it without manual Stripe Dashboard intervention.
+
+**Flag:** `--recover-fixture` (does NOT advance the clock; pure recovery)
+
+**Required fixture field:** `original_payment_method_id` in `backend/.test-clock-fixture.local`. Find via `stripe subscriptions retrieve <sub_id> | grep default_payment_method`.
+
+**Two recovery paths the script handles:**
+
+1. **`past_due` recovery** — sub still exists, PM is just wrong. Script does:
+   - Set `default_payment_method` back to the fixture's `original_payment_method_id` (with retry on Stripe's "clock advancement underway" rejection — up to 5 attempts, 5s apart)
+   - Pay the latest unpaid invoice via `stripe.Invoice.pay()` (uses the now-working PM)
+   - Verify status returns to `active`
+
+2. **`canceled` (or `incomplete_expired`) recovery** — sub is terminal; Stripe blocks all modifications. Script does:
+   - Read price_id from the canceled sub's items
+   - Re-attach the original PM to the customer (best-effort; "already attached" is OK)
+   - Create a NEW subscription on the same customer + clock with the original PM and `metadata.user_id`
+   - Print the new `subscription_id` and ask the user to update the fixture file (the script does not auto-modify the gitignored `.local` file)
+
+**Sample invocation:**
+
+```bash
+DATABASE_URL='postgresql+asyncpg://carddroper:carddroper@localhost:5433/carddroper' \
+  .venv/bin/python backend/scripts/test_renewal.py --recover-fixture
+```
+
+**After the canceled-recovery path:** edit `backend/.test-clock-fixture.local` to set `subscription_id` to the new sub_id printed by the script. customer_id, clock_id, user_id, original_payment_method_id stay the same.
+
+**Origin:** ticket 0024.15 follow-up. Two real-world scenarios surfaced in Phase 1 manual smoke. Codifies the recovery commands so adopters of the chassis can repair their test rigs without a Stripe Dashboard side-quest.
+
 ## Tier C — Stripe Dashboard manipulations
 
 Manual UI-driven tests. Slowest but most realistic for verifying webhook delivery under production-like conditions.

@@ -3,5 +3,7 @@
   "customer_id": "cus_REPLACE_ME",
   "clock_id": "clock_REPLACE_ME",
   "user_id": 0,
-  "subscription_id": "sub_REPLACE_ME"
+  "subscription_id": "sub_REPLACE_ME",
+  "_original_payment_method_id_README": "OPTIONAL but recommended — the working PM the subscription was created with. Used by --simulate-decline's finally-restore (more reliable than runtime capture across repeated runs) AND by --recover-fixture to repair a broken past_due fixture. Find via: stripe subscriptions retrieve <sub_id> | grep default_payment_method.",
+  "original_payment_method_id": "pm_REPLACE_ME"
 }
