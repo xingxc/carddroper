@@ -214,6 +214,63 @@ stripe subscription_items update si_<id> --price=price_<new-tier>
 - Renewal `invoice.paid` (subscription_cycle) updates `grant_micros` from new Price metadata when flag=true
 - `subscription_reset` ledger entry uses the new tier's grant amount
 
+### B3. Renewal failure verification
+
+Tests the `handle_invoice_payment_failed` path: subscription's renewal charge fails, chassis sets status to `past_due`, period and grant_micros are preserved (Path B).
+
+**Flag:** `--simulate-decline`
+
+**Test PM used:** `pm_card_chargeCustomerFail` — a Stripe pre-built test PaymentMethod that attaches to a customer successfully but fails on charge. This is the canonical token for renewal-failure simulation in test mode (any Stripe SDK version).
+
+**Expected outcome:**
+- `status` flips `active → past_due` after the failed charge.
+- `current_period_start` UNCHANGED (period does not advance on failure).
+- `current_period_end` UNCHANGED (period does not advance on failure).
+- `grant_micros` UNCHANGED (Path B: no tier or grant changes on failure).
+- No new `subscription_reset` ledger entry posted.
+- No new `subscription_grant` ledger entry posted.
+
+**`--restore-active` flag (default True):** After assertions pass, the script attempts to pay the failed invoice via `stripe.Invoice.pay(failed_invoice_id)` to bring the subscription back to `active` for clean fixture re-use. This is best-effort — if the original PM was detached during the test, the pay call logs a warning and continues. Use `--no-restore-active` to intentionally leave the subscription in `past_due` state, e.g., as a starting fixture for the 0025 Customer Portal recovery-flow test.
+
+**PM restoration:** The script reads the subscription's `default_payment_method` before swapping it to `pm_card_chargeCustomerFail`, and restores it in a `finally` block — always runs even if assertions fail mid-way. If the original PM was `None` (subscription had no default PM), the script logs a warning.
+
+**Sample invocation:**
+
+```bash
+# Run from the backend/ directory
+DATABASE_URL='postgresql+asyncpg://carddroper:carddroper@localhost:5433/carddroper' \
+  .venv/bin/python backend/scripts/test_renewal.py --simulate-decline
+```
+
+**Leave sub in past_due for 0025 testing:**
+
+```bash
+DATABASE_URL='postgresql+asyncpg://carddroper:carddroper@localhost:5433/carddroper' \
+  .venv/bin/python backend/scripts/test_renewal.py --simulate-decline --no-restore-active
+```
+
+**Verify after running:**
+
+```sql
+-- Expect status='past_due'; period fields and grant_micros unchanged vs pre-run
+SELECT stripe_subscription_id, status, current_period_start, current_period_end, grant_micros
+FROM subscriptions WHERE stripe_subscription_id='sub_<id>';
+```
+
+```bash
+docker-compose logs --tail=50 backend | grep "invoice.payment_failed\|past_due"
+-- Expect: handle_invoice_payment_failed ran; status set to past_due
+```
+
+**What this test verifies (0024.15):**
+- `handle_invoice_payment_failed` correctly transitions status to `past_due`.
+- Path B preservation under failure: period + grant_micros NOT overwritten.
+- No phantom ledger writes on failed payment.
+- `handle_subscription_updated` (fired by the PM swap + status change) does not touch period or grant_micros.
+- PM restoration is always attempted (finally block).
+
+**Origin:** ticket 0024.15. Counterpart to B1 (success path). These two together give the chassis full real-Stripe-event coverage across both renewal outcomes.
+
 ## Tier C — Stripe Dashboard manipulations
 
 Manual UI-driven tests. Slowest but most realistic for verifying webhook delivery under production-like conditions.
