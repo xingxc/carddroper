@@ -1,7 +1,7 @@
 ---
 id: 0024
 title: subscribe + subscription lifecycle handlers (chassis) — /billing/subscribe + /billing/setup-intent + /billing/subscription + 5 webhook handlers + Stripe Elements SubscribeForm
-status: open
+status: resolved
 priority: medium (chassis-completion of the payments subsystem; second user-facing billing surface after PAYG topup; chassis primitive, not project-specific)
 found_by: PLAN.md §10.6 Stripe-layer roadmap; sequenced after 0023 PAYG topup (chassis substrate now fully validated by 0017 + 0017.1 + 0018 + 0019).
 ---
@@ -553,4 +553,4 @@ Orchestrator (on close):
 
 ## Resolution
 
-*(filled in by orchestrator after backend-builder + frontend-builder + user confirms Phase 1 + Phase 2 pass)*
+Resolved 2026-04-29. Original chassis subscribe + 5 webhook handlers + Stripe Elements SubscribeForm shipped. Refined extensively across sub-tickets 0024.1 through 0024.13 (14 sub-tickets total, 44+ commits across the arc). The subscribe flow contract documented in `payments.md` §Flows item 4 reflects the final shape post all sub-tickets: three-way response branch (200 active / 200 requires_action / 402 INVOICE_PAYMENT_FAILED), grants coupled to `invoice.paid` not `customer.subscription.created`, idempotency keyed on `(user_id, lookup_key, payment_method_id)`, basil-shape extractor module, Path B preservation across all webhook handlers. Verified end-to-end via staging deploy 2026-04-29: functional smoke (4242 success → ledger entry, 4000-0341 decline → clean form reset + correct row state) + Tier A2 cancel_at_period_end toggle on `sub_1TRPXX...` confirmed Path B integrity end-to-end with real basil event delivery.

@@ -72,20 +72,20 @@ The Verification section exists because "tsc passes" and "lint passes" are neces
 | 0018 | chassis-hardening audit — find missing validators, grow chassis-contract.md | resolved | medium |
 | 0019 | email deliverability — SendGrid Sender Authentication + SPF / DKIM / DMARC | resolved | high |
 | 0019.1 | email template polish — Subject lines + branded HTML + drop unsubscribe block (5 templates) | resolved | medium |
-| 0024 | subscribe + lifecycle handlers (chassis) — /billing/subscribe + /billing/setup-intent + GET subscription + 5 webhook handlers + Stripe Elements SubscribeForm | open | medium |
-| 0024.1 | chassis tier resolution from Stripe — GET /billing/tiers + format_price + useTiers + SubscribeForm prop change | open | medium |
-| 0024.2 | subscription grants opt-in (BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER) + fix sub.items extraction bug | open | medium |
-| 0024.3 | paid actions opt-out of verified-gate (BILLING_REQUIRE_VERIFIED, default False) | open | medium |
-| 0024.4 | subscriptions.current_period_start/end extraction regression (introduced by 0024.2) | open | medium |
-| 0024.5 | webhook handlers stop overwriting period fields with NULL — architectural fix (Path B) | open | medium |
-| 0024.6 | subscribe idempotency key collides on retry with different payment_method_id (3DS, decline-retry) | open | medium |
-| 0024.7 | webhook handlers stop overwriting subscriptions.grant_micros — apply Path B to grant_micros | open | medium |
-| 0024.8 | subscribe endpoint stores 0 in grant_micros when flag=false (strict flag-gate, regardless of metadata) | open | medium |
-| 0024.9 | subscribe failure recovery — distinguish 3DS from decline; sync-cancel terminal failures; clean up incomplete rows | open | medium |
-| 0024.10 | setup-intent idempotency replay during 0024.9 soft-reset; defensive handleSubmit catch | open | medium |
-| 0024.11 | couple subscription_grant to invoice.paid (subscription_create), not customer.subscription.created — fixes 3DS-fail phantom grant | open | high |
-| 0024.12 | basil API moved invoice.subscription field; stripe_extractors module + 3DS-fail UX symmetry with decline | open | high |
-| 0024.13 | handle_subscription_created INSERT path must flag-gate grant_micros; adds cross-writer audit discipline (Q3.5) | open | medium-high |
+| 0024 | subscribe + lifecycle handlers (chassis) — /billing/subscribe + /billing/setup-intent + GET subscription + 5 webhook handlers + Stripe Elements SubscribeForm | resolved | medium |
+| 0024.1 | chassis tier resolution from Stripe — GET /billing/tiers + format_price + useTiers + SubscribeForm prop change | resolved | medium |
+| 0024.2 | subscription grants opt-in (BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER) + fix sub.items extraction bug | resolved | medium |
+| 0024.3 | paid actions opt-out of verified-gate (BILLING_REQUIRE_VERIFIED, default False) | resolved | medium |
+| 0024.4 | subscriptions.current_period_start/end extraction regression (introduced by 0024.2) | resolved | medium |
+| 0024.5 | webhook handlers stop overwriting period fields with NULL — architectural fix (Path B) | resolved | medium |
+| 0024.6 | subscribe idempotency key collides on retry with different payment_method_id (3DS, decline-retry) | resolved | medium |
+| 0024.7 | webhook handlers stop overwriting subscriptions.grant_micros — apply Path B to grant_micros | resolved | medium |
+| 0024.8 | subscribe endpoint stores 0 in grant_micros when flag=false (strict flag-gate, regardless of metadata) | resolved | medium |
+| 0024.9 | subscribe failure recovery — distinguish 3DS from decline; sync-cancel terminal failures; clean up incomplete rows | resolved | medium |
+| 0024.10 | setup-intent idempotency replay during 0024.9 soft-reset; defensive handleSubmit catch | resolved | medium |
+| 0024.11 | couple subscription_grant to invoice.paid (subscription_create), not customer.subscription.created — fixes 3DS-fail phantom grant | resolved | high |
+| 0024.12 | basil API moved invoice.subscription field; stripe_extractors module + 3DS-fail UX symmetry with decline | resolved | high |
+| 0024.13 | handle_subscription_created INSERT path must flag-gate grant_micros; adds cross-writer audit discipline (Q3.5) | resolved | medium-high |
 | 0020 | legal acceptance — ToS checkbox on /register + /legal/terms + /legal/privacy static pages | open | high |
 | 0021 | Stripe foundation (chassis) — balance ledger, billing primitives, webhook skeleton | resolved | medium |
 | 0022 | app-shell refactor (chassis) — left-rail sidebar + profile popover menu | resolved | medium |
