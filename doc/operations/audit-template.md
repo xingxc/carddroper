@@ -89,6 +89,53 @@ The audit response includes the six answers as numbered sections. Each answer sh
 
 After the six numbered sections, the audit may include free-form additional findings, related concerns, or PAUSE recommendations.
 
+## Post-dispatch audit (orchestrator-side, after agent reports)
+
+The audit-template above is the **pre-implementation** audit (before agent dispatch). A second, lighter discipline runs **after** the agent reports done: the orchestrator runs explicit grep/file checks against the actual code to verify the spec was followed.
+
+### Why
+
+Past pattern: orchestrator dispatches agent, agent reports detailed work + tests passing, orchestrator trusts the report and closes the ticket. Twice in the 0024.x arc this missed something — agent's report described intent correctly but the actual code had a gap (e.g., the misleading comment was technically removed but partially-restored elsewhere; the helper was created but a parallel call site wasn't updated). Post-dispatch grep checks catch these efficiently.
+
+### Pattern — bake the audit checks into the ticket
+
+When the ticket spec is being written, include a **Phase 0c — orchestrator post-dispatch audit** section listing 3–6 grep commands the orchestrator runs after the agent finishes. Each command verifies one specific spec item.
+
+Examples from past tickets:
+
+```bash
+# Did the agent actually call the new helper from the handler?
+grep -n "extract_invoice_subscription_id" backend/app/billing/handlers/subscription.py
+# Expected: matches.
+
+# Did the agent remove the inline lookup?
+grep -n "getattr(invoice, .subscription.," backend/app/
+# Expected: zero matches.
+
+# Did the agent remove the misleading comment?
+grep -n "When flag=OFF the subscribe endpoint will have already stored 0" backend/
+# Expected: zero matches.
+
+# Does the new test use spec= discipline?
+grep -n "spec=\[" backend/tests/test_billing_subscribe.py | tail -10
+# Expected: matches in the new test fixture.
+```
+
+The orchestrator runs these commands and confirms each result matches expectations. If any check fails, the ticket is NOT done — re-dispatch with the specific gap identified.
+
+### When to use
+
+Required for any ticket where the agent's work is non-trivial enough that "did the agent actually do what they said" is a real question. In practice, this is:
+
+- Tickets that replace inline code with a helper (verify the inline code is gone)
+- Tickets that add a new code path with a specific structure requirement (verify the structure)
+- Tickets that require removing a deprecated comment, function, or code block (verify removal)
+- Tickets that mandate a specific test fixture pattern (e.g., `spec=`-restricted MagicMock)
+
+### Origin
+
+Ticket 0024.12 retrospective. The Phase 0c pattern was introduced there and applied successfully to 0024.13. Both tickets caught spec deviations the agent's report didn't surface.
+
 ## When to skip
 
 The template is required for:

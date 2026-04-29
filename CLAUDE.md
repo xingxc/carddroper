@@ -82,8 +82,9 @@ No ticket closes as `resolved` unless it satisfies the §Per-ticket checklist in
 
 ## Chassis discipline docs (read before scoping any billing/auth ticket)
 
-- `doc/operations/audit-template.md` — six-question audit template. Required for any ticket touching billing endpoints, webhook handlers, or idempotency keys. The audit answers gate the ticket's design decisions.
+- `doc/operations/audit-template.md` — six-question pre-implementation audit + post-dispatch grep verification. Required for any ticket touching billing endpoints, webhook handlers, or idempotency keys. The pre-implementation audit gates design decisions; the post-dispatch audit verifies the agent's actual code matches the spec.
 - `doc/operations/idempotency-policy.md` — three-pattern classification (content-based / per-request / time-window) and consumable-resource catalog. Any new `idempotency_key=` argument must classify under one of the patterns; time-window keys for consumable resources are forbidden.
+- `doc/operations/stripe-side-tests.md` — Tier A/B/C battery of real-Stripe-event tests (CLI triggers, test clocks, Dashboard manipulation). Required for tickets touching Stripe webhook handlers or API call sites; mocked unit tests structurally cannot catch Stripe API version drift or cross-writer composition bugs.
 - `doc/systems/payments.md` §Field ownership — single-source-of-truth matrix per column. Updates to `subscriptions` or `balance_ledger` must update the matrix in the same commit.
 
 These three documents are the discipline scaffold from the 0024.x arc retrospective. Audits that ignore them are likely to ship the same composition bugs the arc surfaced.

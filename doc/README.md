@@ -39,6 +39,7 @@ Running, deploying, and evolving carddroper.
 | [operations/chassis-contract.md](operations/chassis-contract.md) | Chassis invariants enforced at startup — the contract adopters must honor. |
 | [operations/audit-template.md](operations/audit-template.md) | Six-question audit template for chassis tickets. Required for any ticket touching billing endpoints, webhook handlers, or idempotency keys. |
 | [operations/idempotency-policy.md](operations/idempotency-policy.md) | Three-pattern classification (content-based / per-request / time-window) for Stripe idempotency keys, plus consumable-resource catalog. |
+| [operations/stripe-side-tests.md](operations/stripe-side-tests.md) | Tier A/B/C Stripe-event test battery — what to run for tickets touching webhook handlers or Stripe API calls. Includes test-clock setup. |
 
 ## Legal
 
