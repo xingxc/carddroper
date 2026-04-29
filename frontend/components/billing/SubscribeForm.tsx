@@ -238,8 +238,14 @@ export function SubscribeForm({ lookupKeys, onSuccess }: SubscribeFormProps) {
     });
 
     if (result.error) {
-      setError(result.error.message ?? "Authentication failed. Please try again.");
-      setPhase("card_entry");
+      // 3DS-fail uses the same soft-reset channel as 402 INVOICE_PAYMENT_FAILED.
+      // The callback name is decline-specific but its semantic is "subscribe failed;
+      // reset form to fresh SetupIntent so the user can retry with a different card".
+      // Both decline and 3DS-fail funnel through onInvoiceDeclined for consistent UX.
+      // Renaming to onSubscribeFailure is deferred to a future cleanup ticket (0024.12).
+      void handleInvoiceDeclined(
+        result.error.message ?? "Authentication failed. Please try again."
+      );
       return;
     }
 
