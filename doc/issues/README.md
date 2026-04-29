@@ -83,6 +83,7 @@ The Verification section exists because "tsc passes" and "lint passes" are neces
 | 0024.8 | subscribe endpoint stores 0 in grant_micros when flag=false (strict flag-gate, regardless of metadata) | open | medium |
 | 0024.9 | subscribe failure recovery — distinguish 3DS from decline; sync-cancel terminal failures; clean up incomplete rows | open | medium |
 | 0024.10 | setup-intent idempotency replay during 0024.9 soft-reset; defensive handleSubmit catch | open | medium |
+| 0024.11 | couple subscription_grant to invoice.paid (subscription_create), not customer.subscription.created — fixes 3DS-fail phantom grant | open | high |
 | 0020 | legal acceptance — ToS checkbox on /register + /legal/terms + /legal/privacy static pages | open | high |
 | 0021 | Stripe foundation (chassis) — balance ledger, billing primitives, webhook skeleton | resolved | medium |
 | 0022 | app-shell refactor (chassis) — left-rail sidebar + profile popover menu | resolved | medium |
