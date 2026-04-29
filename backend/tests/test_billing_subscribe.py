@@ -1052,8 +1052,19 @@ async def test_get_subscription_returns_no_subscription_for_cancelled_row(client
 
 
 @pytest.mark.asyncio
-async def test_handle_subscription_created_grants_initial_period():
-    """Mock subscription.created event → subscriptions row upserted + subscription_grant ledger entry (flag=True)."""
+async def test_handle_subscription_created_no_longer_grants_initial_period_deferred_to_invoice_paid():
+    """Mock subscription.created event → subscriptions row upserted; NO subscription_grant ledger entry (flag=True).
+
+    0024.11 moved the grant trigger from customer.subscription.created to invoice.paid
+    (billing_reason=subscription_create). This test was the bug-codifying test pre-0024.11;
+    it now asserts the corrected behavior: customer.subscription.created only upserts the
+    subscriptions row and NEVER writes to balance_ledger, regardless of flag state.
+
+    Rationale: customer.subscription.created can fire before the first invoice is paid
+    (3DS pending, decline pending). Coupling grants to it produces phantom ledger entries
+    when payment fails — real value leakage when flag=true. invoice.paid is the canonical
+    "money moved" event; grants are now coupled there.
+    """
     from app.billing.handlers.subscription import handle_subscription_created
     from app.services.auth_service import hash_password
 
@@ -1096,7 +1107,7 @@ async def test_handle_subscription_created_grants_initial_period():
             async with session.begin():
                 await handle_subscription_created(event, session)
 
-    # subscriptions row upserted.
+    # subscriptions row upserted with correct fields.
     async with AsyncSession(engine, expire_on_commit=False) as session:
         result = await session.execute(select(Subscription).where(Subscription.user_id == user_id))
         row = result.scalar_one_or_none()
@@ -1107,16 +1118,18 @@ async def test_handle_subscription_created_grants_initial_period():
     assert row.tier_name == "Starter"
     assert row.grant_micros == 10_000_000
 
-    # Ledger entry: subscription_grant of 10_000_000.
+    # NO ledger entry — grant is now deferred to invoice.paid (subscription_create branch).
+    # This is the corrected behavior per ticket 0024.11.
     async with AsyncSession(engine, expire_on_commit=False) as session:
         result = await session.execute(
             select(BalanceLedger).where(BalanceLedger.user_id == user_id)
         )
         entries = result.scalars().all()
-    assert len(entries) == 1
-    assert entries[0].amount_micros == 10_000_000
-    assert entries[0].reason == "subscription_grant"
-    assert entries[0].stripe_event_id == "evt_sub_created_001"
+    assert len(entries) == 0, (
+        "customer.subscription.created must NOT write to balance_ledger (ticket 0024.11). "
+        "Grants are deferred to invoice.paid (billing_reason=subscription_create) to prevent "
+        "phantom ledger entries on 3DS-failure and payment-failure paths."
+    )
 
 
 @pytest.mark.asyncio
@@ -1147,7 +1160,13 @@ async def test_handle_subscription_created_skips_missing_metadata():
 
 @pytest.mark.asyncio
 async def test_handle_subscription_created_idempotent():
-    """Same event posted twice → handler runs once (stripe_events atomic INSERT covers dedup)."""
+    """Same event posted twice → row upserts are idempotent; no ledger entries (ticket 0024.11).
+
+    Pre-0024.11, this test verified that the stripe_events dedup prevented a second
+    ledger entry. Post-0024.11, handle_subscription_created never writes to balance_ledger
+    (grants are coupled to invoice.paid). The idempotency now covers the row upsert only:
+    two calls with the same subscription data produce exactly one subscriptions row.
+    """
     from app.billing.handlers.subscription import handle_subscription_created
     from app.services.auth_service import hash_password
 
@@ -1184,25 +1203,33 @@ async def test_handle_subscription_created_idempotent():
     event.id = "evt_sub_idem_001"
     event.data.object = sub_obj
 
-    # First run — handler runs normally (flag=True so grant fires).
+    # First run — handler upserts row, no ledger write.
     with patch.object(settings, "BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER", True):
         async with AsyncSession(engine, expire_on_commit=False) as session:
             async with session.begin():
                 await handle_subscription_created(event, session)
 
-    # Second run — stripe_events prevents a second stripe_event_id insert on
-    # balance_ledger (the UNIQUE constraint on stripe_event_id would fire). But
-    # since we're calling the handler directly (bypassing the route's idempotency
-    # check), the second call would fail on the ledger unique constraint. The test
-    # verifies that after two calls via the route (which dedups), there is only 1 entry.
-    # For a direct-invocation test, we verify the first call succeeded.
+    # Second run — pg_insert ON CONFLICT DO UPDATE; still no ledger write.
+    with patch.object(settings, "BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER", True):
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            async with session.begin():
+                await handle_subscription_created(event, session)
+
+    # Row exists and is correct.
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(select(Subscription).where(Subscription.user_id == user_id))
+        rows = result.scalars().all()
+    assert len(rows) == 1
+    assert rows[0].stripe_subscription_id == "sub_idem_001"
+
+    # No ledger entries — handle_subscription_created never writes to balance_ledger (ticket 0024.11).
+    # Grants are coupled to invoice.paid (subscription_create branch).
     async with AsyncSession(engine, expire_on_commit=False) as session:
         result = await session.execute(
             select(BalanceLedger).where(BalanceLedger.user_id == user_id)
         )
         entries = result.scalars().all()
-    assert len(entries) == 1
-    assert entries[0].stripe_event_id == "evt_sub_idem_001"
+    assert len(entries) == 0
 
 
 @pytest.mark.asyncio
@@ -1357,39 +1384,131 @@ async def test_handle_subscription_deleted_marks_cancelled():
 
 
 @pytest.mark.asyncio
-async def test_handle_invoice_paid_subscription_create_no_op():
-    """billing_reason='subscription_create' → no ledger entry (covered by subscription.created)."""
+async def test_handle_invoice_paid_subscription_create_grants_when_flag_on():
+    """billing_reason='subscription_create' + flag=True → subscription_grant ledger entry posted.
+
+    Ticket 0024.11: invoice.paid (subscription_create) is now the canonical trigger for the
+    initial-period subscription_grant. The grant is idempotent via stripe_event_id unique index.
+    """
     from app.billing.handlers.subscription import handle_invoice_paid
     from app.services.auth_service import hash_password
 
     async with AsyncSession(engine, expire_on_commit=False) as session:
         async with session.begin():
             user = User(
-                email="inv_paid_create@example.com",
+                email="inv_paid_create_grants@example.com",
                 password_hash=hash_password("Password123!"),
-                full_name="Inv Paid Create",
+                full_name="Inv Paid Create Grants",
+                stripe_customer_id="cus_inv_paid_create_grants",
             )
             session.add(user)
             await session.flush()
             user_id = user.id
 
+    # Pre-insert subscriptions row with grant_micros set (as subscribe endpoint would write).
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        await _create_subscription_row(
+            session, user_id, status="active", stripe_sub_id="sub_create_grants_001"
+        )
+    # Verify the row has grant_micros=10_000_000 (from _create_subscription_row default).
+
     invoice_obj = MagicMock()
     invoice_obj.billing_reason = "subscription_create"
-    invoice_obj.subscription = "sub_test_001"
+    invoice_obj.subscription = "sub_create_grants_001"
 
     event = MagicMock()
-    event.id = "evt_inv_create_no_op"
+    event.id = "evt_inv_create_grants_001"
     event.data.object = invoice_obj
+
+    with patch.object(settings, "BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER", True):
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            async with session.begin():
+                await handle_invoice_paid(event, session)
+
+    # Ledger entry: subscription_grant of 10_000_000 (from row.grant_micros).
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(
+            select(BalanceLedger).where(BalanceLedger.user_id == user_id)
+        )
+        entries = result.scalars().all()
+    assert len(entries) == 1, (
+        "invoice.paid (subscription_create) + flag=True must post one subscription_grant entry"
+    )
+    assert entries[0].amount_micros == 10_000_000
+    assert entries[0].reason == "subscription_grant"
+    assert entries[0].stripe_event_id == "evt_inv_create_grants_001"
+
+    # Idempotency: firing the same event again must NOT post a second entry.
+    # The stripe_events unique index prevents double-post, but at the handler level the
+    # balance_ledger.stripe_event_id UNIQUE constraint is the guard (per 0023.2 atomic dedup).
+    # Simulate by attempting a second grant with the same stripe_event_id — it should raise
+    # (UniqueViolationError) or be caught by the stripe_events dedup at the route level.
+    # Here we verify via a second handler invocation that the ledger still has exactly one row.
+    try:
+        with patch.object(settings, "BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER", True):
+            async with AsyncSession(engine, expire_on_commit=False) as session:
+                async with session.begin():
+                    await handle_invoice_paid(event, session)
+    except Exception:
+        pass  # UniqueViolationError expected — stripe_event_id dedup fires
+
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(
+            select(BalanceLedger).where(BalanceLedger.user_id == user_id)
+        )
+        entries = result.scalars().all()
+    assert len(entries) == 1, "Idempotency: same event must not post a second ledger entry"
+
+
+@pytest.mark.asyncio
+async def test_handle_invoice_paid_subscription_create_does_not_grant_when_flag_off():
+    """billing_reason='subscription_create' + flag=False → no ledger entry.
+
+    Ticket 0024.11: the flag gate must still apply. When BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=False,
+    invoice.paid (subscription_create) is a no-op for the ledger (flat-fee mode).
+    """
+    from app.billing.handlers.subscription import handle_invoice_paid
+    from app.services.auth_service import hash_password
 
     async with AsyncSession(engine, expire_on_commit=False) as session:
         async with session.begin():
-            await handle_invoice_paid(event, session)
-            result = await session.execute(
-                select(BalanceLedger).where(BalanceLedger.user_id == user_id)
+            user = User(
+                email="inv_paid_create_flagoff@example.com",
+                password_hash=hash_password("Password123!"),
+                full_name="Inv Paid Create Flag Off",
             )
-            entries = result.scalars().all()
+            session.add(user)
+            await session.flush()
+            user_id = user.id
 
-    assert len(entries) == 0
+    # Pre-insert subscriptions row.
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        await _create_subscription_row(
+            session, user_id, status="active", stripe_sub_id="sub_create_flagoff_001"
+        )
+
+    invoice_obj = MagicMock()
+    invoice_obj.billing_reason = "subscription_create"
+    invoice_obj.subscription = "sub_create_flagoff_001"
+
+    event = MagicMock()
+    event.id = "evt_inv_create_flagoff_001"
+    event.data.object = invoice_obj
+
+    with patch.object(settings, "BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER", False):
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            async with session.begin():
+                await handle_invoice_paid(event, session)
+
+    # No ledger entry — flag=False means no balance writes.
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(
+            select(BalanceLedger).where(BalanceLedger.user_id == user_id)
+        )
+        entries = result.scalars().all()
+    assert len(entries) == 0, (
+        "invoice.paid (subscription_create) + flag=False must NOT write to balance_ledger"
+    )
 
 
 @pytest.mark.asyncio
@@ -1561,11 +1680,15 @@ async def test_handle_invoice_paid_subscription_cycle_updates_periods():
 
 @pytest.mark.asyncio
 async def test_handle_invoice_paid_subscription_create_no_op_periods():
-    """invoice.paid (subscription_create) does NOT write period fields.
+    """invoice.paid (subscription_create) does NOT write period fields (flag=False).
 
     Architectural invariant (ticket 0024.5): initial period is the subscribe
-    endpoint's job. The subscription_create invoice.paid is a no-op — it should
-    not modify period fields or ledger.
+    endpoint's job. When flag=False, invoice.paid (subscription_create) is a complete
+    no-op — it must not modify period fields or write to the ledger.
+
+    When flag=True, this branch DOES write a ledger entry (ticket 0024.11) but still
+    does NOT modify period fields. This test exercises the flag=False path explicitly
+    to guard the period-unchanged invariant under the no-ledger scenario.
     """
     from app.billing.handlers.subscription import handle_invoice_paid
     from app.services.auth_service import hash_password
@@ -1608,11 +1731,13 @@ async def test_handle_invoice_paid_subscription_create_no_op_periods():
     event.id = "evt_inv_create_noop_period_001"
     event.data.object = invoice_obj
 
-    async with AsyncSession(engine, expire_on_commit=False) as session:
-        async with session.begin():
-            await handle_invoice_paid(event, session)
+    # Explicitly patch flag=False: this is the flat-fee (no-ledger) path.
+    with patch.object(settings, "BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER", False):
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            async with session.begin():
+                await handle_invoice_paid(event, session)
 
-    # No ledger entry — subscription_create is a no-op.
+    # No ledger entry — flag=False means no balance writes for subscription_create.
     async with AsyncSession(engine, expire_on_commit=False) as session:
         result = await session.execute(
             select(BalanceLedger).where(BalanceLedger.user_id == user_id)
@@ -1620,7 +1745,9 @@ async def test_handle_invoice_paid_subscription_create_no_op_periods():
         entries = result.scalars().all()
     assert len(entries) == 0
 
-    # Period fields unchanged — subscription_create no-op does not touch the row.
+    # Period fields unchanged — subscription_create does not touch period timestamps.
+    # (The subscribe endpoint is authoritative for the initial period; invoice.paid
+    # subscription_cycle is authoritative for renewals — ticket 0024.5.)
     async with AsyncSession(engine, expire_on_commit=False) as session:
         result = await session.execute(select(Subscription).where(Subscription.user_id == user_id))
         row = result.scalar_one()
@@ -2069,11 +2196,14 @@ async def test_handle_invoice_paid_subscription_cycle_skips_when_disabled():
 @pytest.mark.asyncio
 async def test_handle_subscription_created_extracts_price_from_items_data():
     """Bug-fix regression: realistic subscription event with items.data[0].price populated
-    → handler extracts price correctly and grants when flag=True.
+    → handler extracts price correctly and upserts row (but does NOT grant — ticket 0024.11).
 
-    Without the fix, the handler would log 'could not extract price from sub.items'
-    and return without granting when Stripe sends a real ListObject-shaped event.
-    With the fix, the handler traverses .data correctly and grants subscription_grant.
+    Without the original fix, the handler would log 'could not extract price from sub.items'
+    and return early when Stripe sends a real ListObject-shaped event.
+    With the fix, the handler traverses .data correctly and upserts the subscriptions row.
+
+    Note: the grant no longer fires here (ticket 0024.11 moved it to invoice.paid
+    subscription_create). The test now asserts the row is correct and NO ledger write occurs.
     """
     from app.billing.handlers.subscription import handle_subscription_created
     from app.services.auth_service import hash_password
@@ -2124,6 +2254,7 @@ async def test_handle_subscription_created_extracts_price_from_items_data():
                 await handle_subscription_created(event, session)
 
     # subscriptions row upserted with correct metadata from items.data[0].price.
+    # This is what the original price-extraction fix verified — still correct.
     async with AsyncSession(engine, expire_on_commit=False) as session:
         result = await session.execute(select(Subscription).where(Subscription.user_id == user_id))
         row = result.scalar_one_or_none()
@@ -2133,16 +2264,18 @@ async def test_handle_subscription_created_extracts_price_from_items_data():
     assert row.tier_key == "starter_monthly"
     assert row.grant_micros == 7_500_000
 
-    # Ledger entry was written — confirming the price extraction bug is fixed.
+    # NO ledger entry — ticket 0024.11 moved the grant to invoice.paid (subscription_create).
+    # customer.subscription.created only upserts the row; balance writes are coupled to
+    # payment events.
     async with AsyncSession(engine, expire_on_commit=False) as session:
         result = await session.execute(
             select(BalanceLedger).where(BalanceLedger.user_id == user_id)
         )
         entries = result.scalars().all()
-    assert len(entries) == 1
-    assert entries[0].amount_micros == 7_500_000
-    assert entries[0].reason == "subscription_grant"
-    assert entries[0].stripe_event_id == "evt_bugfix_regression_001"
+    assert len(entries) == 0, (
+        "customer.subscription.created must NOT write to balance_ledger (ticket 0024.11). "
+        "Grant is deferred to invoice.paid (subscription_create)."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3491,3 +3624,116 @@ async def test_subscribe_decline_retry_uses_fresh_setup_intent(client):
         "The setup-intent endpoint must not pass an idempotency_key to Stripe.SetupIntent.create "
         "(per chassis idempotency-policy.md: SetupIntent is consumable, time-window keys forbidden)."
     )
+
+
+# ---------------------------------------------------------------------------
+# 0024.11 Composition test — phantom grant guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_incomplete_subscription_does_not_post_subscription_grant_to_ledger():
+    """Composition test (per doc/operations/testing.md §Composition tests): simulates
+    the user-52 3DS-failure scenario at the handler level.
+
+    Invariant under test: a subscription that never reaches a paid invoice must NEVER
+    produce a subscription_grant ledger row, regardless of BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER.
+
+    Flow simulated (mirrors ticket 0024.11 §Audit question 2):
+    1. customer.subscription.created fires — subscription in `incomplete` state (3DS pending).
+    2. invoice.payment_failed fires — user failed the 3DS challenge; invoice not paid.
+    3. invoice.paid NEVER fires (invoice was never paid).
+
+    Expected: balance_ledger has NO subscription_grant row after steps 1+2 with flag=true.
+
+    This is the regression guard for the exact bug that surfaced user 52's phantom row 20
+    ($19.99 credit for a subscription whose first invoice was never paid).
+    """
+    from app.billing.handlers.subscription import (
+        handle_invoice_payment_failed,
+        handle_subscription_created,
+    )
+    from app.services.auth_service import hash_password
+
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        async with session.begin():
+            user = User(
+                email="phantom_grant_guard@example.com",
+                password_hash=hash_password("Password123!"),
+                full_name="Phantom Grant Guard",
+                stripe_customer_id="cus_phantom_guard",
+            )
+            session.add(user)
+            await session.flush()
+            user_id = user.id
+
+    # Step 1: customer.subscription.created fires with subscription in `incomplete` state.
+    # (3DS pending — first invoice exists but not yet paid.)
+    price_mock = MagicMock()
+    price_mock.id = "price_phantom_001"
+    price_mock.lookup_key = "starter_monthly"
+    price_mock.metadata = {"grant_micros": "19990000", "tier_name": "Starter"}
+
+    sub_item = MagicMock()
+    sub_item.price = price_mock
+
+    sub_obj = MagicMock()
+    sub_obj.id = "sub_phantom_guard_001"
+    sub_obj.status = "incomplete"  # 3DS pending
+    sub_obj.cancel_at_period_end = False
+    sub_obj.current_period_start = _PERIOD_START_TS
+    sub_obj.current_period_end = _PERIOD_END_TS
+    sub_obj.metadata = {"user_id": str(user_id)}
+    sub_obj.items.data = [sub_item]
+
+    sub_created_event = MagicMock()
+    sub_created_event.id = "evt_phantom_sub_created"
+    sub_created_event.data.object = sub_obj
+
+    with patch.object(settings, "BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER", True):
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            async with session.begin():
+                await handle_subscription_created(sub_created_event, session)
+
+    # Assert: customer.subscription.created must NOT write a ledger entry.
+    # This is the core guard: even with flag=true, no grant fires here.
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(
+            select(BalanceLedger).where(BalanceLedger.user_id == user_id)
+        )
+        entries = result.scalars().all()
+    assert len(entries) == 0, (
+        "customer.subscription.created must NOT produce a subscription_grant ledger entry "
+        "(ticket 0024.11 phantom-grant guard). A subscription_grant row was found even though "
+        "the first invoice has not been paid. This is the user-52 phantom-credit bug."
+    )
+
+    # Step 2: invoice.payment_failed fires — user failed 3DS, invoice not paid.
+    invoice_obj = MagicMock()
+    invoice_obj.subscription = "sub_phantom_guard_001"
+    invoice_obj.billing_reason = "subscription_create"
+
+    payment_failed_event = MagicMock()
+    payment_failed_event.id = "evt_phantom_inv_failed"
+    payment_failed_event.data.object = invoice_obj
+
+    with patch.object(settings, "BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER", True):
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            async with session.begin():
+                await handle_invoice_payment_failed(payment_failed_event, session)
+
+    # Assert: invoice.payment_failed must NOT write a ledger entry.
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(
+            select(BalanceLedger).where(BalanceLedger.user_id == user_id)
+        )
+        entries = result.scalars().all()
+    assert len(entries) == 0, (
+        "invoice.payment_failed must NOT produce any ledger entry. "
+        "No subscription_grant row should exist for a subscription whose first invoice "
+        "was never paid (ticket 0024.11 phantom-grant guard)."
+    )
+
+    # Step 3: invoice.paid NEVER fires (invoice was never paid in this scenario).
+    # The test ends here — confirming the invariant: after customer.subscription.created
+    # + invoice.payment_failed with flag=true, zero balance_ledger rows exist for this user.

@@ -181,8 +181,8 @@ by reason.
 | Reason | Sign | Triggered by |
 |---|---|---|
 | `topup` | + | `payment_intent.succeeded` for a user-initiated purchase |
-| `subscription_grant` | + | `customer.subscription.created` (initial period grant) |
-| `subscription_reset` | + | `invoice.paid` for subscription renewal (grants new period's `grant_micros`). **V1 simplification:** does not zero remaining prior-period balance; balance increases monotonically across renewals. Strict "zero prior-period remainder + grant new period" semantics are a future hardening (analogous to the cancel-at-period-end-vs-immediate distinction). |
+| `subscription_grant` | + | `invoice.paid` for `billing_reason=subscription_create` (initial period grant; flag-gated when `BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=true`). **NOT** `customer.subscription.created` — that event can fire before the first invoice is paid (3DS pending, decline pending), producing phantom grants on payment-failure paths. See ticket 0024.11 for architectural rationale. |
+| `subscription_reset` | + | `invoice.paid` for subscription renewal (`billing_reason=subscription_cycle`; grants new period's `grant_micros`). **V1 simplification:** does not zero remaining prior-period balance; balance increases monotonically across renewals. Strict "zero prior-period remainder + grant new period" semantics are a future hardening. |
 | `signup_bonus` | + | User registration (opt-in, off by default) |
 | `verify_bonus` | + | Email verification (opt-in, off by default) |
 | `debit` | − | Project-layer action via `billing.debit()` |
@@ -298,7 +298,7 @@ project-layer actions calling this primitive.
    For terminal failures: the chassis calls `stripe.Subscription.delete(sub.id)` (idempotent, best-effort) and raises `402 PAYMENT_REQUIRED` with `error_code="INVOICE_PAYMENT_FAILED"`, the Stripe decline message, and `decline_code` / `code` from `last_payment_error`. No `subscriptions` row is written — never-active subscriptions are discarded synchronously. Frontend on 402 should reset the SetupIntent and re-mount the payment form so the user can retry with a different card.
 
 8. Upsert `subscriptions` row (keyed on `user_id`; one active subscription per user in v1). **Only executed for `active` and 3DS-pending `incomplete` outcomes**; terminal failures skip the upsert.
-9. **When `BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=true`:** grant `subscription_grant`: `+grant_micros` ledger entry deferred to `customer.subscription.created` webhook. **When false:** subscription row is upserted; `balance_ledger` is not written.
+9. **When `BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=true`:** grant `subscription_grant`: `+grant_micros` ledger entry fires on `invoice.paid` (with `billing_reason=subscription_create`) — NOT on `customer.subscription.created`. This decouples grants from subscription lifecycle events that can fire before the first invoice is paid (3DS-pending, decline-pending). `invoice.paid` is the canonical "money moved" event; Stripe guarantees the invoice was paid when it fires. See ticket 0024.11 for the architectural rationale and the 3DS-failure phantom-grant bug this fixed. **When false:** subscription row is upserted; `balance_ledger` is not written.
 
 **Subscribe response contract (post-0024.9):**
 
@@ -318,10 +318,11 @@ The chassis no longer leaks Stripe-internal `incomplete` state for terminal fail
 
 | Event | Action |
 |---|---|
-| `customer.subscription.created` | Upsert subscription row. **When `BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=true`:** also grant `subscription_grant`. When false: row only, no ledger write. |
+| `customer.subscription.created` | Upsert subscription row only. **No ledger write, regardless of flag.** Grants are coupled to `invoice.paid` (see below), not to this lifecycle event. `customer.subscription.created` can fire before the first invoice is paid (3DS pending, decline pending); coupling grants to it produces phantom ledger entries on payment-failure paths (ticket 0024.11). |
 | `customer.subscription.updated` | Update `status`, `cancel_at_period_end`, `tier_key`, `tier_name`, `stripe_price_id`. Does NOT update `grant_micros` or period timestamps — subscribe endpoint is authoritative at creation; `invoice.paid` cycle handler is authoritative at renewal (Path B architectural model — tickets 0024.5, 0024.7). No ledger write regardless of flag. |
 | `customer.subscription.deleted` | Mark `status='cancelled'`. Do NOT revoke already-granted balance. |
-| `invoice.paid` | If subscription renewal: update period timestamps. **When `BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=true`:** also post `subscription_reset` entries. When false: timestamps updated only, no ledger write. |
+| `invoice.paid` (`billing_reason=subscription_create`) | **When `BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=true`:** post `subscription_grant` for the initial period (`+grant_micros` from the subscriptions row, set by the subscribe endpoint). When false: no-op. This is the canonical initial-period grant trigger (moved from `customer.subscription.created` per ticket 0024.11). |
+| `invoice.paid` (`billing_reason=subscription_cycle`) | Update period timestamps from `invoice.lines.data[0].period.start/end`. **When `BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=true`:** also post `subscription_reset` entries. When false: timestamps updated only, no ledger write. |
 | `invoice.payment_failed` | Mark subscription `past_due`. Balance stays spendable. |
 | `payment_intent.succeeded` | Topup: grant `topup`. |
 | `charge.refunded` | Record `refund` ledger entry (negative). |
