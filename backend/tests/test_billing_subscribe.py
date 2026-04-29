@@ -1389,6 +1389,11 @@ async def test_handle_invoice_paid_subscription_create_grants_when_flag_on():
 
     Ticket 0024.11: invoice.paid (subscription_create) is now the canonical trigger for the
     initial-period subscription_grant. The grant is idempotent via stripe_event_id unique index.
+
+    Ticket 0024.12: fixture uses the basil API shape (invoice.parent.subscription_details.subscription)
+    with spec=-restricted MagicMock to prevent false-positive attribute auto-vivification.
+    The top-level invoice.subscription attribute is intentionally NOT present in this fixture —
+    that is the basil post-migration shape. Without the extractor fix, this test would fail.
     """
     from app.billing.handlers.subscription import handle_invoice_paid
     from app.services.auth_service import hash_password
@@ -1412,9 +1417,25 @@ async def test_handle_invoice_paid_subscription_create_grants_when_flag_on():
         )
     # Verify the row has grant_micros=10_000_000 (from _create_subscription_row default).
 
-    invoice_obj = MagicMock()
+    # Basil-shaped invoice fixture (ticket 0024.12).
+    # spec= restricts attribute access — invoice.subscription is NOT in the spec so any
+    # code that accesses it raises AttributeError instead of returning a truthy MagicMock.
+    # This is the critical discipline: without spec=, the test would pass even if the
+    # handler still used the legacy getattr(invoice, "subscription", None) path (which
+    # returns a truthy MagicMock, not None, fooling the guard). With spec=, the basil path
+    # must fire correctly or the test fails.
+    sub_details = MagicMock()
+    sub_details.subscription = "sub_create_grants_001"
+
+    parent = MagicMock()
+    parent.subscription_details = sub_details
+
+    invoice_obj = MagicMock(spec=["parent", "lines", "billing_reason", "id"])
+    invoice_obj.parent = parent
+    invoice_obj.id = "in_test_create_grants"
     invoice_obj.billing_reason = "subscription_create"
-    invoice_obj.subscription = "sub_create_grants_001"
+    # invoice_obj.subscription is intentionally NOT set — that's the basil shape.
+    # Accessing invoice_obj.subscription would raise AttributeError (spec= enforces this).
 
     event = MagicMock()
     event.id = "evt_inv_create_grants_001"
@@ -3737,3 +3758,182 @@ async def test_incomplete_subscription_does_not_post_subscription_grant_to_ledge
     # Step 3: invoice.paid NEVER fires (invoice was never paid in this scenario).
     # The test ends here — confirming the invariant: after customer.subscription.created
     # + invoice.payment_failed with flag=true, zero balance_ledger rows exist for this user.
+
+
+# ---------------------------------------------------------------------------
+# 0024.12 — stripe_extractors unit tests + basil-shape integration test
+# ---------------------------------------------------------------------------
+# These tests guard against Stripe API version migrations (basil: 2025-03-31+)
+# that move invoice subscription IDs from top-level fields to nested locations.
+#
+# Discipline: all fixtures use spec=-restricted MagicMock or plain dict objects.
+# Unrestricted MagicMock auto-vivifies any attribute access as a truthy MagicMock,
+# which would falsely pass even if the extractor fell back to the wrong path.
+# With spec=, accessing an attribute not in the spec raises AttributeError —
+# forcing the extractor to use the correct path or return None.
+
+
+def test_extract_invoice_subscription_id_from_basil_shape():
+    """Helper returns sub ID from the basil canonical path.
+
+    Basil (Stripe API 2025-03-31+) moved invoice.subscription to
+    invoice.parent.subscription_details.subscription.
+
+    Fixture: spec=-restricted invoice with ONLY parent attribute present.
+    invoice.subscription is NOT accessible (not in spec) — the helper must
+    use the basil path or fail.
+    """
+    from app.billing.stripe_extractors import extract_invoice_subscription_id
+
+    sub_details = MagicMock()
+    sub_details.subscription = "sub_basil_001"
+
+    parent = MagicMock()
+    parent.subscription_details = sub_details
+
+    # spec= lists only the attributes this fixture exposes.
+    # Accessing invoice.subscription (legacy path) would raise AttributeError —
+    # confirming the helper does NOT accidentally succeed via the legacy path.
+    invoice = MagicMock(spec=["parent", "lines", "billing_reason", "id"])
+    invoice.parent = parent
+    invoice.id = "in_basil_001"
+    invoice.billing_reason = "subscription_create"
+    # invoice.subscription is intentionally NOT set — the basil shape has no top-level field.
+
+    result = extract_invoice_subscription_id(invoice)
+    assert result == "sub_basil_001", (
+        f"Expected 'sub_basil_001' from basil path, got {result!r}. "
+        "Extractor must try invoice.parent.subscription_details.subscription first."
+    )
+
+
+def test_extract_invoice_subscription_id_from_legacy_top_level_shape():
+    """Helper falls back to legacy top-level invoice.subscription when basil path is absent.
+
+    Older Stripe API versions (pre-basil) carry the subscription ID at invoice.subscription.
+    The helper must still handle these payloads for resilience during API version transitions.
+
+    Fixture: spec=-restricted invoice with ONLY subscription attribute (no parent).
+    """
+    from app.billing.stripe_extractors import extract_invoice_subscription_id
+
+    # spec= exposes only 'subscription' — parent is NOT accessible.
+    invoice = MagicMock(spec=["subscription", "lines", "billing_reason", "id"])
+    invoice.subscription = "sub_legacy_001"
+    invoice.id = "in_legacy_001"
+    invoice.billing_reason = "subscription_create"
+    # invoice.parent is not in spec — if helper tries to access it, AttributeError fires.
+    # But the extractor uses getattr(..., None) which returns None for missing attrs,
+    # so absence of parent causes path 1 to return None and path 2 (legacy) to be tried.
+
+    result = extract_invoice_subscription_id(invoice)
+    assert result == "sub_legacy_001", (
+        f"Expected 'sub_legacy_001' from legacy path, got {result!r}. "
+        "Extractor must fall back to invoice.subscription when basil path is absent."
+    )
+
+
+def test_extract_invoice_subscription_id_returns_none_when_all_paths_missing():
+    """Helper returns None when none of the four paths have a subscription ID.
+
+    This simulates an invoice payload where the subscription ID is not present
+    in any known location — the caller is expected to log a warning and return.
+
+    Fixture: spec=-restricted invoice with none of the subscription paths populated.
+    """
+    from app.billing.stripe_extractors import extract_invoice_subscription_id
+
+    # spec= exposes only billing_reason and id — no parent, no subscription, no lines.
+    invoice = MagicMock(spec=["billing_reason", "id"])
+    invoice.billing_reason = "subscription_create"
+    invoice.id = "in_no_sub_001"
+    # All four paths are inaccessible or absent — extractor must return None.
+
+    result = extract_invoice_subscription_id(invoice)
+    assert result is None, (
+        f"Expected None when all paths are absent, got {result!r}. "
+        "Extractor must return None (not raise) when subscription ID is not found."
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_invoice_paid_subscription_create_grants_via_basil_shaped_event():
+    """Handler integration test: basil-shaped invoice.paid event → subscription_grant created.
+
+    Ticket 0024.12: this test fires handle_invoice_paid with a basil-shaped invoice
+    (parent.subscription_details.subscription) and asserts that the subscription_grant
+    ledger entry is correctly created.
+
+    This is the regression guard for users 54 and 55 (confirmed affected): they had active
+    subscriptions and paid first invoices but received no subscription_grant because the
+    handler used the legacy getattr(invoice, 'subscription', None) which returns None for
+    basil-shaped payloads.
+
+    Fixture uses spec=-restricted MagicMock: invoice.subscription is intentionally absent.
+    Without the fix (using extract_invoice_subscription_id), this test FAILS because
+    getattr(invoice, 'subscription', None) returns None and the handler returns early.
+    """
+    from app.billing.handlers.subscription import handle_invoice_paid
+    from app.services.auth_service import hash_password
+
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        async with session.begin():
+            user = User(
+                email="basil_invoice_paid_grant@example.com",
+                password_hash=hash_password("Password123!"),
+                full_name="Basil Invoice Paid Grant",
+                stripe_customer_id="cus_basil_inv_paid",
+            )
+            session.add(user)
+            await session.flush()
+            user_id = user.id
+
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        await _create_subscription_row(
+            session,
+            user_id,
+            status="active",
+            stripe_sub_id="sub_basil_inv_paid_001",
+        )
+
+    # Basil-shaped invoice fixture.
+    # spec= prevents invoice.subscription from being auto-vivified as a truthy MagicMock.
+    # If the handler still used getattr(invoice, 'subscription', None), it would get
+    # AttributeError (which getattr converts to None), triggering the early-return guard
+    # and NOT posting the grant. The test would then fail at the assertion below.
+    sub_details = MagicMock()
+    sub_details.subscription = "sub_basil_inv_paid_001"
+
+    parent = MagicMock()
+    parent.subscription_details = sub_details
+
+    invoice_obj = MagicMock(spec=["parent", "lines", "billing_reason", "id"])
+    invoice_obj.parent = parent
+    invoice_obj.id = "in_basil_inv_paid_001"
+    invoice_obj.billing_reason = "subscription_create"
+    # invoice_obj.subscription intentionally absent (basil shape — no top-level field).
+
+    event = MagicMock()
+    event.id = "evt_basil_inv_paid_grant_001"
+    event.data.object = invoice_obj
+
+    with patch.object(settings, "BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER", True):
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            async with session.begin():
+                await handle_invoice_paid(event, session)
+
+    # Assert: subscription_grant ledger entry was created.
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(
+            select(BalanceLedger).where(BalanceLedger.user_id == user_id)
+        )
+        entries = result.scalars().all()
+
+    assert len(entries) == 1, (
+        "handle_invoice_paid with basil-shaped invoice must post one subscription_grant entry. "
+        "Zero entries means the extractor failed to find the subscription ID in the basil path "
+        "(regression: users 54/55 pattern — active subscription, paid invoice, no balance grant)."
+    )
+    assert entries[0].amount_micros == 10_000_000
+    assert entries[0].reason == "subscription_grant"
+    assert entries[0].stripe_event_id == "evt_basil_inv_paid_grant_001"

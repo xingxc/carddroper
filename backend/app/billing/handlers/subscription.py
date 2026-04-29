@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.billing.handlers import register
 from app.billing.primitives import grant
 from app.billing.reason import Reason
+from app.billing.stripe_extractors import extract_invoice_subscription_id
 from app.config import settings
 from app.models.subscription import Subscription
 
@@ -422,11 +423,15 @@ async def handle_invoice_paid(event: stripe.Event, db: AsyncSession) -> None:
 
         # Resolve the subscriptions row via the invoice's subscription_id so we can read
         # grant_micros (the authoritative value set by the subscribe endpoint at creation).
-        stripe_sub_id = getattr(invoice, "subscription", None)
+        # Uses the basil-resilient extractor (ticket 0024.12): basil API moved the
+        # subscription field from invoice.subscription (legacy) to
+        # invoice.parent.subscription_details.subscription (canonical 2025-03-31+).
+        stripe_sub_id = extract_invoice_subscription_id(invoice)
         if not stripe_sub_id:
+            invoice_keys = list(invoice.keys()) if hasattr(invoice, "keys") else dir(invoice)
             logger.warning(
-                "handle_invoice_paid: billing_reason=subscription_create but invoice.subscription is missing",
-                extra={"event_id": event.id},
+                "handle_invoice_paid: billing_reason=subscription_create but no subscription_id in invoice payload",
+                extra={"event_id": event.id, "invoice_keys": invoice_keys[:30]},
             )
             return
 
@@ -516,11 +521,13 @@ async def handle_invoice_paid(event: stripe.Event, db: AsyncSession) -> None:
         return
 
     # Renewal: find the subscription row via the invoice's subscription_id.
-    stripe_sub_id = getattr(invoice, "subscription", None)
+    # Uses the basil-resilient extractor (ticket 0024.12).
+    stripe_sub_id = extract_invoice_subscription_id(invoice)
     if not stripe_sub_id:
+        invoice_keys = list(invoice.keys()) if hasattr(invoice, "keys") else dir(invoice)
         logger.warning(
-            "handle_invoice_paid: billing_reason=subscription_cycle but invoice.subscription is missing",
-            extra={"event_id": event.id},
+            "handle_invoice_paid: billing_reason=subscription_cycle but no subscription_id in invoice payload",
+            extra={"event_id": event.id, "invoice_keys": invoice_keys[:30]},
         )
         return
 
@@ -648,11 +655,13 @@ async def handle_invoice_payment_failed(event: stripe.Event, db: AsyncSession) -
     """
     invoice = event.data.object
 
-    stripe_sub_id = getattr(invoice, "subscription", None)
+    # Uses the basil-resilient extractor (ticket 0024.12).
+    stripe_sub_id = extract_invoice_subscription_id(invoice)
     if not stripe_sub_id:
+        invoice_keys = list(invoice.keys()) if hasattr(invoice, "keys") else dir(invoice)
         logger.warning(
-            "handle_invoice_payment_failed: invoice.subscription is missing",
-            extra={"event_id": event.id},
+            "handle_invoice_payment_failed: no subscription_id in invoice payload",
+            extra={"event_id": event.id, "invoice_keys": invoice_keys[:30]},
         )
         return
 
