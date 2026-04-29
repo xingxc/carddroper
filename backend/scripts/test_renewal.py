@@ -21,6 +21,14 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Make `app` importable when this script is run as `python scripts/test_renewal.py`
+# from the backend/ directory. Without this, sys.path[0] is `backend/scripts/`, so
+# `from app.config import settings` fails with ImportError. The original 0024.14
+# implementation caught this with `except Exception: pass`, silently swallowing the
+# error and showing a misleading "STRIPE_SECRET_KEY is not set" message even when
+# backend/.env had the value. Fixed by inserting backend/ at the front of sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 # ---------------------------------------------------------------------------
 # ANSI color helpers
 # ---------------------------------------------------------------------------
@@ -156,14 +164,27 @@ def _setup_stripe() -> None:
 
     secret_key = os.environ.get("STRIPE_SECRET_KEY")
     if not secret_key:
-        # Fall back to loading from app.config (picks up backend/.env)
+        # Fall back to loading from app.config (picks up backend/.env via pydantic-settings).
+        # Surface ImportError loudly — silent swallow was the original 0024.14 UX bug.
         try:
             from app.config import settings
 
             if settings.STRIPE_SECRET_KEY:
-                secret_key = settings.STRIPE_SECRET_KEY.get_secret_value()
-        except Exception:
-            pass
+                # STRIPE_SECRET_KEY may be SecretStr (pydantic) or plain str depending
+                # on how config.py is typed. Handle both — fall back to the raw value
+                # if get_secret_value() isn't available.
+                raw = settings.STRIPE_SECRET_KEY
+                secret_key = raw.get_secret_value() if hasattr(raw, "get_secret_value") else raw
+        except ImportError as e:
+            print(
+                _red(
+                    f"ERROR: could not import app.config to read STRIPE_SECRET_KEY: {e}\n"
+                    "  This usually means the script was run without backend/ on sys.path.\n"
+                    "  Run from the backend/ directory: cd backend && .venv/bin/python scripts/test_renewal.py"
+                ),
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     if not secret_key:
         print(
@@ -207,8 +228,15 @@ def _get_grants_flag() -> bool:
         from app.config import settings
 
         return settings.BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER
-    except Exception:
-        return False
+    except ImportError as e:
+        print(
+            _red(
+                f"ERROR: could not import app.config to read BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER: {e}\n"
+                "  Run from backend/ directory or set BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER explicitly."
+            ),
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------

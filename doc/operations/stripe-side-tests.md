@@ -141,8 +141,19 @@ cp backend/.test-clock-fixture.local.example backend/.test-clock-fixture.local
 #    pre/post DB state, and assert the chassis renewal behavior is correct.
 #    It is the canonical Tier B1 test for any future ticket touching the
 #    handle_invoice_paid subscription_cycle branch.
-python backend/scripts/test_renewal.py
+#
+#    NOTE: docker-compose forwards Postgres on host port 5433 (not 5432, to avoid
+#    clashing with any host-installed Postgres). The script reads DATABASE_URL via
+#    pydantic-settings; if backend/.env has a host-Postgres URL on port 5432 (a
+#    common dev setup), override it on the command line to point at the
+#    docker-compose DB:
+DATABASE_URL='postgresql+asyncpg://carddroper:carddroper@localhost:5433/carddroper' \
+  .venv/bin/python backend/scripts/test_renewal.py
 ```
+
+The same override pattern works for the optional `flag=false` re-run: stop the backend, set `BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=false` in the script's environment (or rely on app.config picking it up from a modified `.env`), and run again. The script will advance the clock another 31 days and assert no new `subscription_reset` ledger entry was posted.
+
+**Why running from host (not inside the container):** the chassis Dockerfile deliberately excludes `scripts/` from the production image — `test_renewal.py` is dev tooling and uses Stripe Test Clocks, which are never appropriate for production. The chassis convention is: `app/` runs in containers; `scripts/` runs from host (or CI runners) against deployed/local services.
 
 ### B1. Advance through one renewal
 
