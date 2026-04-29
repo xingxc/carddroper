@@ -3937,3 +3937,95 @@ async def test_handle_invoice_paid_subscription_create_grants_via_basil_shaped_e
     assert entries[0].amount_micros == 10_000_000
     assert entries[0].reason == "subscription_grant"
     assert entries[0].stripe_event_id == "evt_basil_inv_paid_grant_001"
+
+
+@pytest.mark.asyncio
+async def test_handle_subscription_created_insert_path_respects_flag_off_grant_micros():
+    """INSERT path of handle_subscription_created must write grant_micros=0 when flag=false.
+
+    Regression guard for ticket 0024.13: the INSERT path (values= clause of the upsert)
+    previously computed grant_micros_insert from price metadata UNCONDITIONALLY. After
+    0024.9 introduced a terminal-failure path where the subscribe endpoint deliberately
+    skips the upsert, the INSERT path now runs for every decline — making the unconditional
+    metadata read a chassis-invariant violation when flag=false.
+
+    Pre-conditions:
+    - User exists in DB.
+    - NO pre-existing subscriptions row (simulates 0024.9 terminal-failure path where
+      the subscribe endpoint chose not to upsert before the webhook arrived).
+    - Event carries metadata.grant_micros="19990000".
+    - BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=False.
+
+    Without the fix: row.grant_micros == 19990000 (phantom phantom value).
+    With the fix: row.grant_micros == 0 (chassis invariant upheld).
+    """
+    from app.billing.handlers.subscription import handle_subscription_created
+    from app.services.auth_service import hash_password
+
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        async with session.begin():
+            user = User(
+                email="insert_flag_off_grant@example.com",
+                password_hash=hash_password("Password123!"),
+                full_name="Insert Flag Off Grant",
+                stripe_customer_id="cus_insert_flag_off_grant",
+            )
+            session.add(user)
+            await session.flush()
+            user_id = user.id
+
+    # No pre-existing subscriptions row — simulates 0024.9 terminal-failure path.
+    # (subscribe endpoint called _cancel_failed_subscription and raised 402 without upserting)
+
+    # Use spec= to restrict MagicMock attribute access. Unrestricted MagicMock()
+    # auto-vivifies any attribute access into a truthy MagicMock, which would make
+    # the handler appear correct even when the flag-gate is missing (0024.12 discipline).
+    price_meta = {"grant_micros": "19990000", "tier_name": "Starter"}
+
+    price_mock = MagicMock(spec=["id", "lookup_key", "metadata"])
+    price_mock.id = "price_insert_flag_off_001"
+    price_mock.lookup_key = "starter_monthly"
+    price_mock.metadata = price_meta
+
+    sub_item = MagicMock(spec=["price"])
+    sub_item.price = price_mock
+
+    items_list = MagicMock(spec=["data"])
+    items_list.data = [sub_item]
+
+    sub_obj = MagicMock(spec=["id", "status", "cancel_at_period_end", "current_period_start", "current_period_end", "metadata", "items"])
+    sub_obj.id = "sub_insert_flag_off_001"
+    sub_obj.status = "incomplete"
+    sub_obj.cancel_at_period_end = False
+    sub_obj.current_period_start = _PERIOD_START_TS
+    sub_obj.current_period_end = _PERIOD_END_TS
+    sub_obj.metadata = {"user_id": str(user_id)}
+    sub_obj.items = items_list
+
+    event = MagicMock(spec=["id", "data"])
+    event.id = "evt_insert_flag_off_grant_001"
+    event.data.object = sub_obj
+
+    with patch.object(settings, "BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER", False):
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            async with session.begin():
+                await handle_subscription_created(event, session)
+
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(select(Subscription).where(Subscription.user_id == user_id))
+        row = result.scalar_one_or_none()
+
+    assert row is not None, "INSERT path must have created a subscriptions row."
+    assert row.grant_micros == 0, (
+        f"handle_subscription_created INSERT path MUST write grant_micros=0 when "
+        f"BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER=False. Got {row.grant_micros!r}. "
+        f"Without the 0024.13 fix this is 19990000 (phantom value from metadata). "
+        f"Chassis invariant: grant_micros=0 when flag=false, regardless of writer or path."
+    )
+    assert row.status == "incomplete", (
+        f"Expected status='incomplete' from event; got {row.status!r}."
+    )
+    assert row.tier_name == "Starter", (
+        f"tier_name must be preserved from price metadata regardless of flag-gate. "
+        f"Got {row.tier_name!r}. The fix must not accidentally zero non-grant fields."
+    )

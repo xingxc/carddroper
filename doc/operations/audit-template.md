@@ -45,6 +45,20 @@ The narrative format is fine. Order matters because retry behavior depends on st
 | State mutated (Stripe) | Which Stripe resources are created or updated |
 | Retry semantics | What happens on duplicate request: replay (returns prior result), fresh (creates new resource), conflict (raises error) |
 
+### 3.5. If this ticket changes WHEN or WHETHER any writer writes a column, audit every other writer to that column for assumptions that may now be invalidated
+
+When a ticket modifies a writer's behavior — e.g., reordering when an upsert happens, adding an early return that skips a write, changing a condition that gates a write — list every OTHER writer to the same column and check each writer's implicit or explicit assumptions about when it runs.
+
+Common assumptions to look for:
+
+- "I always run after writer X has populated this row, so my INSERT path is rare."
+- "Writer X always handles the flag-gate, so I can use the unflagged metadata value."
+- "Writer X always writes a non-NULL value before me, so I don't need a fallback."
+
+If the ticket invalidates any such assumption, the affected writer needs to be updated in the same ticket OR explicitly carved into a follow-up.
+
+Origin: ticket 0024.13. Tickets 0024.7 (webhook INSERT path assumed subscribe endpoint always upserted first) and 0024.9 (subscribe endpoint stopped upserting on terminal failure) composed into a chassis-correctness bug because no audit explicitly checked the cross-writer assumption.
+
 ### 4. Consumability check
 
 For each Stripe resource the flow creates: is it **consumable** (single-use, terminal state after first use)? Reference `doc/operations/idempotency-policy.md` §"Consumable resource catalog" for the canonical list.

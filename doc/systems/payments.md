@@ -135,6 +135,10 @@ The chassis follows a single-source-of-truth model: each subscription / ledger c
 - **Authoritative writer** sets the column on relevant events. Authoritative on both INSERT and UPDATE paths.
 - **Preserve-only writers** must NOT include the column in their UPDATE / `set_=` clauses. They MAY include it in INSERT / `values=` for fresh rows (defensive: better some value than NULL on a NOT NULL column).
 
+**Preserve-only writers' INSERT-path values** (the rare path where they write because no row exists yet) must respect the same flag-gates and chassis invariants as the authoritative writer. The INSERT path is not a "fallback that ignores the chassis flag" — it's a defensive write under the same semantic.
+
+Concrete: when a webhook handler is preserve-only on UPDATE (omits a column from `set_=`), its INSERT path (`values=`) MUST still apply any flag-gate the authoritative writer applies. The INSERT path is exercised when the authoritative writer didn't run (or ran but skipped the upsert, e.g., 0024.9's terminal-failure path).
+
 #### `subscriptions` table
 
 | Column | Authoritative writer | Preserve-only writers (INSERT-only OR no-touch) |

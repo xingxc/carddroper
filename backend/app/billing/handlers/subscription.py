@@ -190,21 +190,27 @@ async def handle_subscription_created(event: stripe.Event, db: AsyncSession) -> 
     # Defensive dual-access for period timestamps (see _extract_period_timestamps docstring).
     period_start, period_end = _extract_period_timestamps(sub)
 
-    # Read tier_name (always needed for display); grant_micros for INSERT-only default.
-    # grant_micros is read from metadata regardless of flag state so the INSERT case (rare
-    # out-of-band subscription created before subscribe endpoint runs) has a reasonable value.
-    # When flag=OFF the subscribe endpoint will have already stored 0; the INSERT branch is
-    # only exercised for truly out-of-band subscriptions.
+    # Read tier_name (always needed for display).
     price_meta_raw = getattr(price_obj, "metadata", None) or {}
     tier_name = (
         price_meta_raw.get("tier_name") if hasattr(price_meta_raw, "get") else None
     ) or ""
-    raw_grant = (
-        price_meta_raw.get("grant_micros") if hasattr(price_meta_raw, "get") else None
-    ) or "0"
-    try:
-        grant_micros_insert = int(raw_grant)
-    except (ValueError, TypeError):
+
+    # Flag-gated grant_micros for the INSERT path. The chassis discipline is uniform:
+    # subscriptions.grant_micros = 0 when flag=false, regardless of writer or path.
+    # Originally not flag-gated under the assumption (now false post-0024.9) that the
+    # subscribe endpoint always upserted with its own flag-gated value before this
+    # handler ran. Ticket 0024.13 closes the hole exposed by 0024.9's terminal-failure
+    # branch (which deliberately skips the upsert).
+    if settings.BILLING_SUBSCRIPTION_GRANTS_TO_LEDGER:
+        raw_grant = (
+            price_meta_raw.get("grant_micros") if hasattr(price_meta_raw, "get") else None
+        ) or "0"
+        try:
+            grant_micros_insert = int(raw_grant)
+        except (ValueError, TypeError):
+            grant_micros_insert = 0
+    else:
         grant_micros_insert = 0
 
     # Upsert subscriptions row keyed on user_id (one subscription per user).
