@@ -86,6 +86,8 @@ Subscription cancellation is always **cancel-at-period-end** (Stripe default,
 Portal-managed). User retains access through `current_period_end`; chassis
 does not build custom cancellation UI.
 
+**Portal PM update — sub-level vs customer-default.** Stripe distinguishes two payment-method fields: `subscription.default_payment_method` (renewal charges for that specific subscription) and `customer.invoice_settings.default_payment_method` (one-off invoices, future actions when no sub-specific PM is set). When a user updates the PM in Customer Portal while having an active subscription, Stripe updates **only the subscription-level PM**, not the customer default — that's by design (the active sub is what immediately matters for renewals). For chassis correctness, this is sufficient: recovery flow (past_due → next dunning retry uses the new PM) works correctly. The customer-default PM is essentially unused by the chassis (subscribe and topup endpoints both take explicit PM ids from SetupIntent / PaymentIntent flows). Adopters who want Portal updates to also change the customer-default can configure that in Stripe Dashboard → Customer Portal settings; not a chassis concern.
+
 ## Data model (chassis schema)
 
 ```sql

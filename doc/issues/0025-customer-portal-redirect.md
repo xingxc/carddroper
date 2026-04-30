@@ -1,7 +1,7 @@
 ---
 id: 0025
 title: customer portal redirect — POST /billing/portal-session + Manage subscription button on /app/subscribe
-status: open
+status: resolved
 priority: medium (chassis completion; final ticket of the 0024.x billing chassis arc; provides recovery UX for past_due subscriptions and self-service cancellation per payments.md §UX split)
 found_by: chassis arc completion 2026-04-29 — payments.md §UX split designates Stripe Customer Portal as the canonical surface for: payment method updates, subscription cancellation, invoice history, billing detail updates. payments.md line 420 already specifies the endpoint shape POST /billing/portal-session. 0024.x verified the chassis correctly handles past_due entry (0024.15) and recovery via invoice.paid post-PM-update (0024.14). 0025 ships the redirect endpoint and minimum frontend hookup so users can actually reach Portal — completing the recovery loop.
 ---
@@ -383,4 +383,26 @@ User (Phase 1):
 
 ## Resolution
 
-*(filled in by orchestrator after Phase 0a + 0b + 0c + Phase 1)*
+Resolved 2026-04-29. Implemented commits `6ef6a7e` (backend Phase 0a — endpoint, env var, 8 tests, payments.md endpoint description, cloudbuild.yaml env) + `bbf00bf` (frontend Phase 0b — createPortalSession API client, ManageSubscriptionButton component, /app/subscribe page integration). Doc clarification on Portal sub-level vs customer-default PM behavior added to payments.md §UX split in this closure pass.
+
+End-to-end verification 2026-04-29 against test-clock fixture user (cus_UQSrBN..., user 64) and a fresh lazy-test user. Seven manual smoke tests all GREEN:
+
+1. Manage subscription button visible when user has subscription ✓
+2. Click → redirects to billing.stripe.com Portal ✓
+3. Portal "Back to App" → returns to /app/subscribe ✓
+4. Cancel-at-period-end via Portal → chassis row.cancel_at_period_end=true via real customer.subscription.updated webhook (Path B preserves period + grant_micros) ✓
+5. PM update via Portal → subscription.default_payment_method updated on Stripe (customer-default unchanged — correct Stripe Portal behavior, documented in payments.md) ✓
+6. Open-redirect attack rejected — POST with return_url=https://phishing.example.com/steal returns 422 with VALIDATION_ERROR; Stripe never called with the malicious URL ✓
+7. Lazy-create — fresh user with stripe_customer_id=NULL hits endpoint, customer is lazy-created and persisted ✓
+
+Two-state pytest: 239 passed (BILLING_ENABLED=true) / 138 passed + 101 skipped (BILLING_ENABLED=false). Frontend lint + typecheck + build clean. Orchestrator post-dispatch grep audit (11 checks) all PASS. Sanity-check (validation reverted → test fails; restored → passes) confirmed the open-redirect test guards the actual bug.
+
+This is the FIRST chassis ticket scoped from start to finish under all current disciplines (audit-template six questions + Q3.5 cross-writer + Phase 0c orchestrator audit + smoke-run check + idempotency-policy + field-ownership matrix + composition tests + stripe-side tests Tier C). No discipline scaffolding additions needed — the disciplines are mature enough that a clean ticket scoped under them ships without retrospective lessons.
+
+Chassis renewal + recovery flow is now complete:
+- Subscribe (4242, 3DS, decline) — verified across 0024 + 0024.6 + 0024.9 + 0024.10 + 0024.12
+- Renewal success — verified end-to-end via 0024.14 (Stripe test clocks)
+- Renewal failure → past_due — verified end-to-end via 0024.15 (test clocks + pm_card_chargeCustomerFail)
+- Past_due recovery via Portal — verified by this ticket: user clicks Manage → Stripe Portal → updates PM → (Stripe dunning retry) → invoice.paid → chassis returns to active. Chain validated transitively (0024.14's invoice.paid handler is the same code path; 0024.15's --restore-active demonstrated the recovery transition explicitly).
+
+The 0024.x billing chassis arc is complete. 17 tickets total (0024 through 0024.15 + 0025), all resolved. Every code path that processes a Stripe event has been exercised against real basil-shape webhook delivery.
